@@ -79,6 +79,8 @@ pub struct Application {
     lsp_progress: LspProgressMap,
 
     theme_mode: Option<theme::Mode>,
+
+    ipc: crate::ipc::Ipc,
 }
 
 #[cfg(feature = "integration")]
@@ -253,6 +255,7 @@ impl Application {
             jobs,
             lsp_progress: LspProgressMap::new(),
             theme_mode,
+            ipc: crate::ipc::Ipc::start(),
         };
 
         Ok(app)
@@ -347,6 +350,11 @@ impl Application {
                     if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback) {
                         self.jobs.add(job);
                     }
+                    self.render().await;
+                }
+                Some((request, reply)) = self.ipc.rx.recv() => {
+                    let response = crate::ipc::handle(&mut self.editor, &mut self.jobs, &self.lsp_progress, request);
+                    let _ = reply.send(response);
                     self.render().await;
                 }
                 event = self.editor.wait_event() => {

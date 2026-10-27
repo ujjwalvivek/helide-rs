@@ -4122,7 +4122,7 @@ pub static TYPABLE_COMMAND_MAP: LazyLock<HashMap<&'static str, &'static TypableC
             .collect()
     });
 
-fn execute_command_line(
+pub(crate) fn execute_command_line(
     cx: &mut compositor::Context,
     input: &str,
     event: PromptEvent,
