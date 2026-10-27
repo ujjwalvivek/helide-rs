@@ -71,10 +71,19 @@ impl AgentSession {
     pub fn command(&self) -> Vec<String> {
         let program = self.kind.command().to_string();
         match self.kind {
+            // --ide connects to Helide's IDE server on startup (see crate::ide), without asking
+            // to turn on auto-connect for every IDE.
             AgentKind::Claude if claude_transcript_exists(&self.id) => {
-                vec![program, "--resume".into(), self.id.clone()]
+                vec![program, "--ide".into(), "--resume".into(), self.id.clone()]
             }
-            AgentKind::Claude => vec![program, "--session-id".into(), self.id.clone()],
+            AgentKind::Claude => {
+                vec![
+                    program,
+                    "--ide".into(),
+                    "--session-id".into(),
+                    self.id.clone(),
+                ]
+            }
             AgentKind::OpenCode => vec![program, "--session".into(), self.id.clone()],
         }
     }
@@ -266,7 +275,7 @@ mod tests {
             id: "00000000-0000-4000-8000-000000000000".into(),
         };
         // No transcript for this id, so it starts a new conversation under it.
-        assert_eq!(claude.command()[1], "--session-id");
+        assert_eq!(claude.command()[1..3], ["--ide", "--session-id"]);
         assert_eq!(claude.mention("src/a.rs", Some((3, 9))), "@src/a.rs#L3-9 ");
         assert_eq!(claude.mention("src/a.rs", Some((4, 4))), "@src/a.rs#L4 ");
         assert_eq!(claude.mention("src/a.rs", None), "@src/a.rs ");

@@ -8,6 +8,7 @@ pub mod compositor;
 pub mod config;
 pub mod events;
 pub mod health;
+pub mod ide;
 pub mod ipc;
 pub mod job;
 pub mod keymap;

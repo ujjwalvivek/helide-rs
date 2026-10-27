@@ -89,6 +89,9 @@ dashmap = "6.2"
 # Terminal panes
 alacritty_terminal = "0.26"
 
+# Claude Code IDE integration
+tokio-tungstenite = "0.30"
+
 parking_lot.workspace = true
 
 [target.'cfg(windows)'.dependencies]

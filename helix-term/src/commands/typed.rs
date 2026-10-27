@@ -2733,6 +2733,28 @@ fn tab_prev(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+fn accept_proposal(
+    _cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        crate::ide::queue_decision(true);
+    }
+    Ok(())
+}
+
+fn reject_proposal(
+    _cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        crate::ide::queue_decision(false);
+    }
+    Ok(())
+}
+
 fn agent(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     use ui::agents::AgentKind;
     if event != PromptEvent::Validate {
@@ -4168,6 +4190,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["tabprevious", "tabp"],
         doc: "Go to the previous tab.",
         fun: tab_prev,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "accept",
+        aliases: &[],
+        doc: "Accept the change Claude proposed in this tab. Claude then writes the file.",
+        fun: accept_proposal,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "reject",
+        aliases: &[],
+        doc: "Reject the change Claude proposed in this tab and close it.",
+        fun: reject_proposal,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
