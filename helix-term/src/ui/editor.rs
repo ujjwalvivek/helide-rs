@@ -34,9 +34,11 @@ use helix_view::{
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
 use super::{
+    agents::{self, AgentKind, AgentSession},
     file_tree::{self, FileTree, TreeAction},
     frame::{self, End, Label},
     git_panel::{GitAction, GitPanel},
+    overlay::overlaid,
     panel_style::Roles,
     terminal::TerminalPanel,
 };
@@ -46,6 +48,7 @@ use super::{
 enum Edge {
     Sidebar,
     Terminal,
+    Agents,
 }
 
 /// A mouse press on a panel edge: dragging resizes, a press without movement is a click.
@@ -64,6 +67,9 @@ const EDITOR_MIN_HEIGHT: u16 = 6;
 /// The terminal's default share of the main box, and its smallest size, in rows.
 const TERMINAL_PERCENT: u16 = 35;
 const TERMINAL_MIN: u16 = 4;
+/// The agent panel's default width: two fifths of the window, within these limits.
+const AGENTS_DEFAULT: (u16, u16) = (52, 110);
+const AGENTS_MIN: u16 = 36;
 
 /// Cuts `text` to `width` columns, keeping its start.
 fn shorten_end(text: &str, width: usize) -> String {
@@ -82,6 +88,7 @@ enum Panel {
     Tree,
     Git,
     Terminal,
+    Agents,
 }
 
 use tui::{buffer::Buffer as Surface, text::Span};
@@ -97,6 +104,12 @@ pub struct EditorView {
     terminal_focused: bool,
     /// Helide's terminal panel, docked under the editor.
     pub terminal: TerminalPanel,
+    /// Helide's agent panel, on the right.
+    pub agents: TerminalPanel,
+    /// The project whose saved agent tabs were last restored or saved.
+    agents_project: Option<PathBuf>,
+    agents_width: Option<u16>,
+    agents_box: Option<Rect>,
     /// Helide's file tree, docked left of the editor.
     pub file_tree: FileTree,
     /// Helide's git panel, sharing the left sidebar with the file tree.
@@ -138,7 +151,11 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
-            terminal: TerminalPanel::default(),
+            terminal: TerminalPanel::new("TERMINAL"),
+            agents: TerminalPanel::new("AGENTS"),
+            agents_project: None,
+            agents_width: None,
+            agents_box: None,
             file_tree: FileTree::default(),
             git: GitPanel::default(),
             tab_hits: Vec::new(),
@@ -1578,6 +1595,95 @@ impl EditorView {
         self.file_tree.focused = panel == Panel::Tree;
         self.git.focused = panel == Panel::Git;
         self.terminal.focused = panel == Panel::Terminal;
+        self.agents.focused = panel == Panel::Agents;
+    }
+
+    /// Ctrl+4. Focused: hide. Hidden or unfocused with tabs: show and focus. Empty: reopen the
+    /// project's saved agent tabs, or start an agent, asking which when both are installed.
+    pub fn toggle_agents(&mut self, editor: &mut Editor) -> Option<Box<dyn Component>> {
+        if self.agents.visible && self.agents.focused {
+            self.agents.visible = false;
+            self.agents.focused = false;
+            return None;
+        }
+        if !self.agents.is_empty() {
+            self.agents.visible = true;
+            self.focus_only(Panel::Agents);
+            return None;
+        }
+        let project = helix_stdx::env::current_working_dir();
+        if self.agents_project.as_ref() != Some(&project) {
+            self.agents_project = Some(project.clone());
+            let saved = agents::load(&project);
+            if !saved.is_empty() {
+                for session in saved {
+                    if let Err(err) = self.agents.open_agent(session) {
+                        editor.set_error(format!("cannot start agent: {err}"));
+                    }
+                }
+                if !self.agents.is_empty() {
+                    self.focus_only(Panel::Agents);
+                }
+                return None;
+            }
+        }
+        match AgentKind::installed().as_slice() {
+            [] => {
+                editor.set_error("Neither claude nor opencode is on PATH.");
+                None
+            }
+            [kind] => {
+                self.open_agent(*kind, editor);
+                None
+            }
+            _ => Some(Box::new(overlaid(agent_picker()))),
+        }
+    }
+
+    /// Opens a new tab running `kind` on a fresh session, and saves the project's agent tabs.
+    pub fn open_agent(&mut self, kind: AgentKind, editor: &mut Editor) {
+        match self.agents.open_agent(AgentSession::new(kind)) {
+            Ok(()) => {
+                self.focus_only(Panel::Agents);
+                self.save_agents();
+            }
+            Err(err) => editor.set_error(format!("cannot start {}: {err}", kind.command())),
+        }
+    }
+
+    fn save_agents(&mut self) {
+        let project = helix_stdx::env::current_working_dir();
+        agents::save(&project, &self.agents.agent_sessions());
+        self.agents_project = Some(project);
+    }
+
+    /// Ctrl+Shift+A: types an @-mention of the current file (and selected lines) into the agent
+    /// being shown, then focuses it.
+    pub fn mention_in_agent(&mut self, editor: &mut Editor) {
+        let Some(agent) = self.agents.active_agent().cloned() else {
+            editor.set_error("No agent is open. Press Ctrl+4 to start one.");
+            return;
+        };
+        let (view, doc) = current_ref!(editor);
+        let Some(path) = doc.path() else {
+            editor.set_error("This buffer has no file to mention.");
+            return;
+        };
+        let cwd = helix_stdx::env::current_working_dir();
+        let relative = path
+            .strip_prefix(&cwd)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let text = doc.text().slice(..);
+        let range = doc.selection(view.id).primary();
+        let lines = (range.len() > 1).then(|| {
+            let (start, end) = range.line_range(text);
+            (start + 1, end + 1)
+        });
+        self.agents.send_text(&agent.mention(&relative, lines));
+        self.agents.visible = true;
+        self.focus_only(Panel::Agents);
     }
 
     /// Splits `frame` into the sidebar box, the editor box and the terminal box. The editor and
@@ -1596,6 +1702,18 @@ impl EditorView {
             if width + EDITOR_MIN_WIDTH <= frame.width {
                 self.sidebar_box = Some(frame.with_width(width));
                 main = frame.clip_left(width);
+            }
+        }
+        self.agents_box = None;
+        if self.agents.visible && !self.agents.is_empty() {
+            let width = self
+                .agents_width
+                .unwrap_or((frame.width * 2 / 5).clamp(AGENTS_DEFAULT.0, AGENTS_DEFAULT.1))
+                .min(main.width.saturating_sub(EDITOR_MIN_WIDTH))
+                .max(AGENTS_MIN);
+            if width + EDITOR_MIN_WIDTH <= main.width {
+                self.agents_box = Some(Rect::new(main.right() - width, main.y, width, main.height));
+                main = main.with_width(main.width - width);
             }
         }
         self.main_box = main;
@@ -1700,6 +1818,15 @@ impl EditorView {
             draw_terminal(surface);
             draw_editor(surface);
         }
+        if let Some(agents_box) = self.agents_box {
+            frame::draw_box(
+                surface,
+                agents_box,
+                border(self.agents.focused),
+                End::Corner,
+                End::Corner,
+            );
+        }
         self.render_editor_labels(editor, surface, &roles);
 
         // The focused view's position in its document, on the editor box's right border.
@@ -1800,8 +1927,15 @@ impl EditorView {
                         && mouse.column >= terminal.x
                         && mouse.column < terminal.right()
                 });
+                let on_agents_edge = self.agents_box.is_some_and(|agents| {
+                    (mouse.column == agents.x || mouse.column + 1 == agents.x)
+                        && mouse.row >= agents.y
+                        && mouse.row < agents.bottom()
+                });
                 let edge = if on_sidebar_edge {
                     Edge::Sidebar
+                } else if on_agents_edge {
+                    Edge::Agents
                 } else if on_divider {
                     Edge::Terminal
                 } else {
@@ -1823,6 +1957,10 @@ impl EditorView {
                     Edge::Sidebar => {
                         let left = self.sidebar_box.map_or(0, |sidebar| sidebar.x);
                         self.sidebar_width = Some(mouse.column.saturating_sub(left) + 1);
+                    }
+                    Edge::Agents => {
+                        let right = self.agents_box.map_or(0, |agents| agents.right());
+                        self.agents_width = Some(right.saturating_sub(mouse.column));
                     }
                     Edge::Terminal => {
                         // The divider follows the mouse: the rows below it, less the border.
@@ -1853,7 +1991,20 @@ impl EditorView {
         if key.modifiers != KeyModifiers::ALT | KeyModifiers::SHIFT {
             return false;
         }
-        let sidebar = self.sidebar_box.map(|sidebar| sidebar.width);
+        // With the agents focused, left and right resize the agent panel.
+        if self.agents.focused {
+            if let Some(width) = self.agents_box.map(|agents| agents.width) {
+                match key.code {
+                    KeyCode::Left => self.agents_width = Some(width + 2),
+                    KeyCode::Right => self.agents_width = Some(width.saturating_sub(2)),
+                    _ => {}
+                }
+            }
+        }
+        let sidebar = self
+            .sidebar_box
+            .filter(|_| !self.agents.focused)
+            .map(|sidebar| sidebar.width);
         let terminal = self
             .terminal_box
             .map(|terminal| terminal.height.saturating_sub(2));
@@ -1975,6 +2126,13 @@ impl EditorView {
                 self.terminal.mouse(mouse);
                 Some(EventResult::Consumed(None))
             }
+            Event::Mouse(mouse) if self.agents.contains(mouse.column, mouse.row) => {
+                if let MouseEventKind::Down(_) = mouse.kind {
+                    self.focus_only(Panel::Agents);
+                }
+                self.agents.mouse(mouse);
+                Some(EventResult::Consumed(None))
+            }
             Event::Mouse(mouse) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_editor();
@@ -1982,7 +2140,10 @@ impl EditorView {
                 None
             }
             Event::Key(key)
-                if self.terminal.focused || self.file_tree.focused || self.git.focused =>
+                if self.terminal.focused
+                    || self.file_tree.focused
+                    || self.git.focused
+                    || self.agents.focused =>
             {
                 cx.editor.reset_idle_timer();
                 let ctrl = key.modifiers == KeyModifiers::CONTROL;
@@ -1990,6 +2151,13 @@ impl EditorView {
                     KeyCode::Char('1') if ctrl => self.toggle_git(),
                     KeyCode::Char('2') if ctrl => self.focus_editor(),
                     KeyCode::Char('3') if ctrl => self.toggle_terminal(cx.editor),
+                    KeyCode::Char('4') if ctrl => {
+                        if let Some(picker) = self.toggle_agents(cx.editor) {
+                            return Some(EventResult::Consumed(Some(Box::new(
+                                move |compositor, _| compositor.push(picker),
+                            ))));
+                        }
+                    }
                     KeyCode::Char('5') if ctrl => self.toggle_file_tree(cx.editor),
                     _ if self.file_tree.focused => {
                         let action = self.file_tree.key(*key, cx.editor);
@@ -1999,10 +2167,17 @@ impl EditorView {
                         let action = self.git.key(*key, cx.editor);
                         return Some(self.git_action(action));
                     }
+                    KeyCode::PageUp if ctrl && self.agents.focused => self.agents.cycle(false),
+                    KeyCode::PageDown if ctrl && self.agents.focused => self.agents.cycle(true),
+                    _ if self.agents.focused => self.agents.key(*key),
                     KeyCode::PageUp if ctrl => self.terminal.cycle(false),
                     KeyCode::PageDown if ctrl => self.terminal.cycle(true),
                     _ => self.terminal.key(*key),
                 }
+                Some(EventResult::Consumed(None))
+            }
+            Event::Paste(text) if self.agents.focused => {
+                self.agents.paste(text);
                 Some(EventResult::Consumed(None))
             }
             Event::Paste(text) if self.terminal.focused => {
@@ -2196,6 +2371,18 @@ impl Component for EditorView {
         // and, below a shared divider, the terminal. The last row stays for the command line.
         let frame = area.clip_bottom(1);
         self.terminal.update();
+        let (finished, closed) = self.agents.update();
+        if closed {
+            self.save_agents();
+        }
+        for run in finished.iter().filter(|run| !run.seen) {
+            let project = helix_stdx::env::current_working_dir();
+            let project = project
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            agents::notify(&format!("{} finished", run.name), &project);
+        }
         self.layout_frame(frame);
         let editor_box = self.editor_box;
         let inner = |rect: Rect| {
@@ -2210,7 +2397,10 @@ impl Component for EditorView {
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(inner(editor_box));
 
-        let editor_focused = !self.terminal.focused && !self.file_tree.focused && !self.git.focused;
+        let editor_focused = !self.terminal.focused
+            && !self.file_tree.focused
+            && !self.git.focused
+            && !self.agents.focused;
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
             self.render_view(
@@ -2229,6 +2419,11 @@ impl Component for EditorView {
             // The divider row and the inside, without the bottom border.
             let panel = terminal_box.clip_bottom(1);
             self.terminal.render(panel, surface, &cx.editor.theme);
+        }
+        if let Some(agents_box) = self.agents_box {
+            // The top border holds the tab labels; the agent runs inside the box.
+            self.agents
+                .render(agents_box.clip_bottom(1), surface, &cx.editor.theme);
         }
         if let Some(sidebar) = self.sidebar_box {
             if self.git.visible {
@@ -2347,6 +2542,9 @@ impl Component for EditorView {
         if self.terminal.visible && self.terminal.focused {
             return self.terminal.cursor();
         }
+        if self.agents.visible && self.agents.focused {
+            return self.agents.cursor();
+        }
         if (self.file_tree.visible && self.file_tree.focused)
             || (self.git.visible && self.git.focused)
         {
@@ -2375,4 +2573,29 @@ fn canonicalize_key(key: &mut KeyEvent) {
     {
         key.modifiers.remove(KeyModifiers::SHIFT)
     }
+}
+
+/// Which agent to start, when both are installed.
+fn agent_picker() -> super::Picker<AgentKind, ()> {
+    let columns = [super::PickerColumn::new("agent", |kind: &AgentKind, _| {
+        kind.command().into()
+    })];
+    super::Picker::new(
+        columns,
+        0,
+        AgentKind::installed(),
+        (),
+        |cx, kind, _action| {
+            let kind = *kind;
+            cx.jobs.callback(async move {
+                Ok(crate::job::Callback::EditorCompositor(Box::new(
+                    move |editor, compositor| {
+                        if let Some(editor_view) = compositor.find::<EditorView>() {
+                            editor_view.open_agent(kind, editor);
+                        }
+                    },
+                )))
+            });
+        },
+    )
 }

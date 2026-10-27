@@ -8,9 +8,11 @@ use std::{
     borrow::Cow,
     path::PathBuf,
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use alacritty_terminal::{
@@ -38,6 +40,7 @@ use helix_view::{
 use tui::buffer::Buffer as Surface;
 
 use super::{
+    agents::AgentSession,
     frame::{labels_left, Label},
     panel_style::Roles,
 };
@@ -55,19 +58,35 @@ impl EventListener for Listener {
     }
 }
 
+/// A program is busy while it writes; this much silence makes it idle again.
+const QUIET: Duration = Duration::from_millis(1500);
+/// Only a busy stretch this long counts as a finished run worth a notification.
+const LONG_RUN: Duration = Duration::from_secs(5);
+
 struct Session {
     term: Arc<FairMutex<Term<Listener>>>,
     pty: EventLoopSender,
     events: Receiver<TermEvent>,
-    /// What the tab strip shows: the program name until the program sets a title.
+    /// What the tab strip shows: the program's name.
     name: String,
-    title: Option<String>,
+    /// The agent session this tab runs, for agent tabs.
+    agent: Option<AgentSession>,
+    /// When the current busy stretch started, and when the program last wrote.
+    busy_since: Option<Instant>,
+    last_output: Option<Instant>,
+    /// Finished a long run while you were elsewhere; cleared once the tab is looked at.
+    attention: bool,
     exited: bool,
     size: (u16, u16),
 }
 
 impl Session {
-    fn spawn(command: &[String], name: Option<String>, size: (u16, u16)) -> anyhow::Result<Self> {
+    fn spawn(
+        command: &[String],
+        name: Option<String>,
+        agent: Option<AgentSession>,
+        size: (u16, u16),
+    ) -> anyhow::Result<Self> {
         let (cols, rows) = size;
         let shell = command
             .split_first()
@@ -118,7 +137,10 @@ impl Session {
             pty,
             events,
             name,
-            title: None,
+            agent,
+            busy_since: None,
+            last_output: None,
+            attention: false,
             exited: false,
             size,
         })
@@ -147,8 +169,11 @@ impl Session {
                 TermEvent::TextAreaSizeRequest(format) => {
                     self.write(format(window_size(self.size)).into_bytes())
                 }
-                TermEvent::Title(title) => self.title = Some(title),
-                TermEvent::ResetTitle => self.title = None,
+                TermEvent::Wakeup => {
+                    let now = Instant::now();
+                    self.last_output = Some(now);
+                    self.busy_since.get_or_insert(now);
+                }
                 TermEvent::ChildExit(_) | TermEvent::Exit => self.exited = true,
                 _ => {}
             }
@@ -156,7 +181,23 @@ impl Session {
     }
 
     fn label(&self) -> &str {
-        self.title.as_deref().unwrap_or(&self.name)
+        &self.name
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy_since.is_some()
+    }
+
+    /// Ends a busy stretch after a quiet spell. Returns whether it was a long run.
+    fn settle(&mut self, now: Instant) -> bool {
+        let (Some(since), Some(last)) = (self.busy_since, self.last_output) else {
+            return false;
+        };
+        if now.duration_since(last) < QUIET {
+            return false;
+        }
+        self.busy_since = None;
+        last.duration_since(since) >= LONG_RUN
     }
 
     fn mode(&self) -> TermMode {
@@ -179,8 +220,17 @@ fn window_size((cols, rows): (u16, u16)) -> WindowSize {
     }
 }
 
+/// A tab that finished a long run since the last frame.
+pub struct Finished {
+    pub name: String,
+    /// Whether it was the tab you were looking at.
+    pub seen: bool,
+}
+
 #[derive(Default)]
 pub struct TerminalPanel {
+    /// Set into the top border: TERMINAL, AGENTS.
+    title: &'static str,
     sessions: Vec<Session>,
     active: usize,
     pub visible: bool,
@@ -191,22 +241,48 @@ pub struct TerminalPanel {
     area: Rect,
     /// Columns each tab label covered on the top edge last frame.
     tab_hits: Vec<(u16, u16)>,
+    /// A redraw is already scheduled to settle busy tabs.
+    tick: Arc<AtomicBool>,
 }
 
 impl TerminalPanel {
+    pub fn new(title: &'static str) -> Self {
+        Self {
+            title,
+            ..Default::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
 
     /// Opens a new tab running `command`, or the user's shell when it is empty. `name` labels the
-    /// tab until the program sets a title.
+    /// tab; it defaults to the program's name.
     pub fn open(&mut self, command: &[String], name: Option<String>) -> anyhow::Result<()> {
+        self.open_session(command, name, None)
+    }
+
+    /// Opens an agent tab on `agent`'s session.
+    pub fn open_agent(&mut self, agent: AgentSession) -> anyhow::Result<()> {
+        let command = agent.command();
+        let name = Some(agent.kind.command().to_string());
+        self.open_session(&command, name, Some(agent))
+    }
+
+    fn open_session(
+        &mut self,
+        command: &[String],
+        name: Option<String>,
+        agent: Option<AgentSession>,
+    ) -> anyhow::Result<()> {
         let size = if self.grid_area.width > 0 {
             (self.grid_area.width, self.grid_area.height)
         } else {
             (80, 24)
         };
-        self.sessions.push(Session::spawn(command, name, size)?);
+        self.sessions
+            .push(Session::spawn(command, name, agent, size)?);
         self.active = self.sessions.len() - 1;
         self.visible = true;
         self.focused = true;
@@ -239,7 +315,6 @@ impl TerminalPanel {
         }
     }
 
-    /// Gives the panel its slice of `area`, returning what is left for the editor.
     /// Shows tab `index`.
     pub fn select(&mut self, index: usize) {
         if index < self.sessions.len() {
@@ -247,26 +322,73 @@ impl TerminalPanel {
         }
     }
 
-    /// Drains events from every session and drops the ones whose program exited.
-    pub fn update(&mut self) {
-        for session in &mut self.sessions {
+    /// The agent sessions of the open tabs, in tab order.
+    pub fn agent_sessions(&self) -> Vec<AgentSession> {
+        self.sessions
+            .iter()
+            .filter_map(|session| session.agent.clone())
+            .collect()
+    }
+
+    /// The agent session of the tab being shown.
+    pub fn active_agent(&self) -> Option<&AgentSession> {
+        self.sessions.get(self.active)?.agent.as_ref()
+    }
+
+    /// Types `text` into the tab being shown.
+    pub fn send_text(&mut self, text: &str) -> bool {
+        let Some(session) = self.sessions.get(self.active) else {
+            return false;
+        };
+        session.write(text.as_bytes().to_vec());
+        true
+    }
+
+    /// Drains events from every session, drops the ones whose program exited, and reports the
+    /// tabs that just finished a long run. Returns (finished, whether any tab closed).
+    pub fn update(&mut self) -> (Vec<Finished>, bool) {
+        let now = Instant::now();
+        let mut finished = Vec::new();
+        for (index, session) in self.sessions.iter_mut().enumerate() {
             session.drain_events();
+            if session.settle(now) {
+                let seen = self.visible && self.focused && index == self.active;
+                session.attention = !seen;
+                finished.push(Finished {
+                    name: session.name.clone(),
+                    seen,
+                });
+            }
         }
         let before = self.sessions.len();
         self.sessions.retain(|session| !session.exited);
-        if self.sessions.len() != before {
+        let closed = self.sessions.len() != before;
+        if closed {
             self.active = self.active.min(self.sessions.len().saturating_sub(1));
             if self.sessions.is_empty() {
                 self.visible = false;
                 self.focused = false;
             }
         }
+        // A busy tab is settled by a redraw after the quiet spell, even if nothing else draws.
+        if self.sessions.iter().any(Session::is_busy) && !self.tick.swap(true, Ordering::Relaxed) {
+            let tick = self.tick.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(QUIET).await;
+                tick.store(false, Ordering::Relaxed);
+                helix_event::request_redraw();
+            });
+        }
+        (finished, closed)
     }
 
     pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
         self.area = area;
         if area.height < 2 || self.sessions.is_empty() {
             return;
+        }
+        if self.focused {
+            self.sessions[self.active].attention = false;
         }
 
         let strip = area.with_height(1);
@@ -322,14 +444,22 @@ impl TerminalPanel {
     /// Sets TERMINAL and one label per tab into the divider row the frame drew above the panel.
     fn render_tabs(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
         let roles = Roles::new(theme);
-        let mut labels = vec![Label::new("TERMINAL", roles.label())];
+        let mut labels = vec![Label::new(self.title, roles.label())];
         labels.extend(self.sessions.iter().enumerate().map(|(i, session)| {
-            let style = if i == self.active {
-                roles.text.add_modifier(Modifier::BOLD)
+            // Status is a glyph, never colour alone: ● working, ✓ finished while away.
+            let (mark, style) = if session.is_busy() {
+                (" ●", roles.warning)
+            } else if session.attention {
+                (" ✓", roles.accent.add_modifier(Modifier::BOLD))
+            } else if i == self.active {
+                ("", roles.text.add_modifier(Modifier::BOLD))
             } else {
-                roles.muted
+                ("", roles.muted)
             };
-            Label::new(format!("{} {}", i + 1, short_label(session.label())), style)
+            Label::new(
+                format!("{} {}{mark}", i + 1, short_label(session.label())),
+                style,
+            )
         }));
         let hits = labels_left(surface, area.y, area.x, area.right() - 1, &labels);
         // The first label is the title; the rest are tabs.
@@ -662,6 +792,34 @@ fn sgr_mouse(event: &MouseEvent, col: u16, row: u16, mode: TermMode) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tab that writes for several seconds, then goes quiet, is reported finished once; a
+    /// short burst is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reports_long_runs_once_they_go_quiet() {
+        let mut panel = TerminalPanel::new("TEST");
+        let busy = "for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 1; done; sleep 30".to_string();
+        panel
+            .open(&["sh".into(), "-c".into(), busy], Some("busy".into()))
+            .unwrap();
+        panel
+            .open(
+                &["sh".into(), "-c".into(), "echo hi; sleep 30".into()],
+                Some("short".into()),
+            )
+            .unwrap();
+        panel.focused = false;
+
+        let mut finished = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(12) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let (done, _) = panel.update();
+            finished.extend(done.into_iter().map(|run| (run.name, run.seen)));
+        }
+        assert_eq!(finished, vec![("busy".to_string(), false)]);
+        assert!(panel.sessions[0].attention);
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         encode_key(KeyEvent { code, modifiers }, TermMode::empty()).unwrap()

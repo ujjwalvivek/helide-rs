@@ -1,3 +1,4 @@
+pub mod agents;
 mod completion;
 mod document;
 pub(crate) mod editor;
