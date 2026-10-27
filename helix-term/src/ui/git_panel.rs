@@ -18,7 +18,7 @@ use helix_view::{
     align_view,
     document::Document,
     editor::Action,
-    graphics::Rect,
+    graphics::{Modifier, Rect},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
     Align, Editor, Theme,
@@ -113,6 +113,8 @@ pub struct Snapshot {
 
 enum Row {
     Header(Section, usize),
+    /// A folder of changed files: section, its path, its depth in the tree.
+    Dir(Section, String, u16),
     File(usize),
     /// File entry index, hunk index.
     Hunk(usize, usize),
@@ -235,7 +237,21 @@ impl GitPanel {
                 rows.push(Row::Gap);
             }
             rows.push(Row::Header(section, files.len()));
+            // A tree, like Zed's git panel: files sorted by path, with a row for each folder
+            // the first time it is reached.
+            let mut files = files;
+            files.sort_by(|a, b| snapshot.entries[*a].path.cmp(&snapshot.entries[*b].path));
+            let mut open: Vec<&str> = Vec::new();
             for file in files {
+                let path = snapshot.entries[file].path.as_str();
+                let parts: Vec<&str> = path.split('/').collect();
+                let dirs = &parts[..parts.len() - 1];
+                let shared = open.iter().zip(dirs).take_while(|(a, b)| a == b).count();
+                open.truncate(shared);
+                for (depth, dir) in dirs.iter().enumerate().skip(shared) {
+                    open.push(dir);
+                    rows.push(Row::Dir(section, dirs[..=depth].join("/"), depth as u16));
+                }
                 rows.push(Row::File(file));
                 let entry = &snapshot.entries[file];
                 let key = (entry.section, entry.path.clone());
@@ -269,6 +285,7 @@ impl GitPanel {
     fn row_key(&self, index: usize) -> Option<String> {
         let snapshot = &self.snapshot;
         match self.rows.get(index)? {
+            Row::Dir(section, path, _) => Some(format!("dir {section:?} {path}")),
             Row::File(i) => {
                 let entry = &snapshot.entries[*i];
                 Some(format!("file {:?} {}", entry.section, entry.path))
@@ -290,7 +307,7 @@ impl GitPanel {
     fn selectable(row: &Row) -> bool {
         matches!(
             row,
-            Row::File(_) | Row::Hunk(..) | Row::Stash(_) | Row::Commit(_)
+            Row::Dir(..) | Row::File(_) | Row::Hunk(..) | Row::Stash(_) | Row::Commit(_)
         )
     }
 
@@ -483,6 +500,14 @@ impl GitPanel {
                     surface.set_string(line.x + 1, y, "COMMITS", roles.label());
                 }
                 Row::Gap => {}
+                Row::Dir(_, path, depth) => {
+                    let x = line.x + 1 + depth;
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    let (glyph, color) = super::file_tree::icon(name, true, true);
+                    surface.set_string(x, y, glyph, roles.text.fg(color));
+                    let room = (line.right() as usize).saturating_sub(x as usize + 3);
+                    surface.set_stringn(x + 2, y, name, room, roles.muted);
+                }
                 Row::File(index) => {
                     let entry = &snapshot.entries[*index];
                     let code_style = match entry.code {
@@ -491,23 +516,21 @@ impl GitPanel {
                         'U' => roles.error,
                         _ => roles.delta,
                     };
-                    let expanded = self.expanded.contains(&(entry.section, entry.path.clone()));
-                    let chevron = match (entry.section, expanded) {
-                        (Section::Untracked, _) => " ",
-                        (_, true) => "▾",
-                        (_, false) => "▸",
+                    let depth = entry.path.matches('/').count() as u16;
+                    let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                    let x = line.x + 1 + depth;
+                    let (glyph, color) = super::file_tree::icon(name, false, false);
+                    surface.set_string(x, y, glyph, roles.text.fg(color));
+                    // The status letter sits at the right edge, in its colour.
+                    let code_x = line.right().saturating_sub(2);
+                    surface.set_string(code_x, y, &entry.code.to_string(), code_style);
+                    let room = (code_x as usize).saturating_sub(x as usize + 3);
+                    let name_style = if entry.code == 'D' {
+                        roles.muted.add_modifier(Modifier::CROSSED_OUT)
+                    } else {
+                        roles.text
                     };
-                    surface.set_string(line.x + 1, y, chevron, roles.muted);
-                    surface.set_string(line.x + 3, y, &entry.code.to_string(), code_style);
-                    let width = inner_width.saturating_sub(4);
-                    // The directory in muted ink, the file name in full ink.
-                    let path = shorten_left(&entry.path, width);
-                    let (dir, name) = match path.rfind('/') {
-                        Some(slash) => path.split_at(slash + 1),
-                        None => ("", path.as_str()),
-                    };
-                    surface.set_string(line.x + 5, y, dir, roles.muted);
-                    surface.set_string(line.x + 5 + dir.width() as u16, y, name, roles.text);
+                    surface.set_stringn(x + 2, y, name, room, name_style);
                 }
                 Row::Hunk(file, h) => {
                     let entry = &snapshot.entries[*file];
@@ -703,6 +726,19 @@ impl GitPanel {
 
     /// Space: stage or unstage a file or hunk, or pop a stash.
     fn primary(&mut self) {
+        if let Some(Row::Dir(section, path, _)) = self.selected_row() {
+            let (section, path) = (*section, path.clone());
+            match section {
+                Section::Staged => self.run(
+                    &["restore", "--staged", "--", &path],
+                    "unstaging",
+                    "",
+                    false,
+                ),
+                _ => self.run(&["add", "--", &path], "staging", "", false),
+            }
+            return;
+        }
         if let Some((entry, hunk)) = self.selected_hunk() {
             let (args, busy): (&[&str], _) = match entry.section {
                 Section::Staged => (&["apply", "--cached", "--reverse", "-"], "unstaging hunk"),
@@ -1429,17 +1465,6 @@ fn last_line(text: &str) -> String {
         .to_string()
 }
 
-/// Keeps the end of a path, which is the part that tells files apart.
-fn shorten_left(path: &str, width: usize) -> String {
-    if path.width() <= width || width < 2 {
-        return path.to_string();
-    }
-    let chars: Vec<char> = path.chars().collect();
-    let keep = width - 1;
-    let tail: String = chars[chars.len().saturating_sub(keep)..].iter().collect();
-    format!("…{tail}")
-}
-
 /// Opens `text` as a read-only, unnamed buffer labelled `label`.
 fn open_scratch(editor: &mut Editor, label: &str, text: &str, language: &str, action: Action) {
     let mut doc = Document::from(
@@ -1597,11 +1622,9 @@ index 111..222 100644
     }
 
     #[test]
-    fn shortens_ages_and_paths() {
+    fn shortens_ages() {
         assert_eq!(short_age("3 hours ago"), "3h");
         assert_eq!(short_age("1 day ago"), "1d");
         assert_eq!(short_age("2 months ago"), "2mo");
-        assert_eq!(shorten_left("src/ui/git_panel.rs", 10), "…_panel.rs");
-        assert_eq!(shorten_left("a.rs", 10), "a.rs");
     }
 }
