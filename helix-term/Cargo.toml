@@ -92,6 +92,9 @@ alacritty_terminal = "0.26"
 # Claude Code IDE integration
 tokio-tungstenite = "0.30"
 
+# Reloading files changed on disk
+notify = "8"
+
 parking_lot.workspace = true
 
 [target.'cfg(windows)'.dependencies]

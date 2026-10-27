@@ -15,6 +15,7 @@ pub mod keymap;
 pub mod logging;
 pub mod mcp;
 pub mod ui;
+pub mod watch;
 
 #[cfg(not(windows))]
 use std::env::var_os;
