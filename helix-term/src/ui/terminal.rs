@@ -389,6 +389,37 @@ impl TerminalPanel {
         self.sessions = indexed.into_iter().map(|(_, session)| session).collect();
     }
 
+    /// The tab whose × is at `column`: labels end in " × ".
+    pub fn close_at(&self, column: u16) -> Option<usize> {
+        self.tab_hits
+            .iter()
+            .position(|&(_, end)| end >= 2 && column == end - 2)
+    }
+
+    /// Closes tab `index`: every pane in it ends.
+    pub fn close_tab(&mut self, index: usize) {
+        let Some(&group) = self.groups().get(index) else {
+            return;
+        };
+        let shown = self.sessions.get(self.active).map(|s| s.group);
+        // Panes before the focused one that go away shift it left.
+        let removed_before = self.sessions[..self.active.min(self.sessions.len())]
+            .iter()
+            .filter(|session| session.group == group)
+            .count();
+        self.sessions.retain(|session| session.group != group);
+        if self.sessions.is_empty() {
+            self.active = 0;
+            self.visible = false;
+            self.focused = false;
+        } else if shown == Some(group) {
+            self.active = (self.active - removed_before).min(self.sessions.len() - 1);
+        } else {
+            // The focused pane stays focused.
+            self.active -= removed_before;
+        }
+    }
+
     /// The index of the tab being shown.
     pub fn shown_tab(&self) -> Option<usize> {
         let group = self.sessions.get(self.active)?.group;
@@ -554,17 +585,26 @@ impl TerminalPanel {
             let members: Vec<&Session> =
                 self.sessions.iter().filter(|s| s.group == group).collect();
             let names: Vec<String> = members.iter().map(|s| short_label(s.label())).collect();
-            // Status is a glyph, never colour alone: ● working, ✓ finished while away.
-            let (mark, style) = if members.iter().any(|s| s.is_busy()) {
-                (" ●", roles.warning)
-            } else if members.iter().any(|s| s.attention) {
-                (" ✓", roles.accent.add_modifier(Modifier::BOLD))
-            } else if Some(group) == shown {
-                ("", roles.text.add_modifier(Modifier::BOLD))
+            // The shown tab is a filled chip, like the editor's. Status is a glyph, never colour
+            // alone: ● working, ✓ finished while away.
+            let chip = roles
+                .selected
+                .patch(roles.accent)
+                .add_modifier(Modifier::BOLD);
+            let base = if Some(group) == shown {
+                chip
             } else {
-                ("", roles.muted)
+                roles.muted
             };
-            Label::new(format!("{} {}{mark}", i + 1, names.join(" · ")), style)
+            let (mark, style) = if members.iter().any(|s| s.is_busy()) {
+                (" ●", base.patch(roles.warning))
+            } else if members.iter().any(|s| s.attention) {
+                (" ✓", base.patch(roles.accent).add_modifier(Modifier::BOLD))
+            } else {
+                ("", base)
+            };
+            // The trailing × closes the tab.
+            Label::new(format!("{} {}{mark} ×", i + 1, names.join(" · ")), style)
         }));
         let hits = labels_left(surface, area.y, area.x, area.right() - 1, &labels);
         // The first label is the title; the rest are tabs.
@@ -1133,6 +1173,35 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         encode_key(KeyEvent { code, modifiers }, TermMode::empty()).unwrap()
+    }
+
+    /// Closing a tab ends its panes and keeps showing the tab that was shown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_tabs_keeps_the_shown_one() {
+        let mut panel = TerminalPanel::new("TEST");
+        let sleep = |name: &str| {
+            (
+                vec!["sh".to_string(), "-c".into(), "sleep 30".into()],
+                Some(name.to_string()),
+            )
+        };
+        for name in ["a", "b", "c"] {
+            let (command, name) = sleep(name);
+            panel.open(&command, name).unwrap();
+        }
+        let (command, name) = sleep("b2");
+        panel.select(1);
+        panel.split(&command, name).unwrap();
+        // Tabs: a | b · b2 | c, showing b2.
+        assert_eq!(panel.groups().len(), 3);
+        panel.close_tab(0);
+        assert_eq!(panel.groups().len(), 2);
+        assert_eq!(panel.sessions[panel.active].name, "b2");
+        panel.close_tab(0);
+        assert_eq!(panel.sessions.len(), 1);
+        assert_eq!(panel.sessions[panel.active].name, "c");
+        panel.close_tab(0);
+        assert!(panel.is_empty() && !panel.visible);
     }
 
     #[test]

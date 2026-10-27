@@ -135,7 +135,7 @@ async fn tabs_open_switch_and_close() -> anyhow::Result<()> {
             ),
             // Each tab keeps its own layout: splitting here leaves the first tab alone.
             (
-                Some("<C-w>v<C-pageup>"),
+                Some("<C-w>v<A-pageup>"),
                 Some(&|app| {
                     assert_eq!(0, app.editor.tree.active_tab());
                     assert_eq!(current_path(app), a);
