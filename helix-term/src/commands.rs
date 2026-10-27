@@ -620,7 +620,7 @@ impl MappableCommand {
         file_tree_toggle, "Show and focus the file tree, or hide it when focused",
         git_panel_toggle, "Show and focus the git panel, or hide it when focused",
         agent_toggle, "Show and focus the agent panel, starting an agent if there is none",
-        agent_mention, "Mention the current file and selected lines in the agent",
+        agent_mention, "Mention this file (and selected lines) in the agent",
         tab_new, "Open the current buffer in a new tab",
         tab_next, "Go to next tab",
         tab_prev, "Go to previous tab",
