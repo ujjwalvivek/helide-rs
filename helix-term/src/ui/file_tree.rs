@@ -12,7 +12,7 @@ use std::{
 use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::{
     editor::Action,
-    graphics::{Modifier, Rect},
+    graphics::{Color, Modifier, Rect},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
     Editor,
@@ -216,24 +216,14 @@ impl FileTree {
             }
             let is_current = current.as_deref() == Some(row.path.as_path());
             let expanded = row.is_dir && self.expanded.contains(&row.path);
-            let chevron = match (row.is_dir, expanded) {
-                (false, _) => " ",
-                (true, true) => "▾",
-                (true, false) => "▸",
-            };
             let indent = 2 * row.depth as u16;
             let mut x = line.x + 1 + indent;
-            if x + 4 >= line.right() {
+            if x + 3 >= line.right() {
                 continue;
             }
-            surface.set_string(x, y, chevron, roles.muted);
-            x += 2;
-            let icon_style = if is_current {
-                roles.accent
-            } else {
-                roles.muted
-            };
-            surface.set_string(x, y, icon(&row.name, row.is_dir, expanded), icon_style);
+            // The icon is the chevron: an open or closed folder, or the file type in its colour.
+            let (glyph, color) = icon(&row.name, row.is_dir, expanded);
+            surface.set_string(x, y, glyph, roles.text.fg(color));
             x += 2;
             let name_style = if is_current {
                 roles.accent.add_modifier(Modifier::BOLD)
@@ -523,61 +513,74 @@ fn refresh_later(cx: &mut compositor::Context, focus_editor: bool) {
     });
 }
 
-/// A Nerd Font icon for a tree row, picked by directory state, file name, then extension.
-fn icon(name: &str, is_dir: bool, expanded: bool) -> &'static str {
+/// A Nerd Font icon for a tree row and its colour, picked by directory state, file name, then
+/// extension. Colours follow nvim-web-devicons and mini.icons (as glyph.hx does), so a file
+/// type looks the same here as in other editors; folders are azure, unknown files grey. A
+/// folder's open or closed icon is its expanded state; there is no separate chevron.
+fn icon(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) {
+    const FOLDER: Color = Color::Rgb(0x7e, 0xba, 0xe4);
+    const GREY: Color = Color::Rgb(0x6d, 0x80, 0x86);
+    let rgb = |hex: u32| Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
     if is_dir {
         return match (name, expanded) {
-            (".git" | ".github", _) => "\u{e5fb}",
-            ("node_modules", _) => "\u{e5fa}",
-            (_, true) => "\u{f07c}",
-            (_, false) => "\u{f07b}",
+            (".git", _) => ("\u{e5fb}", rgb(0xf54d27)),
+            (".github", _) => ("\u{e5fd}", FOLDER),
+            ("node_modules", _) => ("\u{e5fa}", rgb(0xe8274b)),
+            (_, true) => ("\u{f07c}", FOLDER),
+            (_, false) => ("\u{f07b}", FOLDER),
         };
     }
     let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        "cargo.toml" | "cargo.lock" => return "\u{e7a8}",
-        "dockerfile" | "containerfile" => return "\u{f308}",
-        "makefile" | "justfile" => return "\u{e779}",
-        "license" | "license.md" | "license.txt" | "copying" => return "\u{f0219}",
-        ".gitignore" | ".gitattributes" | ".gitmodules" => return "\u{e702}",
-        "flake.nix" | "flake.lock" => return "\u{f313}",
-        _ => {}
+    let by_name = match lower.as_str() {
+        "cargo.toml" | "cargo.lock" => Some(("\u{e7a8}", rgb(0xdea584))),
+        "dockerfile" | "containerfile" => Some(("\u{f308}", rgb(0x458ee6))),
+        "makefile" | "justfile" => Some(("\u{e779}", rgb(0x6d8086))),
+        "license" | "license.md" | "license.txt" | "copying" => Some(("\u{f0219}", rgb(0xd0bf41))),
+        ".gitignore" | ".gitattributes" | ".gitmodules" => Some(("\u{e702}", rgb(0xf54d27))),
+        "flake.nix" | "flake.lock" => Some(("\u{f313}", rgb(0x7ebae4))),
+        "readme.md" | "readme" => Some(("\u{f00ba}", rgb(0xededed))),
+        _ => None,
+    };
+    if let Some(found) = by_name {
+        return found;
     }
     let extension = lower.rsplit_once('.').map_or("", |(_, ext)| ext);
     match extension {
-        "rs" => "\u{e7a8}",
-        "md" | "markdown" => "\u{e73e}",
-        "toml" => "\u{e6b2}",
-        "json" | "jsonc" | "json5" => "\u{e60b}",
-        "yml" | "yaml" => "\u{e6a8}",
-        "lock" => "\u{f023}",
-        "js" | "mjs" | "cjs" => "\u{e74e}",
-        "ts" | "mts" | "cts" => "\u{e628}",
-        "jsx" | "tsx" => "\u{e7ba}",
-        "py" => "\u{e73c}",
-        "go" => "\u{e627}",
-        "c" | "h" => "\u{e61e}",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "\u{e61d}",
-        "cs" => "\u{f031b}",
-        "java" => "\u{e738}",
-        "kt" | "kts" => "\u{e634}",
-        "swift" => "\u{e755}",
-        "zig" => "\u{e6a9}",
-        "lua" => "\u{e620}",
-        "scm" | "ss" | "rkt" => "\u{e6b1}",
-        "nix" => "\u{f313}",
-        "sh" | "bash" | "zsh" | "fish" | "nu" | "ps1" => "\u{f489}",
-        "html" | "htm" => "\u{e736}",
-        "css" | "scss" | "sass" => "\u{e749}",
-        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" => "\u{f1c5}",
-        "pdf" => "\u{f1c1}",
-        "zip" | "tar" | "gz" | "xz" | "zst" | "7z" => "\u{f410}",
-        "txt" | "log" => "\u{f15c}",
-        "sql" | "db" | "sqlite" => "\u{e706}",
-        "xml" => "\u{f05c0}",
-        "csproj" | "sln" => "\u{e70c}",
-        "kdl" | "conf" | "ini" | "cfg" | "env" => "\u{e615}",
-        _ => "\u{f15b}",
+        "rs" => ("\u{e7a8}", rgb(0xdea584)),
+        "md" | "markdown" => ("\u{e73e}", rgb(0xdddddd)),
+        "toml" => ("\u{e6b2}", rgb(0x9c4221)),
+        "json" | "jsonc" | "json5" => ("\u{e60b}", rgb(0xcbcb41)),
+        "yml" | "yaml" => ("\u{e6a8}", rgb(0x6d8086)),
+        "lock" => ("\u{f023}", rgb(0xbbbbbb)),
+        "js" | "mjs" | "cjs" => ("\u{e74e}", rgb(0xcbcb41)),
+        "ts" | "mts" | "cts" => ("\u{e628}", rgb(0x519aba)),
+        "jsx" | "tsx" => ("\u{e7ba}", rgb(0x20c2e3)),
+        "py" => ("\u{e73c}", rgb(0xffbc03)),
+        "go" => ("\u{e627}", rgb(0x00add8)),
+        "c" | "h" => ("\u{e61e}", rgb(0x599eff)),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => ("\u{e61d}", rgb(0xf34b7d)),
+        "cs" => ("\u{f031b}", rgb(0x596706)),
+        "java" => ("\u{e738}", rgb(0xcc3e44)),
+        "kt" | "kts" => ("\u{e634}", rgb(0x7f52ff)),
+        "swift" => ("\u{e755}", rgb(0xe37933)),
+        "zig" => ("\u{e6a9}", rgb(0xf69a1b)),
+        "lua" => ("\u{e620}", rgb(0x51a0cf)),
+        "scm" | "ss" | "rkt" => ("\u{e6b1}", rgb(0xeeeeee)),
+        "nix" => ("\u{f313}", rgb(0x7ebae4)),
+        "sh" | "bash" | "zsh" | "fish" | "nu" | "ps1" => ("\u{f489}", rgb(0x89e051)),
+        "html" | "htm" => ("\u{e736}", rgb(0xe44d26)),
+        "css" | "scss" | "sass" => ("\u{e749}", rgb(0x42a5f5)),
+        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" => {
+            ("\u{f1c5}", rgb(0xa074c4))
+        }
+        "pdf" => ("\u{f1c1}", rgb(0xb30b00)),
+        "zip" | "tar" | "gz" | "xz" | "zst" | "7z" => ("\u{f410}", rgb(0xeca517)),
+        "txt" | "log" => ("\u{f15c}", rgb(0x89e051)),
+        "sql" | "db" | "sqlite" => ("\u{e706}", rgb(0xdad8d8)),
+        "xml" => ("\u{f05c0}", rgb(0xe37933)),
+        "csproj" | "sln" => ("\u{e70c}", rgb(0x512bd4)),
+        "kdl" | "conf" | "ini" | "cfg" | "env" => ("\u{e615}", rgb(0x6d8086)),
+        _ => ("\u{f15b}", GREY),
     }
 }
 
