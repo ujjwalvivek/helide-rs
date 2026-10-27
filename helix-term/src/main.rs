@@ -33,6 +33,15 @@ async fn main_impl() -> Result<i32> {
     if argv.get(1).map(String::as_str) == Some("mcp") {
         return helix_term::mcp::run();
     }
+    // An editor started from inside Claude Code would hand that session's variables to the
+    // agents it runs, which then treat themselves as child sessions (no transcripts, no
+    // resume). Agent tabs start clean; the IDE server sets its own variables later.
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key == "CLAUDECODE" || key.starts_with("CLAUDE_CODE_") {
+            std::env::remove_var(key.as_ref());
+        }
+    }
 
     let args = Args::parse_args().context("could not parse arguments")?;
 
