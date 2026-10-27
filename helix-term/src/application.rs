@@ -82,6 +82,7 @@ pub struct Application {
 
     ipc: crate::ipc::Ipc,
     ide: crate::ide::Ide,
+    watch: crate::watch::FileWatcher,
 }
 
 #[cfg(feature = "integration")]
@@ -277,6 +278,7 @@ impl Application {
             theme_mode,
             ipc: crate::ipc::Ipc::start(),
             ide: crate::ide::Ide::start(),
+            watch: crate::watch::FileWatcher::start(),
         };
 
         Ok(app)
@@ -284,6 +286,7 @@ impl Application {
 
     async fn render(&mut self) {
         self.ide.after_event(&mut self.editor);
+        self.watch.sync(&self.editor);
         let summary = self.lsp_summary();
         if let Some(editor_view) = self.compositor.find::<ui::EditorView>() {
             editor_view.lsp_summary = summary;
@@ -385,6 +388,14 @@ impl Application {
                         crate::ipc::handle(&mut self.editor, &mut self.jobs, &self.lsp_progress, request)
                     };
                     let _ = reply.send(response);
+                    self.render().await;
+                }
+                Some(mut paths) = self.watch.rx.recv() => {
+                    // Saves and checkouts come in bursts; take everything already queued.
+                    while let Ok(more) = self.watch.rx.try_recv() {
+                        paths.extend(more);
+                    }
+                    crate::watch::reload_changed(&mut self.editor, paths);
                     self.render().await;
                 }
                 Some(call) = self.ide.rx.recv() => {
