@@ -622,6 +622,7 @@ impl MappableCommand {
         agent_toggle, "Show and focus the agent panel, starting an agent if there is none",
         agent_mention, "Mention this file (and selected lines) in the agent",
         zen_toggle, "Zen mode: hide every panel, or bring them back",
+        markdown_preview, "Preview the markdown file beside it, or close the preview",
         goto_location, "Open the newest file:line printed in the terminal (again: older)",
         send_output_to_agent, "Send the last terminal command's output to the agent",
         open_config, "Open the config file",
@@ -7308,6 +7309,16 @@ fn agent_mention(cx: &mut Context) {
         |compositor: &mut Compositor, cx: &mut compositor::Context| {
             if let Some(editor_view) = compositor.find::<ui::EditorView>() {
                 editor_view.mention_in_agent(cx.editor);
+            }
+        },
+    ));
+}
+
+fn markdown_preview(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.toggle_preview(cx.editor);
             }
         },
     ));

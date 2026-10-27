@@ -31,7 +31,7 @@ use helix_view::{
     keyboard::{KeyCode, KeyModifiers},
     Document, DocumentId, Editor, Theme, View, ViewId,
 };
-use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
+use std::{collections::HashMap, mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
 use super::{
     agents::{self, AgentKind, AgentSession},
@@ -157,6 +157,12 @@ pub struct EditorView {
     main_box: Rect,
     editor_box: Rect,
     terminal_box: Option<Rect>,
+    /// Views drawn as a rendered markdown preview: the file they preview, how far down they
+    /// are scrolled, and the file the pane showed before, when the preview reused a pane. A
+    /// view that has since been closed or switched to another file is dropped.
+    previews: HashMap<ViewId, (DocumentId, u16, Option<DocumentId>)>,
+    /// Columns of the PREVIEW button on the editor box's top border last frame.
+    preview_hit: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +208,136 @@ impl EditorView {
             main_box: Rect::default(),
             editor_box: Rect::default(),
             terminal_box: None,
+            previews: HashMap::new(),
+            preview_hit: None,
         }
+    }
+
+    /// Opens a preview of the focused markdown file, or closes it if one is showing. With a
+    /// single pane it splits; with several it reuses the next pane rather than adding another.
+    pub fn toggle_preview(&mut self, editor: &mut Editor) {
+        self.prune_previews(editor);
+        let focus = editor.tree.focus;
+        if self.previews.contains_key(&focus) {
+            self.close_preview(focus, editor);
+            return;
+        }
+        let doc_id = view!(editor).doc;
+        if !super::preview::is_markdown(doc!(editor)) {
+            editor.set_error("Preview works on markdown files");
+            return;
+        }
+        if let Some(open) = self.preview_in_layout(editor, doc_id) {
+            self.close_preview(open, editor);
+            return;
+        }
+        let views: Vec<ViewId> = editor.tree.views().map(|(view, _)| view.id).collect();
+        let (target, previous) = if views.len() == 1 {
+            editor.switch(doc_id, Action::VerticalSplit);
+            (editor.tree.focus, None)
+        } else {
+            let here = views.iter().position(|&id| id == focus).unwrap_or(0);
+            let next = views[(here + 1) % views.len()];
+            // A pane already previewing another file goes back to what it showed first.
+            let previous = match self.previews.remove(&next) {
+                Some((_, _, previous)) => previous,
+                None => editor.tree.try_get(next).map(|view| view.doc),
+            };
+            editor.focus(next);
+            editor.switch(doc_id, Action::Replace);
+            (next, previous)
+        };
+        // Editing goes on in the source; the preview follows it.
+        editor.focus(focus);
+        self.previews.insert(target, (doc_id, 0, previous));
+    }
+
+    /// Closes the preview in `view`: a pane it split off closes, a pane it reused gets its file
+    /// back.
+    fn close_preview(&mut self, view: ViewId, editor: &mut Editor) {
+        let Some((_, _, previous)) = self.previews.remove(&view) else {
+            return;
+        };
+        match previous.filter(|doc| editor.document(*doc).is_some()) {
+            Some(doc) => {
+                let focus = editor.tree.focus;
+                editor.focus(view);
+                editor.switch(doc, Action::Replace);
+                if focus != view {
+                    editor.focus(focus);
+                }
+            }
+            None => editor.close(view),
+        }
+    }
+
+    /// The view in the current layout previewing `doc`, if any.
+    fn preview_in_layout(&self, editor: &Editor, doc: DocumentId) -> Option<ViewId> {
+        editor
+            .tree
+            .views()
+            .map(|(view, _)| view.id)
+            .find(|id| self.previews.get(id).is_some_and(|(d, ..)| *d == doc))
+    }
+
+    /// Forgets previews whose view is gone or now shows another file.
+    fn prune_previews(&mut self, editor: &Editor) {
+        self.previews.retain(|id, (doc, ..)| {
+            editor
+                .tree
+                .try_get(*id)
+                .is_some_and(|view| view.doc == *doc)
+        });
+    }
+
+    /// Scrolls the preview `view` by `lines` (negative is up).
+    fn scroll_preview(&mut self, view: ViewId, lines: i32) -> bool {
+        match self.previews.get_mut(&view) {
+            Some((_, scroll, _)) => {
+                *scroll = (*scroll as i32 + lines).clamp(0, u16::MAX as i32) as u16;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Keys on a focused preview: scrolling and closing. Keys that leave the pane (Space,
+    /// `:`, Ctrl and Alt chords) pass through; anything that would edit the hidden text is
+    /// swallowed.
+    fn preview_key(&mut self, key: &KeyEvent, editor: &mut Editor) -> Option<EventResult> {
+        let focus = editor.tree.focus;
+        if !self.previews.contains_key(&focus)
+            || editor.mode() != Mode::Normal
+            || !self.keymaps.pending().is_empty()
+            || self.on_next_key.is_some()
+        {
+            return None;
+        }
+        let half = (view!(editor).area.height / 2).max(1) as i32;
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => self.scroll_preview(focus, 1),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => self.scroll_preview(focus, -1),
+            KeyCode::Char('d') if ctrl => self.scroll_preview(focus, half),
+            KeyCode::Char('u') if ctrl => self.scroll_preview(focus, -half),
+            KeyCode::PageDown => self.scroll_preview(focus, 2 * half),
+            KeyCode::PageUp => self.scroll_preview(focus, -2 * half),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll_preview(focus, -(u16::MAX as i32)),
+            KeyCode::Char('G') | KeyCode::End => self.scroll_preview(focus, u16::MAX as i32),
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.toggle_preview(editor);
+                true
+            }
+            KeyCode::Char(' ' | ':') => return None,
+            _ if !key.modifiers.is_empty() && key.modifiers != KeyModifiers::SHIFT => return None,
+            KeyCode::Char(_)
+            | KeyCode::Enter
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Tab => true,
+            _ => return None,
+        };
+        Some(EventResult::Consumed(None))
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
@@ -2169,7 +2304,7 @@ impl EditorView {
             .add_modifier(Modifier::BOLD);
         // Layouts: whole arrangements of splits, numbered on the right after HELIDE when there are
         // several. Files are the tabs on the left.
-        let tab_labels: Vec<Label> = if tab_count > 1 {
+        let mut tab_labels: Vec<Label> = if tab_count > 1 {
             std::iter::once(Label::new("HELIDE", roles.label()))
                 .chain((0..tab_count).map(|index| {
                     let style = if index == editor.tree.active_tab() {
@@ -2183,15 +2318,26 @@ impl EditorView {
         } else {
             Vec::new()
         };
+        // PREVIEW, for a markdown file: lit while its preview is open.
+        let focus = editor.tree.focus;
+        let markdown = self.previews.get(&focus).map(|(doc, ..)| *doc).or_else(|| {
+            let doc = doc!(editor);
+            super::preview::is_markdown(doc).then(|| doc.id())
+        });
+        let preview_button = markdown.map(|doc| {
+            let open = self.preview_in_layout(editor, doc).is_some();
+            Label::new("PREVIEW", if open { chip } else { roles.label() })
+        });
+        let has_button = preview_button.is_some();
+        tab_labels.splice(0..0, preview_button);
         let tabs_width: u16 = tab_labels
             .iter()
             .map(|label| label.text.width() as u16 + 2)
             .sum();
-        // The first label is HELIDE; the rest are the layouts.
-        for (start, end) in frame::labels_right(surface, row.y, left, right, &tab_labels)
-            .into_iter()
-            .skip(1)
-        {
+        // PREVIEW comes first, then HELIDE; the rest are the layouts.
+        let mut hits = frame::labels_right(surface, row.y, left, right, &tab_labels).into_iter();
+        self.preview_hit = if has_button { hits.next() } else { None };
+        for (start, end) in hits.skip(1) {
             self.tab_hits.push((row.y, start, end));
         }
 
@@ -2335,6 +2481,38 @@ impl EditorView {
                 true
             }
             MouseEventKind::Down(MouseButton::Left) if self.close_click(mouse, editor) => true,
+            MouseEventKind::Down(MouseButton::Left)
+                if self.zen.is_none()
+                    && mouse.row == self.editor_box.y
+                    && self
+                        .preview_hit
+                        .is_some_and(|(start, end)| (start..end).contains(&mouse.column)) =>
+            {
+                self.toggle_preview(editor);
+                true
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let Some(view) = editor
+                    .tree
+                    .views()
+                    .map(|(view, _)| view)
+                    .find(|view| {
+                        let area = view.area;
+                        (area.x..area.right()).contains(&mouse.column)
+                            && (area.y..area.bottom()).contains(&mouse.row)
+                    })
+                    .map(|view| view.id)
+                else {
+                    return false;
+                };
+                let lines = editor.config().scroll_lines.unsigned_abs() as i32;
+                let lines = if mouse.kind == MouseEventKind::ScrollUp {
+                    -lines
+                } else {
+                    lines
+                };
+                self.scroll_preview(view, lines)
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some((grab, label)) = self.grab_at(mouse.column, mouse.row, editor) else {
                     return false;
@@ -2620,6 +2798,14 @@ impl EditorView {
     ) -> Option<EventResult> {
         match event {
             Event::Key(key) if self.resize_with_key(key) => Some(EventResult::Consumed(None)),
+            Event::Key(key)
+                if !(self.terminal.focused
+                    || self.file_tree.focused
+                    || self.git.focused
+                    || self.agents.focused) =>
+            {
+                self.preview_key(key, cx.editor)
+            }
             Event::Mouse(mouse) if self.drag(mouse, cx.editor) => Some(EventResult::Consumed(None)),
             Event::Mouse(mouse) if self.file_tree.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
@@ -2939,8 +3125,21 @@ impl Component for EditorView {
             && !self.file_tree.focused
             && !self.git.focused
             && !self.agents.focused;
+        self.prune_previews(cx.editor);
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
+            if let Some((_, scroll, _)) = self.previews.get_mut(&view.id) {
+                super::preview::render(
+                    view.area,
+                    surface,
+                    doc,
+                    scroll,
+                    &cx.editor.theme,
+                    cx.editor.syn_loader.clone(),
+                    is_focused && editor_focused,
+                );
+                continue;
+            }
             self.render_view(
                 cx.editor,
                 doc,

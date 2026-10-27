@@ -227,6 +227,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "l" => goto_location,
             ">" => send_output_to_agent,
             "z" => zen_toggle,
+            "m" => markdown_preview,
             "f" => file_picker,
             "F" => file_picker_in_current_directory,
             "e" => file_explorer,

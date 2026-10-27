@@ -13,6 +13,7 @@ pub mod overlay;
 pub mod panel_style;
 pub mod picker;
 pub mod popup;
+pub mod preview;
 pub mod prompt;
 mod select;
 mod spinner;
