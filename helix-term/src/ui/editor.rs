@@ -2058,7 +2058,7 @@ impl EditorView {
                     sidebar.bottom() - 1,
                     left,
                     right,
-                    &[Label::new(footer, roles.faint)],
+                    &[Label::new(footer, roles.muted)],
                 );
             }
         }

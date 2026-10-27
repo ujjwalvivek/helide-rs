@@ -35,7 +35,7 @@ use crate::{
 
 /// While shown, the panel re-reads status at most this often (on redraws).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const COMMITS_SHOWN: usize = 12;
+const COMMITS_SHOWN: usize = 40;
 /// Changed lines shown under an expanded hunk before it is cut short.
 const HUNK_LINES_SHOWN: usize = 8;
 
@@ -87,6 +87,19 @@ struct Commit {
     hash: String,
     subject: String,
     when: String,
+    /// Branches and tags pointing at it (`main`, `origin/main`, `tag: v1`).
+    refs: Vec<String>,
+    /// Whether HEAD is here.
+    head: bool,
+    /// Hashes of its parents.
+    parents: Vec<String>,
+    /// Its row of the graph: one glyph per column and the lane colour it is drawn in.
+    graph: Vec<(char, usize)>,
+}
+
+#[derive(Debug, Clone)]
+enum History {
+    Commit(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +122,8 @@ pub struct Snapshot {
     hunks: HashMap<FileKey, Vec<Hunk>>,
     stashes: Vec<Stash>,
     commits: Vec<Commit>,
+    /// The history as git draws it: one line per commit, plus connector lines between them.
+    history: Vec<History>,
 }
 
 enum Row {
@@ -276,7 +291,9 @@ impl GitPanel {
         if !snapshot.commits.is_empty() {
             rows.push(Row::Gap);
             rows.push(Row::CommitsHeader);
-            rows.extend((0..snapshot.commits.len()).map(Row::Commit));
+            rows.extend(snapshot.history.iter().map(|line| match line {
+                History::Commit(commit) => Row::Commit(*commit),
+            }));
         }
         self.rows = rows;
     }
@@ -491,7 +508,7 @@ impl GitPanel {
                     let label = section.title().to_uppercase();
                     surface.set_string(line.x + 1, y, &label, roles.label());
                     let x = line.x + 2 + label.width() as u16;
-                    surface.set_string(x, y, &count.to_string(), roles.faint);
+                    surface.set_string(x, y, &count.to_string(), roles.muted);
                 }
                 Row::StashesHeader => {
                     surface.set_string(line.x + 1, y, "STASHES", roles.label());
@@ -562,7 +579,7 @@ impl GitPanel {
                 }
                 Row::HunkMore(count) => {
                     let label = format!("{count} more lines");
-                    surface.set_stringn(line.x + 7, y, &label, inner_width, roles.faint);
+                    surface.set_stringn(line.x + 7, y, &label, inner_width, roles.muted);
                 }
                 Row::Stash(index) => {
                     let stash = &snapshot.stashes[*index];
@@ -575,21 +592,39 @@ impl GitPanel {
                     surface.set_stringn(subject_x, y, &stash.subject, room, roles.text);
                     if room > 0 {
                         let x = line.right().saturating_sub(when_width as u16 + 1);
-                        surface.set_string(x, y, &stash.when, roles.faint);
+                        surface.set_string(x, y, &stash.when, roles.muted);
                     }
                 }
                 Row::Commit(index) => {
                     let commit = &snapshot.commits[*index];
-                    let hash = &commit.hash[..commit.hash.len().min(7)];
-                    surface.set_string(line.x + 3, y, hash, roles.muted);
-                    let when_width = commit.when.width();
-                    let subject_x = line.x + 3 + hash.width() as u16 + 1;
-                    let room =
-                        (line.right() as usize).saturating_sub(subject_x as usize + when_width + 2);
-                    surface.set_stringn(subject_x, y, &commit.subject, room, roles.text);
+                    let mut x = draw_graph(surface, line.x + 1, y, &commit.graph, &roles);
+                    let when_width = commit.when.width() as u16;
+                    let end = line.right().saturating_sub(when_width + 2);
+                    // Branch and tag names before the subject, in colour only.
+                    for name in &commit.refs {
+                        let (style, label) = match name.strip_prefix("tag: ") {
+                            Some(tag) => (roles.plus, format!("#{tag}")),
+                            None if commit.head && !name.contains('/') => {
+                                (roles.accent, name.clone())
+                            }
+                            None => (roles.muted, name.clone()),
+                        };
+                        if x + label.width() as u16 + 8 > end {
+                            break;
+                        }
+                        surface.set_string(x, y, &label, style);
+                        x += label.width() as u16 + 1;
+                    }
+                    let room = end.saturating_sub(x) as usize;
+                    let subject_style = if commit.head {
+                        roles.text.add_modifier(Modifier::BOLD)
+                    } else {
+                        roles.text
+                    };
+                    surface.set_stringn(x, y, &commit.subject, room, subject_style);
                     if room > 0 {
-                        let x = line.right().saturating_sub(when_width as u16 + 1);
-                        surface.set_string(x, y, &commit.when, roles.faint);
+                        let when_x = line.right().saturating_sub(when_width + 1);
+                        surface.set_string(when_x, y, &commit.when, roles.muted);
                     }
                 }
             }
@@ -949,7 +984,13 @@ impl GitPanel {
             },
         );
         if amend {
-            if let Some(last) = self.snapshot.commits.first() {
+            if let Some(last) = self
+                .snapshot
+                .commits
+                .iter()
+                .find(|commit| commit.head)
+                .or(self.snapshot.commits.first())
+            {
                 prompt = prompt.with_line(last.subject.clone(), editor);
             }
         }
@@ -1264,10 +1305,16 @@ async fn read_snapshot(cwd: &Path, expanded: &[FileKey]) -> Snapshot {
         "-z",
         "--untracked-files=all",
     ]);
+    // Every branch, remote and tag, drawn by git as a graph.
     let log_args = args(&[
         "log",
+        "--topo-order",
         &format!("-n{COMMITS_SHOWN}"),
-        "--format=%H%x1f%s%x1f%cr",
+        "--format=%H%x1f%P%x1f%s%x1f%cr%x1f%D",
+        "--branches",
+        "--remotes",
+        "--tags",
+        "HEAD",
     ]);
     let stash_args = args(&["stash", "list", "--format=%gd%x1f%s%x1f%cr"]);
     let (status, log, stashes) = tokio::join!(
@@ -1281,13 +1328,9 @@ async fn read_snapshot(cwd: &Path, expanded: &[FileKey]) -> Snapshot {
         parse_status(&status.stdout, &mut snapshot);
     }
     if let Ok(log) = log {
-        snapshot.commits = parse_records(&log.stdout)
-            .map(|[hash, subject, when]| Commit {
-                hash,
-                subject,
-                when: short_age(&when),
-            })
-            .collect();
+        let (commits, history) = parse_graph(&log.stdout);
+        snapshot.commits = commits;
+        snapshot.history = history;
     }
     if let Ok(stashes) = stashes {
         snapshot.stashes = parse_records(&stashes.stdout)
@@ -1313,6 +1356,201 @@ async fn read_snapshot(cwd: &Path, expanded: &[FileKey]) -> Snapshot {
     }
     snapshot.repo = Some(repo);
     snapshot
+}
+
+/// Parses `git log --topo-order --format=%H%x1f%P%x1f%s%x1f%cr%x1f%D` and lays out the graph.
+fn parse_graph(output: &str) -> (Vec<Commit>, Vec<History>) {
+    let mut commits: Vec<Commit> = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\x1f');
+            let hash = fields.next()?.to_string();
+            let parents = fields
+                .next()?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let subject = fields.next()?.to_string();
+            let when = short_age(fields.next()?);
+            let refs = fields.next().unwrap_or_default();
+            let head = refs
+                .split(", ")
+                .any(|r| r == "HEAD" || r.starts_with("HEAD -> "));
+            let refs = refs
+                .split(", ")
+                .filter(|r| !r.is_empty() && *r != "HEAD" && !r.ends_with("/HEAD"))
+                .map(|r| r.trim_start_matches("HEAD -> ").to_string())
+                .collect();
+            Some(Commit {
+                hash,
+                subject,
+                when,
+                refs,
+                head,
+                parents,
+                graph: Vec::new(),
+            })
+        })
+        .collect();
+    layout_graph(&mut commits);
+    let history = (0..commits.len()).map(History::Commit).collect();
+    (commits, history)
+}
+
+/// Lays out the commit graph, one row per commit, the way graphical clients draw it: each lane
+/// is a straight `│` column keeping one colour; a commit is `●` in its lane; a branch or merge
+/// leaves or joins it on the commit's own row with rounded corners (`╭╮╰╯`), `─` between, and
+/// `┼` where it crosses another lane. Lanes are two columns apart.
+fn layout_graph(commits: &mut [Commit]) {
+    // Each lane: the commit it is waiting for, and its colour.
+    let mut lanes: Vec<Option<(String, usize)>> = Vec::new();
+    let mut next_color = 0;
+    for commit in commits.iter_mut() {
+        let hash = commit.hash.clone();
+        // The commit's lane: the first that waits for it, else a free one, else a new one.
+        let lane = match lanes
+            .iter()
+            .position(|l| l.as_ref().is_some_and(|(h, _)| *h == hash))
+        {
+            Some(lane) => lane,
+            None => {
+                let color = next_color;
+                next_color += 1;
+                match lanes.iter().position(Option::is_none) {
+                    Some(free) => {
+                        lanes[free] = Some((hash.clone(), color));
+                        free
+                    }
+                    None => {
+                        lanes.push(Some((hash.clone(), color)));
+                        lanes.len() - 1
+                    }
+                }
+            }
+        };
+        let color = lanes[lane].as_ref().map_or(0, |(_, c)| *c);
+        // Lanes running down from above: everything that was waiting before this row.
+        let above: Vec<Option<usize>> = lanes
+            .iter()
+            .enumerate()
+            .map(|(k, l)| {
+                l.as_ref()
+                    .filter(|(h, _)| k != lane || *h == hash)
+                    .map(|(_, c)| *c)
+            })
+            .collect();
+        // Other lanes that wait for this commit end here, joining it.
+        let joining: Vec<(usize, usize)> = lanes
+            .iter()
+            .enumerate()
+            .filter(|(k, l)| *k != lane && l.as_ref().is_some_and(|(h, _)| *h == hash))
+            .map(|(k, l)| (k, l.as_ref().map_or(0, |(_, c)| *c)))
+            .collect();
+        for (k, _) in &joining {
+            lanes[*k] = None;
+        }
+        // The first parent continues the lane; other parents branch off to theirs.
+        lanes[lane] = commit.parents.first().map(|p| (p.clone(), color));
+        let mut leaving: Vec<(usize, usize, bool)> = Vec::new(); // (lane, colour, already running)
+        for parent in commit.parents.iter().skip(1) {
+            if let Some(k) = lanes
+                .iter()
+                .position(|l| l.as_ref().is_some_and(|(h, _)| h == parent))
+            {
+                let c = lanes[k].as_ref().map_or(0, |(_, c)| *c);
+                leaving.push((k, c, true));
+                continue;
+            }
+            let c = next_color;
+            next_color += 1;
+            // A new lane goes where nothing is drawn on this row.
+            let slot = (0..lanes.len()).find(|&k| {
+                k != lane && lanes[k].is_none() && above.get(k).is_none_or(Option::is_none)
+            });
+            let k = match slot {
+                Some(k) => k,
+                None => {
+                    lanes.push(None);
+                    lanes.len() - 1
+                }
+            };
+            lanes[k] = Some((parent.clone(), c));
+            leaving.push((k, c, false));
+        }
+
+        // Draw the row: lanes passing through, the commit, then the joins and branches.
+        let columns = lanes.len().max(above.len()).max(lane + 1);
+        let mut row: Vec<(char, usize)> = vec![(' ', 0); 2 * columns];
+        for (k, slot) in above.iter().enumerate() {
+            let continues = lanes.get(k).is_some_and(Option::is_some);
+            if let (true, Some(c), true) = (k != lane, slot, continues) {
+                row[2 * k] = ('│', *c);
+            }
+        }
+        let connect = |row: &mut Vec<(char, usize)>, to: usize, color: usize, corner: char| {
+            let (from, to_col) = (2 * lane, 2 * to);
+            let (low, high) = if from < to_col {
+                (from, to_col)
+            } else {
+                (to_col, from)
+            };
+            for cell in &mut row[low + 1..high] {
+                *cell = match cell.0 {
+                    '│' | '┼' => ('┼', cell.1),
+                    _ => ('─', color),
+                };
+            }
+            row[to_col] = (corner, color);
+        };
+        for (k, c) in &joining {
+            // A lane coming down from above turns into the commit.
+            connect(&mut row, *k, *c, if *k > lane { '╯' } else { '╰' });
+        }
+        for (k, c, running) in &leaving {
+            let corner = match (*running, *k > lane) {
+                // Joins a lane that already runs through this row.
+                (true, true) => '┤',
+                (true, false) => '├',
+                // Starts a new lane going down.
+                (false, true) => '╮',
+                (false, false) => '╭',
+            };
+            connect(&mut row, *k, *c, corner);
+        }
+        row[2 * lane] = ('●', color);
+        while row.last().is_some_and(|(ch, _)| *ch == ' ') {
+            row.pop();
+        }
+        commit.graph = row;
+
+        while lanes.last().is_some_and(Option::is_none) {
+            lanes.pop();
+        }
+    }
+}
+
+/// Draws a commit's graph row, each lane in its colour. Returns the column after it.
+fn draw_graph(
+    surface: &mut Surface,
+    x: u16,
+    y: u16,
+    graph: &[(char, usize)],
+    roles: &Roles,
+) -> u16 {
+    let lanes = [
+        roles.accent,
+        roles.delta,
+        roles.warning,
+        roles.plus,
+        roles.minus,
+    ];
+    for (i, (ch, color)) in graph.iter().enumerate() {
+        if *ch != ' ' {
+            let style = lanes[color % lanes.len()];
+            surface.set_string(x + i as u16, y, &ch.to_string(), style);
+        }
+    }
+    x + graph.len() as u16 + 1
 }
 
 /// Lines of three `\x1f`-separated fields.
@@ -1619,6 +1857,30 @@ index 111..222 100644
             ]
         );
         assert_eq!(branches[1].when, "3d");
+    }
+
+    /// The rows the layout draws for a merge: the merge, both sides, and where they meet.
+    #[test]
+    fn lays_out_a_merge_with_curves() {
+        let output = [
+            "m\x1fa b\x1fmerge\x1f1 hour ago\x1fHEAD -> main, tag: v1",
+            "b\x1fc\x1fside\x1f2 hours ago\x1fside",
+            "a\x1fc\x1fmain work\x1f3 hours ago\x1f",
+            "c\x1f\x1fstart\x1f1 day ago\x1f",
+        ]
+        .join("\n");
+        let (commits, history) = parse_graph(&output);
+        let rows: Vec<String> = commits
+            .iter()
+            .map(|c| c.graph.iter().map(|(ch, _)| *ch).collect())
+            .collect();
+        assert_eq!(rows, vec!["●─╮", "│ ●", "● │", "●─╯"]);
+        assert_eq!(history.len(), 4);
+        assert!(commits[0].head);
+        assert_eq!(commits[0].refs, vec!["main", "tag: v1"]);
+        // A lane keeps its colour from top to bottom.
+        assert_eq!(commits[1].graph[2].1, commits[0].graph[2].1);
+        assert_eq!(commits[3].graph[2].1, commits[0].graph[2].1);
     }
 
     #[test]
