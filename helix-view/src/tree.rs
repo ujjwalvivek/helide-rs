@@ -15,6 +15,16 @@ pub struct Tree {
 
     // used for traversals
     stack: Vec<(ViewId, Rect)>,
+
+    /// Helide tabs: one root container per tab, in order. `root` and `focus` are the active
+    /// tab's; the focus stored here for the active tab is stale until it is switched away from.
+    tabs: Vec<Tab>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Tab {
+    root: ViewId,
+    focus: ViewId,
 }
 
 #[derive(Debug)]
@@ -100,6 +110,7 @@ impl Tree {
             area,
             nodes,
             stack: Vec::new(),
+            tabs: vec![Tab { root, focus: root }],
         }
     }
 
@@ -253,8 +264,9 @@ impl Tree {
             self.focus = self.prev();
         }
 
+        let tab_root = self.root_of(index);
         let parent = self.nodes[index].parent;
-        let parent_is_root = parent == self.root;
+        let parent_is_root = parent == tab_root;
 
         self.remove_or_replace(index, None);
 
@@ -266,10 +278,132 @@ impl Tree {
             self.remove_or_replace(parent, Some(sibling));
         }
 
+        self.after_remove_in_tab(tab_root, index);
         self.recalculate()
     }
 
+    /// Drops the tab rooted at `tab_root` if `removed` was its last view (unless it is the only
+    /// tab), and keeps a background tab's remembered focus valid.
+    fn after_remove_in_tab(&mut self, tab_root: ViewId, removed: ViewId) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.root == tab_root) else {
+            return;
+        };
+        let empty = self.container_mut(tab_root).children.is_empty();
+        if empty && self.tabs.len() > 1 {
+            self.tabs.remove(index);
+            self.nodes.remove(tab_root);
+            if tab_root == self.root {
+                let next = self.tabs[index.min(self.tabs.len() - 1)];
+                self.root = next.root;
+                self.focus = next.focus;
+            }
+        } else if tab_root != self.root && self.tabs[index].focus == removed {
+            let first = Traverse::from_root(self, tab_root).next().map(|(id, _)| id);
+            self.tabs[index].focus = first.unwrap_or(tab_root);
+        }
+    }
+
+    /// The root container of the tab holding `id`.
+    fn root_of(&self, mut id: ViewId) -> ViewId {
+        loop {
+            let parent = self.nodes[id].parent;
+            if parent == id {
+                return id;
+            }
+            id = parent;
+        }
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_tab(&self) -> usize {
+        self.tabs
+            .iter()
+            .position(|tab| tab.root == self.root)
+            .unwrap_or(0)
+    }
+
+    /// The index of the tab holding view `id`.
+    pub fn tab_of(&self, id: ViewId) -> usize {
+        let root = self.root_of(id);
+        self.tabs
+            .iter()
+            .position(|tab| tab.root == root)
+            .unwrap_or(0)
+    }
+
+    /// The focused view of tab `index`, or `None` if the tab is empty.
+    pub fn tab_focus(&self, index: usize) -> Option<ViewId> {
+        let tab = self.tabs.get(index)?;
+        let focus = if tab.root == self.root {
+            self.focus
+        } else {
+            tab.focus
+        };
+        self.try_get(focus).map(|view| view.id)
+    }
+
+    /// The views of tab `index`, in layout order.
+    pub fn tab_views(&self, index: usize) -> Vec<ViewId> {
+        self.tabs
+            .get(index)
+            .map(|tab| {
+                Traverse::from_root(self, tab.root)
+                    .map(|(id, _)| id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Opens `view` in a new tab after the active one and switches to it.
+    pub fn new_tab(&mut self, view: View) -> ViewId {
+        let active = self.active_tab();
+        self.tabs[active].focus = self.focus;
+
+        let root = self.nodes.insert(Node::container(Layout::Vertical));
+        self.nodes[root].parent = root;
+        self.tabs.insert(active + 1, Tab { root, focus: root });
+        self.root = root;
+        self.focus = root;
+        self.insert(view)
+    }
+
+    pub fn switch_tab(&mut self, index: usize) {
+        let active = self.active_tab();
+        if index == active || index >= self.tabs.len() {
+            return;
+        }
+        self.tabs[active].focus = self.focus;
+        self.root = self.tabs[index].root;
+        self.focus = self.tabs[index].focus;
+        self.recalculate();
+    }
+
+    /// The views of the active tab.
     pub fn views(&self) -> impl Iterator<Item = (&View, bool)> {
+        let focus = self.focus;
+        self.traverse().map(move |(key, view)| (view, focus == key))
+    }
+
+    /// The views of the active tab.
+    pub fn views_mut(&mut self) -> impl Iterator<Item = (&mut View, bool)> {
+        let active: Vec<ViewId> = self.traverse().map(|(id, _)| id).collect();
+        let focus = self.focus;
+        self.nodes
+            .iter_mut()
+            .filter_map(move |(key, node)| match node {
+                Node {
+                    content: Content::View(view),
+                    ..
+                } if active.contains(&key) => Some((view.as_mut(), focus == key)),
+                _ => None,
+            })
+    }
+
+    /// The views of every tab.
+    pub fn all_views(&self) -> impl Iterator<Item = (&View, bool)> {
         let focus = self.focus;
         self.nodes.iter().filter_map(move |(key, node)| match node {
             Node {
@@ -280,7 +414,8 @@ impl Tree {
         })
     }
 
-    pub fn views_mut(&mut self) -> impl Iterator<Item = (&mut View, bool)> {
+    /// The views of every tab.
+    pub fn all_views_mut(&mut self) -> impl Iterator<Item = (&mut View, bool)> {
         let focus = self.focus;
         self.nodes
             .iter_mut()
@@ -679,9 +814,13 @@ pub struct Traverse<'a> {
 
 impl<'a> Traverse<'a> {
     fn new(tree: &'a Tree) -> Self {
+        Self::from_root(tree, tree.root)
+    }
+
+    fn from_root(tree: &'a Tree, root: ViewId) -> Self {
         Self {
             tree,
-            stack: vec![tree.root],
+            stack: vec![root],
         }
     }
 }
@@ -964,5 +1103,59 @@ mod test {
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn tabs_keep_their_own_layout_and_focus() {
+        let mut tree = Tree::new(Rect::new(0, 0, 180, 80));
+        let view = || View::new(DocumentId::default(), GutterConfig::default());
+
+        let a0 = tree.insert(view());
+        let a1 = tree.split(view(), Layout::Vertical);
+        tree.focus = a0;
+
+        let b0 = tree.new_tab(view());
+        assert_eq!(2, tree.tab_count());
+        assert_eq!(1, tree.active_tab());
+        assert_eq!(b0, tree.focus);
+        // Only the active tab's views are iterated and laid out over the whole area.
+        assert_eq!(
+            vec![b0],
+            tree.views().map(|(v, _)| v.id).collect::<Vec<_>>()
+        );
+        assert_eq!(3, tree.all_views().count());
+        assert_eq!(180, tree.get(b0).area.width);
+
+        tree.switch_tab(0);
+        assert_eq!(a0, tree.focus, "focus is remembered per tab");
+        assert_eq!(vec![a0, a1], tree.tab_views(0));
+        assert_eq!(1, tree.tab_of(b0));
+        assert_eq!(Some(b0), tree.tab_focus(1));
+    }
+
+    #[test]
+    fn removing_the_last_view_of_a_tab_closes_the_tab() {
+        let mut tree = Tree::new(Rect::new(0, 0, 180, 80));
+        let view = || View::new(DocumentId::default(), GutterConfig::default());
+
+        let a0 = tree.insert(view());
+        let b0 = tree.new_tab(view());
+        let c0 = tree.new_tab(view());
+        assert_eq!(3, tree.tab_count());
+
+        // Closing the active tab's only view moves to the tab that took its place.
+        tree.remove(c0);
+        assert_eq!(2, tree.tab_count());
+        assert_eq!(b0, tree.focus);
+
+        // A background tab can lose its last view too.
+        tree.remove(a0);
+        assert_eq!(1, tree.tab_count());
+        assert_eq!(b0, tree.focus);
+        assert!(!tree.is_empty());
+
+        // The last view of the last tab empties the tree, as before.
+        tree.remove(b0);
+        assert!(tree.is_empty());
     }
 }

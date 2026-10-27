@@ -112,3 +112,105 @@ async fn file_tree_keys_toggle_focus() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tabs_open_switch_and_close() -> anyhow::Result<()> {
+    let file_a = tempfile::NamedTempFile::new()?;
+    let file_b = tempfile::NamedTempFile::new()?;
+    let a = path::normalize(file_a.path());
+    let b = path::normalize(file_b.path());
+
+    let mut app = helpers::AppBuilder::new().with_file(&a, None).build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (
+                Some(&format!(":tabnew {}<ret>", b.display())),
+                Some(&|app| {
+                    assert_eq!(2, app.editor.tree.tab_count());
+                    assert_eq!(1, app.editor.tree.active_tab());
+                    assert_eq!(current_path(app), b);
+                }),
+            ),
+            // Each tab keeps its own layout: splitting here leaves the first tab alone.
+            (
+                Some("<C-w>v<C-pageup>"),
+                Some(&|app| {
+                    assert_eq!(0, app.editor.tree.active_tab());
+                    assert_eq!(current_path(app), a);
+                    assert_eq!(1, app.editor.tree.views().count());
+                    assert_eq!(2, app.editor.tree.tab_views(1).len());
+                }),
+            ),
+            (
+                Some(":tabn 2<ret>"),
+                Some(&|app| assert_eq!(1, app.editor.tree.active_tab())),
+            ),
+            // Closing a buffer shown only in a background tab removes that tab.
+            (
+                Some(&format!(":tabn 1<ret>:buffer-close {}<ret>", b.display())),
+                Some(&|app| {
+                    assert_eq!(1, app.editor.tree.tab_count());
+                    assert_eq!(current_path(app), a);
+                }),
+            ),
+            // :q in a tab closes the tab instead of the editor.
+            (
+                Some(":tabnew<ret>:q<ret>"),
+                Some(&|app| {
+                    assert_eq!(1, app.editor.tree.tab_count());
+                    assert!(!app.editor.should_close());
+                }),
+            ),
+            (
+                Some(":tabc<ret>"),
+                Some(&|app| {
+                    assert_eq!(1, app.editor.tree.tab_count());
+                    assert!(!app.editor.should_close());
+                }),
+            ),
+        ],
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tree_opens_in_new_tab() -> anyhow::Result<()> {
+    let dir = scratch_dir()?;
+    let dir_path = path::normalize(dir.path().canonicalize()?);
+    std::fs::write(dir_path.join("a.rs"), "")?;
+    std::fs::write(dir_path.join("b.rs"), "")?;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(dir_path.join("a.rs"), None)
+        .build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (
+                Some("<C-5>jt"),
+                Some(&|app| {
+                    assert_eq!(2, app.editor.tree.tab_count());
+                    assert_eq!(current_path(app), dir_path.join("b.rs"));
+                }),
+            ),
+            // Quitting only closes the tab while others remain.
+            (
+                Some(":q<ret>"),
+                Some(&|app| {
+                    assert_eq!(1, app.editor.tree.tab_count());
+                    assert_eq!(current_path(app), dir_path.join("a.rs"));
+                }),
+            ),
+        ],
+        false,
+    )
+    .await?;
+
+    Ok(())
+}

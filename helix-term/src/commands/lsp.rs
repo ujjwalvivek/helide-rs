@@ -1334,7 +1334,7 @@ pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::
         return;
     }
 
-    for (view, _) in editor.tree.views() {
+    for (view, _) in editor.tree.all_views() {
         let doc = match editor.documents.get(&view.doc) {
             Some(doc) => doc,
             None => continue,
