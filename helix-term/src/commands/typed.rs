@@ -2733,6 +2733,41 @@ fn tab_prev(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+fn agent(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    use ui::agents::AgentKind;
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let kind = match args.first() {
+        Some(name) => Some(
+            AgentKind::from_name(name)
+                .ok_or_else(|| anyhow!("unknown agent '{name}': use claude or opencode"))?,
+        ),
+        None => None,
+    };
+    cx.jobs.callback(async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                let Some(editor_view) = compositor.find::<ui::EditorView>() else {
+                    return;
+                };
+                let picker = match kind {
+                    Some(kind) => {
+                        editor_view.open_agent(kind, editor);
+                        None
+                    }
+                    None => editor_view.toggle_agents(editor),
+                };
+                if let Some(picker) = picker {
+                    compositor.push(picker);
+                }
+            },
+        ));
+        Ok(call)
+    });
+    Ok(())
+}
+
 fn git_panel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -4136,6 +4171,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "agent",
+        aliases: &[],
+        doc: "Start an agent in a new tab of the agent panel: claude or opencode. Without a name, toggle the panel.",
+        fun: agent,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },

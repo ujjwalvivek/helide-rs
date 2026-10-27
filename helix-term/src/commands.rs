@@ -619,6 +619,8 @@ impl MappableCommand {
         terminal_toggle, "Show and focus the terminal panel, or hide it when focused",
         file_tree_toggle, "Show and focus the file tree, or hide it when focused",
         git_panel_toggle, "Show and focus the git panel, or hide it when focused",
+        agent_toggle, "Show and focus the agent panel, starting an agent if there is none",
+        agent_mention, "Mention the current file and selected lines in the agent",
         tab_new, "Open the current buffer in a new tab",
         tab_next, "Go to next tab",
         tab_prev, "Go to previous tab",
@@ -7279,6 +7281,29 @@ fn git_panel_toggle(cx: &mut Context) {
         |compositor: &mut Compositor, _: &mut compositor::Context| {
             if let Some(editor_view) = compositor.find::<ui::EditorView>() {
                 editor_view.toggle_git();
+            }
+        },
+    ));
+}
+
+fn agent_toggle(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            let picker = compositor
+                .find::<ui::EditorView>()
+                .and_then(|editor_view| editor_view.toggle_agents(cx.editor));
+            if let Some(picker) = picker {
+                compositor.push(picker);
+            }
+        },
+    ));
+}
+
+fn agent_mention(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.mention_in_agent(cx.editor);
             }
         },
     ));
