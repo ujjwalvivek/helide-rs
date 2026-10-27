@@ -216,7 +216,7 @@ impl FileTree {
             }
             let is_current = current.as_deref() == Some(row.path.as_path());
             let expanded = row.is_dir && self.expanded.contains(&row.path);
-            let indent = 2 * row.depth as u16;
+            let indent = row.depth as u16;
             let mut x = line.x + 1 + indent;
             if x + 3 >= line.right() {
                 continue;
