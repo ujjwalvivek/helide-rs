@@ -47,13 +47,19 @@ use super::{
 
 const SCROLLBACK: usize = 10_000;
 
-/// Forwards terminal events to the panel and wakes the editor so it redraws.
+/// Forwards terminal events to the panel and wakes the editor so it redraws. Events arrive on
+/// the PTY reader thread, so the redraw is requested from inside the editor's runtime, where
+/// helix-event keeps its state.
 #[derive(Clone)]
-struct Listener(Sender<TermEvent>);
+struct Listener {
+    events: Sender<TermEvent>,
+    runtime: Option<tokio::runtime::Handle>,
+}
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.0.send(event);
+        let _ = self.events.send(event);
+        let _guard = self.runtime.as_ref().map(|runtime| runtime.enter());
         helix_event::request_redraw();
     }
 }
@@ -117,7 +123,10 @@ impl Session {
         let pty = tty::new(&options, window_size(size), 0)?;
 
         let (tx, events) = mpsc::channel();
-        let listener = Listener(tx);
+        let listener = Listener {
+            events: tx,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        };
         let config = TermConfig {
             scrolling_history: SCROLLBACK,
             ..Default::default()
