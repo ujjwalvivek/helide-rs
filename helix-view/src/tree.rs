@@ -370,6 +370,14 @@ impl Tree {
         self.insert(view)
     }
 
+    /// Moves tab `from` to position `to`; the active tab stays active.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from < self.tabs.len() && to < self.tabs.len() && from != to {
+            let tab = self.tabs.remove(from);
+            self.tabs.insert(to, tab);
+        }
+    }
+
     pub fn switch_tab(&mut self, index: usize) {
         let active = self.active_tab();
         if index == active || index >= self.tabs.len() {
