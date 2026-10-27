@@ -1583,9 +1583,9 @@ impl EditorView {
                 self.git.visible = false;
                 self.git.focused = false;
             }
-            GitAction::Prompt(prompt) => {
+            GitAction::Layer(layer) => {
                 return EventResult::Consumed(Some(Box::new(move |compositor, _| {
-                    compositor.push(prompt)
+                    compositor.push(layer)
                 })));
             }
         }
