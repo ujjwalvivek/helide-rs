@@ -33,7 +33,10 @@ use helix_view::{
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
-use super::terminal::TerminalPanel;
+use super::{
+    file_tree::{self, FileTree, TreeAction},
+    terminal::TerminalPanel,
+};
 
 use tui::{buffer::Buffer as Surface, text::Span};
 
@@ -48,6 +51,8 @@ pub struct EditorView {
     terminal_focused: bool,
     /// Helide's terminal panel, docked under the editor.
     pub terminal: TerminalPanel,
+    /// Helide's file tree, docked left of the editor.
+    pub file_tree: FileTree,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +77,7 @@ impl EditorView {
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
             terminal: TerminalPanel::default(),
+            file_tree: FileTree::default(),
         }
     }
 
@@ -1452,39 +1458,96 @@ impl EditorView {
 }
 
 impl EditorView {
-    /// Routes input to the terminal panel while it is focused, and mouse input inside it at any
-    /// time. Returns `None` when the event belongs to the editor.
-    fn handle_terminal_event(
+    /// Shows the terminal panel, or hides it when focused. Only one panel holds focus at a time.
+    pub fn toggle_terminal(&mut self, editor: &mut Editor) {
+        if let Err(err) = self.terminal.toggle() {
+            editor.set_error(format!("cannot start terminal: {err}"));
+        }
+        if self.terminal.focused {
+            self.file_tree.focused = false;
+        }
+    }
+
+    /// Opens a terminal tab running `command` (a shell when empty) and focuses it.
+    pub fn open_terminal(&mut self, command: &[String], name: Option<String>, editor: &mut Editor) {
+        match self.terminal.open(command, name) {
+            Ok(()) => self.file_tree.focused = false,
+            Err(err) => editor.set_error(format!("cannot start terminal: {err}")),
+        }
+    }
+
+    /// Shows the file tree on the current file, or hides it when focused.
+    pub fn toggle_file_tree(&mut self, editor: &Editor) {
+        self.file_tree.toggle(editor);
+        if self.file_tree.focused {
+            self.terminal.focused = false;
+        }
+    }
+
+    fn focus_editor(&mut self) {
+        self.terminal.focused = false;
+        self.file_tree.focused = false;
+    }
+
+    fn tree_action(&mut self, action: TreeAction, editor: &Editor) -> EventResult {
+        match action {
+            TreeAction::None => {}
+            TreeAction::FocusEditor => self.focus_editor(),
+            TreeAction::Hide => {
+                self.file_tree.visible = false;
+                self.file_tree.focused = false;
+            }
+            action => {
+                if let Some(prompt) = file_tree::prompt(&action, editor) {
+                    return EventResult::Consumed(Some(Box::new(move |compositor, _| {
+                        compositor.push(prompt)
+                    })));
+                }
+            }
+        }
+        EventResult::Consumed(None)
+    }
+
+    /// Routes input to a focused panel, and mouse input to whichever panel it lands on.
+    /// Returns `None` when the event belongs to the editor.
+    fn handle_panel_event(
         &mut self,
         event: &Event,
         cx: &mut crate::compositor::Context,
     ) -> Option<EventResult> {
-        if !self.terminal.visible {
-            return None;
-        }
         match event {
+            Event::Mouse(mouse) if self.file_tree.contains(mouse.column, mouse.row) => {
+                if let MouseEventKind::Down(_) = mouse.kind {
+                    self.file_tree.focused = true;
+                    self.terminal.focused = false;
+                }
+                let action = self.file_tree.mouse(mouse, cx.editor);
+                Some(self.tree_action(action, cx.editor))
+            }
             Event::Mouse(mouse) if self.terminal.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.terminal.focused = true;
+                    self.file_tree.focused = false;
                 }
                 self.terminal.mouse(mouse);
                 Some(EventResult::Consumed(None))
             }
             Event::Mouse(mouse) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
-                    self.terminal.focused = false;
+                    self.focus_editor();
                 }
                 None
             }
-            Event::Key(key) if self.terminal.focused => {
+            Event::Key(key) if self.terminal.focused || self.file_tree.focused => {
                 cx.editor.reset_idle_timer();
                 let ctrl = key.modifiers == KeyModifiers::CONTROL;
                 match key.code {
-                    KeyCode::Char('2') if ctrl => self.terminal.focused = false,
-                    KeyCode::Char('3') if ctrl => {
-                        if let Err(err) = self.terminal.toggle() {
-                            cx.editor.set_error(format!("cannot start terminal: {err}"));
-                        }
+                    KeyCode::Char('2') if ctrl => self.focus_editor(),
+                    KeyCode::Char('3') if ctrl => self.toggle_terminal(cx.editor),
+                    KeyCode::Char('5') if ctrl => self.toggle_file_tree(cx.editor),
+                    _ if self.file_tree.focused => {
+                        let action = self.file_tree.key(*key, cx.editor);
+                        return Some(self.tree_action(action, cx.editor));
                     }
                     KeyCode::PageUp if ctrl => self.terminal.cycle(false),
                     KeyCode::PageDown if ctrl => self.terminal.cycle(true),
@@ -1507,7 +1570,7 @@ impl Component for EditorView {
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
-        if let Some(result) = self.handle_terminal_event(event, context) {
+        if let Some(result) = self.handle_panel_event(event, context) {
             return result;
         }
 
@@ -1693,7 +1756,9 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
-        // the terminal panel takes the bottom of the editor area
+        // the file tree takes the left of the editor area, the terminal panel the bottom of the rest
+        let tree_area = editor_area;
+        editor_area = self.file_tree.layout(editor_area);
         self.terminal.update();
         let panel_area = editor_area;
         editor_area = self.terminal.layout(editor_area);
@@ -1707,13 +1772,18 @@ impl Component for EditorView {
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            let is_focused = is_focused && !self.terminal.focused;
+            let is_focused = is_focused && !self.terminal.focused && !self.file_tree.focused;
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
         }
 
-        if editor_area != panel_area {
+        if editor_area.height != panel_area.height {
             let panel_area = panel_area.clip_top(editor_area.height);
             self.terminal.render(panel_area, surface, &cx.editor.theme);
+        }
+
+        if panel_area.width != tree_area.width {
+            let tree_area = tree_area.with_width(tree_area.width - panel_area.width);
+            self.file_tree.render(tree_area, surface, cx.editor);
         }
 
         if config.auto_info {
@@ -1807,6 +1877,9 @@ impl Component for EditorView {
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
         if self.terminal.visible && self.terminal.focused {
             return self.terminal.cursor();
+        }
+        if self.file_tree.visible && self.file_tree.focused {
+            return (None, CursorKind::Hidden);
         }
         match editor.cursor() {
             // all block cursors are drawn manually
