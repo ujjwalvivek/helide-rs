@@ -35,8 +35,18 @@ use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
 use super::{
     file_tree::{self, FileTree, TreeAction},
+    git_panel::{GitAction, GitPanel},
     terminal::TerminalPanel,
 };
+
+/// Helide's panels around the editor, for focus handling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Panel {
+    None,
+    Tree,
+    Git,
+    Terminal,
+}
 
 use tui::{buffer::Buffer as Surface, text::Span};
 
@@ -53,6 +63,8 @@ pub struct EditorView {
     pub terminal: TerminalPanel,
     /// Helide's file tree, docked left of the editor.
     pub file_tree: FileTree,
+    /// Helide's git panel, sharing the left sidebar with the file tree.
+    pub git: GitPanel,
     /// Where each tab label was drawn last frame: (row, start column, end column).
     tab_hits: Vec<(u16, u16, u16)>,
 }
@@ -80,6 +92,7 @@ impl EditorView {
             terminal_focused: true,
             terminal: TerminalPanel::default(),
             file_tree: FileTree::default(),
+            git: GitPanel::default(),
             tab_hits: Vec::new(),
         }
     }
@@ -698,13 +711,15 @@ impl EditorView {
         let current_doc = view!(editor).doc;
 
         for doc in editor.documents() {
-            let fname = doc
-                .path()
-                .unwrap_or(&scratch)
-                .file_name()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or_default();
+            let fname = match (doc.path(), &doc.label) {
+                (None, Some(label)) => label.as_str(),
+                (path, _) => path
+                    .unwrap_or(&scratch)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_str()
+                    .unwrap_or_default(),
+            };
 
             let style = if current_doc == doc.id() {
                 bufferline_active
@@ -1467,24 +1482,46 @@ impl EditorView {
             editor.set_error(format!("cannot start terminal: {err}"));
         }
         if self.terminal.focused {
-            self.file_tree.focused = false;
+            self.focus_only(Panel::Terminal);
         }
     }
 
     /// Opens a terminal tab running `command` (a shell when empty) and focuses it.
     pub fn open_terminal(&mut self, command: &[String], name: Option<String>, editor: &mut Editor) {
         match self.terminal.open(command, name) {
-            Ok(()) => self.file_tree.focused = false,
+            Ok(()) => self.focus_only(Panel::Terminal),
             Err(err) => editor.set_error(format!("cannot start terminal: {err}")),
         }
     }
 
-    /// Shows the file tree on the current file, or hides it when focused.
+    /// Shows the file tree on the current file, or hides it when focused. The tree and the git
+    /// panel share the left sidebar.
     pub fn toggle_file_tree(&mut self, editor: &Editor) {
         self.file_tree.toggle(editor);
-        if self.file_tree.focused {
-            self.terminal.focused = false;
+        if self.file_tree.visible {
+            self.git.visible = false;
         }
+        if self.file_tree.focused {
+            self.focus_only(Panel::Tree);
+        }
+    }
+
+    /// Shows the git panel, or hides it when focused.
+    pub fn toggle_git(&mut self) {
+        self.git.toggle();
+        if self.git.visible {
+            self.file_tree.visible = false;
+        }
+        if self.git.focused {
+            self.focus_only(Panel::Git);
+        }
+    }
+
+    /// Focuses `panel` and takes focus from the others.
+    fn focus_only(&mut self, panel: Panel) {
+        self.file_tree.focused = panel == Panel::Tree;
+        self.git.focused = panel == Panel::Git;
+        self.terminal.focused = panel == Panel::Terminal;
     }
 
     /// Draws the tab labels right-aligned on the bufferline row, when there is more than one tab.
@@ -1507,6 +1544,7 @@ impl EditorView {
                         doc.path()
                             .and_then(|path| path.file_name())
                             .map(|name| name.to_string_lossy().into_owned())
+                            .or_else(|| doc.label.clone())
                             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string())
                     })
                     .unwrap_or_default();
@@ -1534,8 +1572,24 @@ impl EditorView {
     }
 
     fn focus_editor(&mut self) {
-        self.terminal.focused = false;
-        self.file_tree.focused = false;
+        self.focus_only(Panel::None);
+    }
+
+    fn git_action(&mut self, action: GitAction) -> EventResult {
+        match action {
+            GitAction::None => {}
+            GitAction::FocusEditor => self.focus_editor(),
+            GitAction::Hide => {
+                self.git.visible = false;
+                self.git.focused = false;
+            }
+            GitAction::Prompt(prompt) => {
+                return EventResult::Consumed(Some(Box::new(move |compositor, _| {
+                    compositor.push(prompt)
+                })));
+            }
+        }
+        EventResult::Consumed(None)
     }
 
     fn tree_action(&mut self, action: TreeAction, editor: &Editor) -> EventResult {
@@ -1584,16 +1638,21 @@ impl EditorView {
             }
             Event::Mouse(mouse) if self.file_tree.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
-                    self.file_tree.focused = true;
-                    self.terminal.focused = false;
+                    self.focus_only(Panel::Tree);
                 }
                 let action = self.file_tree.mouse(mouse, cx.editor);
                 Some(self.tree_action(action, cx.editor))
             }
+            Event::Mouse(mouse) if self.git.contains(mouse.column, mouse.row) => {
+                if let MouseEventKind::Down(_) = mouse.kind {
+                    self.focus_only(Panel::Git);
+                }
+                let action = self.git.mouse(mouse);
+                Some(self.git_action(action))
+            }
             Event::Mouse(mouse) if self.terminal.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
-                    self.terminal.focused = true;
-                    self.file_tree.focused = false;
+                    self.focus_only(Panel::Terminal);
                 }
                 self.terminal.mouse(mouse);
                 Some(EventResult::Consumed(None))
@@ -1604,16 +1663,23 @@ impl EditorView {
                 }
                 None
             }
-            Event::Key(key) if self.terminal.focused || self.file_tree.focused => {
+            Event::Key(key)
+                if self.terminal.focused || self.file_tree.focused || self.git.focused =>
+            {
                 cx.editor.reset_idle_timer();
                 let ctrl = key.modifiers == KeyModifiers::CONTROL;
                 match key.code {
+                    KeyCode::Char('1') if ctrl => self.toggle_git(),
                     KeyCode::Char('2') if ctrl => self.focus_editor(),
                     KeyCode::Char('3') if ctrl => self.toggle_terminal(cx.editor),
                     KeyCode::Char('5') if ctrl => self.toggle_file_tree(cx.editor),
                     _ if self.file_tree.focused => {
                         let action = self.file_tree.key(*key, cx.editor);
                         return Some(self.tree_action(action, cx.editor));
+                    }
+                    _ if self.git.focused => {
+                        let action = self.git.key(*key, cx.editor);
+                        return Some(self.git_action(action));
                     }
                     KeyCode::PageUp if ctrl => self.terminal.cycle(false),
                     KeyCode::PageDown if ctrl => self.terminal.cycle(true),
@@ -1825,7 +1891,11 @@ impl Component for EditorView {
 
         // the file tree takes the left of the editor area, the terminal panel the bottom of the rest
         let tree_area = editor_area;
-        editor_area = self.file_tree.layout(editor_area);
+        editor_area = if self.git.visible {
+            self.git.layout(editor_area)
+        } else {
+            self.file_tree.layout(editor_area)
+        };
         self.terminal.update();
         let panel_area = editor_area;
         editor_area = self.terminal.layout(editor_area);
@@ -1840,7 +1910,10 @@ impl Component for EditorView {
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            let is_focused = is_focused && !self.terminal.focused && !self.file_tree.focused;
+            let is_focused = is_focused
+                && !self.terminal.focused
+                && !self.file_tree.focused
+                && !self.git.focused;
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
         }
 
@@ -1850,8 +1923,12 @@ impl Component for EditorView {
         }
 
         if panel_area.width != tree_area.width {
-            let tree_area = tree_area.with_width(tree_area.width - panel_area.width);
-            self.file_tree.render(tree_area, surface, cx.editor);
+            let sidebar = tree_area.with_width(tree_area.width - panel_area.width);
+            if self.git.visible {
+                self.git.render(sidebar, surface, &cx.editor.theme);
+            } else {
+                self.file_tree.render(sidebar, surface, cx.editor);
+            }
         }
 
         if config.auto_info {
@@ -1946,7 +2023,9 @@ impl Component for EditorView {
         if self.terminal.visible && self.terminal.focused {
             return self.terminal.cursor();
         }
-        if self.file_tree.visible && self.file_tree.focused {
+        if (self.file_tree.visible && self.file_tree.focused)
+            || (self.git.visible && self.git.focused)
+        {
             return (None, CursorKind::Hidden);
         }
         match editor.cursor() {

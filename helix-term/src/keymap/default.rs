@@ -341,6 +341,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "C-3" => terminal_toggle,
         "C-5" => file_tree_toggle,
+        "C-1" => git_panel_toggle,
         "C-pageup" => tab_prev,
         "C-pagedown" => tab_next,
     });
@@ -390,6 +391,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-x" => completion,
         "C-3" => terminal_toggle,
         "C-5" => file_tree_toggle,
+        "C-1" => git_panel_toggle,
         "C-pageup" => tab_prev,
         "C-pagedown" => tab_next,
         "C-r" => insert_register,
