@@ -62,6 +62,13 @@ pub enum Layout {
     // could explore stacked/tabbed
 }
 
+/// A tab's split structure, as returned by [`Tree::tab_layout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutNode {
+    View(ViewId),
+    Split(Layout, Vec<LayoutNode>),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
     Up,
@@ -368,6 +375,31 @@ impl Tree {
         self.root = root;
         self.focus = root;
         self.insert(view)
+    }
+
+    /// The split structure of tab `index`, for saving it: views as leaves, containers with
+    /// their layout. Containers with a single child are folded into the child.
+    pub fn tab_layout(&self, index: usize) -> Option<LayoutNode> {
+        let root = self.tabs.get(index)?.root;
+        self.layout_of(root)
+    }
+
+    fn layout_of(&self, id: ViewId) -> Option<LayoutNode> {
+        match &self.nodes.get(id)?.content {
+            Content::View(view) => Some(LayoutNode::View(view.id)),
+            Content::Container(container) => {
+                let mut children: Vec<LayoutNode> = container
+                    .children
+                    .iter()
+                    .filter_map(|child| self.layout_of(*child))
+                    .collect();
+                match children.len() {
+                    0 => None,
+                    1 => children.pop(),
+                    _ => Some(LayoutNode::Split(container.layout, children)),
+                }
+            }
+        }
     }
 
     /// Moves tab `from` to position `to`; the active tab stays active.

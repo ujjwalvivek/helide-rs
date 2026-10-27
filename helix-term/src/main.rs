@@ -29,6 +29,10 @@ async fn main_impl() -> Result<i32> {
     if argv.get(1).map(String::as_str) == Some("msg") {
         return helix_term::ipc::client::run(&argv[2..]);
     }
+    // `hx mcp` serves the editor's context to agents (OpenCode) over MCP on stdio.
+    if argv.get(1).map(String::as_str) == Some("mcp") {
+        return helix_term::mcp::run();
+    }
 
     let args = Args::parse_args().context("could not parse arguments")?;
 
