@@ -33,6 +33,8 @@ use helix_view::{
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
+use super::terminal::TerminalPanel;
+
 use tui::{buffer::Buffer as Surface, text::Span};
 
 pub struct EditorView {
@@ -44,6 +46,8 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    /// Helide's terminal panel, docked under the editor.
+    pub terminal: TerminalPanel,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,7 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            terminal: TerminalPanel::default(),
         }
     }
 
@@ -1446,12 +1451,66 @@ impl EditorView {
     }
 }
 
+impl EditorView {
+    /// Routes input to the terminal panel while it is focused, and mouse input inside it at any
+    /// time. Returns `None` when the event belongs to the editor.
+    fn handle_terminal_event(
+        &mut self,
+        event: &Event,
+        cx: &mut crate::compositor::Context,
+    ) -> Option<EventResult> {
+        if !self.terminal.visible {
+            return None;
+        }
+        match event {
+            Event::Mouse(mouse) if self.terminal.contains(mouse.column, mouse.row) => {
+                if let MouseEventKind::Down(_) = mouse.kind {
+                    self.terminal.focused = true;
+                }
+                self.terminal.mouse(mouse);
+                Some(EventResult::Consumed(None))
+            }
+            Event::Mouse(mouse) => {
+                if let MouseEventKind::Down(_) = mouse.kind {
+                    self.terminal.focused = false;
+                }
+                None
+            }
+            Event::Key(key) if self.terminal.focused => {
+                cx.editor.reset_idle_timer();
+                let ctrl = key.modifiers == KeyModifiers::CONTROL;
+                match key.code {
+                    KeyCode::Char('2') if ctrl => self.terminal.focused = false,
+                    KeyCode::Char('3') if ctrl => {
+                        if let Err(err) = self.terminal.toggle() {
+                            cx.editor.set_error(format!("cannot start terminal: {err}"));
+                        }
+                    }
+                    KeyCode::PageUp if ctrl => self.terminal.cycle(false),
+                    KeyCode::PageDown if ctrl => self.terminal.cycle(true),
+                    _ => self.terminal.key(*key),
+                }
+                Some(EventResult::Consumed(None))
+            }
+            Event::Paste(text) if self.terminal.focused => {
+                self.terminal.paste(text);
+                Some(EventResult::Consumed(None))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl Component for EditorView {
     fn handle_event(
         &mut self,
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
+        if let Some(result) = self.handle_terminal_event(event, context) {
+            return result;
+        }
+
         let mut cx = commands::Context {
             editor: context.editor,
             count: None,
@@ -1634,6 +1693,11 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
+        // the terminal panel takes the bottom of the editor area
+        self.terminal.update();
+        let panel_area = editor_area;
+        editor_area = self.terminal.layout(editor_area);
+
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
 
@@ -1643,7 +1707,13 @@ impl Component for EditorView {
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
+            let is_focused = is_focused && !self.terminal.focused;
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
+        }
+
+        if editor_area != panel_area {
+            let panel_area = panel_area.clip_top(editor_area.height);
+            self.terminal.render(panel_area, surface, &cx.editor.theme);
         }
 
         if config.auto_info {
@@ -1735,6 +1805,9 @@ impl Component for EditorView {
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        if self.terminal.visible && self.terminal.focused {
+            return self.terminal.cursor();
+        }
         match editor.cursor() {
             // all block cursors are drawn manually
             (pos, CursorKind::Block) => {

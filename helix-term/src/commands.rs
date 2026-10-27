@@ -616,6 +616,7 @@ impl MappableCommand {
         goto_prev_tabstop, "Goto next snippet placeholder",
         rotate_selections_first, "Make the first selection your primary one",
         rotate_selections_last, "Make the last selection your primary one",
+        terminal_toggle, "Show and focus the terminal panel, or hide it when focused",
     );
 }
 
@@ -7225,4 +7226,17 @@ fn lsp_or_syntax_workspace_symbol_picker(cx: &mut Context) {
     } else {
         syntax_workspace_symbol_picker(cx);
     }
+}
+
+fn terminal_toggle(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            let Some(editor_view) = compositor.find::<ui::EditorView>() else {
+                return;
+            };
+            if let Err(err) = editor_view.terminal.toggle() {
+                cx.editor.set_error(format!("cannot start terminal: {err}"));
+            }
+        },
+    ));
 }
