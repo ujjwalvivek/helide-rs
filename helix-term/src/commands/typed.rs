@@ -2768,6 +2768,23 @@ fn terminal_split(
     Ok(())
 }
 
+fn preview(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.jobs.callback(async {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            |editor: &mut Editor, compositor: &mut Compositor| {
+                if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                    editor_view.toggle_preview(editor);
+                }
+            },
+        ));
+        Ok(call)
+    });
+    Ok(())
+}
+
 fn zen(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -4256,6 +4273,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (0, Some(2)),
             raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "preview",
+        aliases: &[],
+        doc: "Preview the markdown file in the pane beside it, or close the preview.",
+        fun: preview,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },
