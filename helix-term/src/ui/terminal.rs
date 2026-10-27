@@ -37,12 +37,11 @@ use helix_view::{
 };
 use tui::buffer::Buffer as Surface;
 
-use super::panel_style::Roles;
+use super::{
+    frame::{labels_left, Label},
+    panel_style::Roles,
+};
 
-/// Share of the editor area the panel takes when shown.
-const HEIGHT_PERCENT: u16 = 35;
-/// The panel never gets smaller than this, tab strip included.
-const MIN_HEIGHT: u16 = 6;
 const SCROLLBACK: usize = 10_000;
 
 /// Forwards terminal events to the panel and wakes the editor so it redraws.
@@ -241,18 +240,11 @@ impl TerminalPanel {
     }
 
     /// Gives the panel its slice of `area`, returning what is left for the editor.
-    /// `height` overrides the default share when the user has dragged the panel's edge.
-    pub fn layout(&self, area: Rect, height: Option<u16>) -> Rect {
-        if !self.visible {
-            return area;
+    /// Shows tab `index`.
+    pub fn select(&mut self, index: usize) {
+        if index < self.sessions.len() {
+            self.active = index;
         }
-        let height = height
-            .unwrap_or(area.height * HEIGHT_PERCENT / 100)
-            .max(MIN_HEIGHT);
-        if height + MIN_HEIGHT > area.height {
-            return area;
-        }
-        area.clip_bottom(height)
     }
 
     /// Drains events from every session and drops the ones whose program exited.
@@ -280,7 +272,13 @@ impl TerminalPanel {
         let strip = area.with_height(1);
         self.render_tabs(strip, surface, theme);
 
-        let grid = area.clip_top(1);
+        // Inside the box's side borders, below the divider.
+        let grid = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height - 1,
+        );
         self.grid_area = grid;
         let session = &mut self.sessions[self.active];
         session.resize((grid.width, grid.height));
@@ -321,32 +319,21 @@ impl TerminalPanel {
         }
     }
 
-    /// The top edge doubles as the tab strip: TERMINAL, then one label per tab, set into a
-    /// line that is solid and accented while the panel has focus.
+    /// Sets TERMINAL and one label per tab into the divider row the frame drew above the panel.
     fn render_tabs(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
         let roles = Roles::new(theme);
-        roles.horizontal_edge(surface, area, self.focused);
-        self.tab_hits.clear();
-
-        let mut x = area.x + 1;
-        let title = " TERMINAL ";
-        surface.set_string(x, area.y, title, roles.label());
-        x += title.width() as u16;
-        for (i, session) in self.sessions.iter().enumerate() {
-            let label = format!(" {} {} ", i + 1, short_label(session.label()));
-            let width = area.right().saturating_sub(x + 1) as usize;
-            if width < 4 {
-                break;
-            }
+        let mut labels = vec![Label::new("TERMINAL", roles.label())];
+        labels.extend(self.sessions.iter().enumerate().map(|(i, session)| {
             let style = if i == self.active {
                 roles.text.add_modifier(Modifier::BOLD)
             } else {
                 roles.muted
             };
-            let (next, _) = surface.set_stringn(x, area.y, &label, width, style);
-            self.tab_hits.push((x, next));
-            x = next;
-        }
+            Label::new(format!("{} {}", i + 1, short_label(session.label())), style)
+        }));
+        let hits = labels_left(surface, area.y, area.x, area.right() - 1, &labels);
+        // The first label is the title; the rest are tabs.
+        self.tab_hits = hits.into_iter().skip(1).collect();
     }
 
     pub fn cursor(&self) -> (Option<helix_core::Position>, CursorKind) {

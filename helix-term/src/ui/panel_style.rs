@@ -2,8 +2,8 @@
 //! only, so any theme, including Noctalia's generated one, styles them without extra keys.
 //!
 //! The roles follow the house design system: three ink strengths, one accent, selection as a
-//! small surface step, status colours always next to a word or glyph. Panel edges are dashed
-//! and faint when the panel is inert, solid and accented when it has focus.
+//! small surface step, status colours always next to a word or glyph. Borders are drawn by
+//! the frame (ui/frame.rs): muted when inert, accented when focused.
 
 use helix_view::{
     graphics::{Modifier, Rect, Style},
@@ -62,41 +62,6 @@ impl Roles {
             surface.set_string(row.x, row.y, "▎", self.accent);
         } else {
             surface.set_string(row.x, row.y, "▎", self.faint);
-        }
-    }
-
-    /// A vertical edge at column `x`: solid accent when focused, dashed and faint otherwise.
-    pub fn vertical_edge(
-        &self,
-        surface: &mut Surface,
-        x: u16,
-        top: u16,
-        bottom: u16,
-        focused: bool,
-    ) {
-        let (symbol, style) = if focused {
-            ("│", self.accent)
-        } else {
-            ("╎", self.faint)
-        };
-        for y in top..bottom {
-            if let Some(cell) = surface.get_mut(x, y) {
-                cell.set_symbol(symbol).set_style(style);
-            }
-        }
-    }
-
-    /// A horizontal edge across `row`: solid accent when focused, dashed and faint otherwise.
-    pub fn horizontal_edge(&self, surface: &mut Surface, row: Rect, focused: bool) {
-        let (symbol, style) = if focused {
-            ("─", self.accent)
-        } else {
-            ("╌", self.faint)
-        };
-        for x in row.left()..row.right() {
-            if let Some(cell) = surface.get_mut(x, row.y) {
-                cell.set_symbol(symbol).set_style(style);
-            }
         }
     }
 }

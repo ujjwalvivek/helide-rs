@@ -25,17 +25,19 @@ use helix_core::{
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
     document::{Mode, SCRATCH_BUFFER_NAME},
-    editor::{CompleteAction, CursorShapeConfig},
+    editor::{Action, CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, Editor, Theme, View,
+    Document, DocumentId, Editor, Theme, View,
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
 use super::{
     file_tree::{self, FileTree, TreeAction},
+    frame::{self, End, Label},
     git_panel::{GitAction, GitPanel},
+    panel_style::Roles,
     terminal::TerminalPanel,
 };
 
@@ -46,11 +48,32 @@ enum Edge {
     Terminal,
 }
 
-/// The sidebar's default width: a fifth of the editor area, within readable limits.
-const SIDEBAR_DEFAULT: (u16, u16) = (26, 44);
-/// The editor always keeps this many columns, and the terminal this many rows of editor.
+/// A mouse press on a panel edge: dragging resizes, a press without movement is a click.
+struct Press {
+    edge: Edge,
+    column: u16,
+    moved: bool,
+}
+
+/// The sidebar's default width: a fifth of the window, within readable limits.
+const SIDEBAR_DEFAULT: (u16, u16) = (30, 48);
+const SIDEBAR_MIN: u16 = 24;
+/// The editor always keeps this many columns and rows.
 const EDITOR_MIN_WIDTH: u16 = 40;
 const EDITOR_MIN_HEIGHT: u16 = 6;
+/// The terminal's default share of the main box, and its smallest size, in rows.
+const TERMINAL_PERCENT: u16 = 35;
+const TERMINAL_MIN: u16 = 4;
+
+/// Cuts `text` to `width` columns, keeping its start.
+fn shorten_end(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
 
 /// Helide's panels around the editor, for focus handling.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,13 +103,18 @@ pub struct EditorView {
     pub git: GitPanel,
     /// Where each tab label was drawn last frame: (row, start column, end column).
     tab_hits: Vec<(u16, u16, u16)>,
-    /// Sidebar width and terminal height the user set by dragging their edges.
+    /// Columns each buffer label covered on the editor box's top border last frame.
+    buffer_hits: Vec<(u16, u16, DocumentId)>,
+    /// Sidebar width and terminal rows the user set by dragging or with Alt+Shift+arrows.
     sidebar_width: Option<u16>,
     terminal_height: Option<u16>,
-    /// The edge being dragged, and where the edges were drawn last frame.
-    dragging: Option<Edge>,
-    sidebar_span: Option<(u16, u16)>,
-    terminal_span: Option<(u16, u16)>,
+    /// A mouse press on a panel edge, until it is released.
+    pressed: Option<Press>,
+    /// The frame's boxes, as laid out for the last frame.
+    sidebar_box: Option<Rect>,
+    main_box: Rect,
+    editor_box: Rect,
+    terminal_box: Option<Rect>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,11 +142,14 @@ impl EditorView {
             file_tree: FileTree::default(),
             git: GitPanel::default(),
             tab_hits: Vec::new(),
+            buffer_hits: Vec::new(),
             sidebar_width: None,
             terminal_height: None,
-            dragging: None,
-            sidebar_span: None,
-            terminal_span: None,
+            pressed: None,
+            sidebar_box: None,
+            main_box: Rect::default(),
+            editor_box: Rect::default(),
+            terminal_box: None,
         }
     }
 
@@ -1549,91 +1580,293 @@ impl EditorView {
         self.terminal.focused = panel == Panel::Terminal;
     }
 
-    /// Draws the tab labels right-aligned on the bufferline row, when there is more than one tab.
-    fn render_tabs(&mut self, editor: &Editor, row: Rect, surface: &mut Surface) {
-        self.tab_hits.clear();
-        let count = editor.tree.tab_count();
-        if count < 2 {
-            return;
+    /// Splits `frame` into the sidebar box, the editor box and the terminal box. The editor and
+    /// terminal boxes share their divider row.
+    fn layout_frame(&mut self, frame: Rect) {
+        self.sidebar_box = None;
+        self.terminal_box = None;
+        let mut main = frame;
+        if self.git.visible || self.file_tree.visible {
+            let (min, max) = SIDEBAR_DEFAULT;
+            let width = self
+                .sidebar_width
+                .unwrap_or((frame.width / 5).clamp(min, max))
+                .min(frame.width.saturating_sub(EDITOR_MIN_WIDTH))
+                .max(SIDEBAR_MIN);
+            if width + EDITOR_MIN_WIDTH <= frame.width {
+                self.sidebar_box = Some(frame.with_width(width));
+                main = frame.clip_left(width);
+            }
         }
-        let active = editor.theme.get("ui.bufferline.active");
-        let inactive = editor.theme.get("ui.bufferline");
-        let labels: Vec<String> = (0..count)
-            .map(|index| {
-                let views = editor.tree.tab_views(index).len();
-                let name = editor
-                    .tree
-                    .tab_focus(index)
-                    .and_then(|view| editor.document(editor.tree.get(view).doc))
-                    .map(|doc| {
-                        doc.path()
-                            .and_then(|path| path.file_name())
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .or_else(|| doc.label.clone())
-                            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string())
-                    })
-                    .unwrap_or_default();
-                let more = if views > 1 {
-                    format!(" +{}", views - 1)
-                } else {
-                    String::new()
-                };
-                format!(" {} {name}{more} ", index + 1)
-            })
-            .collect();
-        let total: u16 = labels.iter().map(|label| label.width() as u16).sum();
-        let mut x = row.right().saturating_sub(total).max(row.x);
-        for (index, label) in labels.iter().enumerate() {
-            let style = if index == editor.tree.active_tab() {
-                active
-            } else {
-                inactive
-            };
-            let start = x;
-            let width = row.right().saturating_sub(x) as usize;
-            (x, _) = surface.set_stringn(x, row.y, label, width, style);
-            self.tab_hits.push((row.y, start, x));
+        self.main_box = main;
+        self.editor_box = main;
+        if self.terminal.visible && !self.terminal.is_empty() {
+            // Rows inside the main box, less the divider.
+            let rows = main.height.saturating_sub(3);
+            let height = self
+                .terminal_height
+                .unwrap_or(rows * TERMINAL_PERCENT / 100)
+                .min(rows.saturating_sub(EDITOR_MIN_HEIGHT))
+                .max(TERMINAL_MIN);
+            if height + EDITOR_MIN_HEIGHT <= rows {
+                let divider = main.bottom() - 2 - height;
+                self.editor_box = Rect::new(main.x, main.y, main.width, divider - main.y + 1);
+                self.terminal_box = Some(Rect::new(
+                    main.x,
+                    divider,
+                    main.width,
+                    main.bottom() - divider,
+                ));
+            }
         }
     }
 
-    /// Starts, continues or ends dragging a panel edge. Returns whether the mouse event was used.
+    /// Draws the boxes, their titles and meta, and the editor's scrollbar. The focused box is
+    /// drawn last, in the accent, so the divider it shares takes its colour.
+    fn render_frame(&mut self, editor: &Editor, surface: &mut Surface, editor_focused: bool) {
+        let roles = Roles::new(&editor.theme);
+        let border = |focused: bool| if focused { roles.accent } else { roles.muted };
+
+        if let Some(sidebar) = self.sidebar_box {
+            let focused = self.git.focused || self.file_tree.focused;
+            frame::draw_box(surface, sidebar, border(focused), End::Corner, End::Corner);
+            let (title, meta, meta_style) = if self.git.visible {
+                let (meta, busy) = self.git.meta();
+                ("GIT", meta, if busy { roles.warning } else { roles.muted })
+            } else {
+                ("FILES", self.file_tree.root_name(), roles.muted)
+            };
+            let (left, right) = (sidebar.x, sidebar.right() - 1);
+            let title_hits = frame::labels_left(
+                surface,
+                sidebar.y,
+                left,
+                right,
+                &[Label::new(title, roles.label())],
+            );
+            let title_end = title_hits.first().map_or(left, |&(_, end)| end);
+            if !meta.is_empty() {
+                let room = right.saturating_sub(title_end + 3) as usize;
+                let meta = shorten_end(&meta, room);
+                frame::labels_right(
+                    surface,
+                    sidebar.y,
+                    title_end,
+                    right,
+                    &[Label::new(meta, meta_style)],
+                );
+            }
+            if let Some(footer) = self.git.visible.then(|| self.git.footer()).flatten() {
+                frame::labels_right(
+                    surface,
+                    sidebar.bottom() - 1,
+                    left,
+                    right,
+                    &[Label::new(footer, roles.faint)],
+                );
+            }
+        }
+
+        let editor_bottom = if self.terminal_box.is_some() {
+            End::Tee
+        } else {
+            End::Corner
+        };
+        let draw_editor = |surface: &mut Surface| {
+            frame::draw_box(
+                surface,
+                self.editor_box,
+                border(editor_focused),
+                End::Corner,
+                editor_bottom,
+            )
+        };
+        let draw_terminal = |surface: &mut Surface| {
+            if let Some(terminal_box) = self.terminal_box {
+                let focused = self.terminal.focused;
+                frame::draw_box(
+                    surface,
+                    terminal_box,
+                    border(focused),
+                    End::Tee,
+                    End::Corner,
+                );
+            }
+        };
+        if self.terminal.focused {
+            draw_editor(surface);
+            draw_terminal(surface);
+        } else {
+            draw_terminal(surface);
+            draw_editor(surface);
+        }
+        self.render_editor_labels(editor, surface, &roles);
+
+        // The focused view's position in its document, on the editor box's right border.
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text();
+        let total = text.len_lines();
+        let offset = text.char_to_line(doc.view_offset(view.id).anchor.min(text.len_chars()));
+        let visible = view.inner_height();
+        let editor_box = self.editor_box;
+        frame::scrollbar(
+            surface,
+            editor_box.right() - 1,
+            editor_box.y + 1,
+            editor_box.bottom() - 1,
+            (total, offset, visible),
+            border(editor_focused),
+        );
+    }
+
+    /// Buffers on the left of the editor box's top border, tabs on the right. Both are clickable.
+    fn render_editor_labels(&mut self, editor: &Editor, surface: &mut Surface, roles: &Roles) {
+        self.tab_hits.clear();
+        self.buffer_hits.clear();
+        let row = self.editor_box;
+        let (left, right) = (row.x, row.right() - 1);
+
+        let tab_count = editor.tree.tab_count();
+        let tab_labels: Vec<Label> = if tab_count > 1 {
+            (0..tab_count)
+                .map(|index| {
+                    let style = if index == editor.tree.active_tab() {
+                        roles.accent.add_modifier(Modifier::BOLD)
+                    } else {
+                        roles.muted
+                    };
+                    Label::new((index + 1).to_string(), style)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let tabs_width: u16 = tab_labels
+            .iter()
+            .map(|label| label.text.width() as u16 + 2)
+            .sum();
+        for (index, (start, end)) in frame::labels_right(surface, row.y, left, right, &tab_labels)
+            .into_iter()
+            .enumerate()
+        {
+            self.tab_hits.push((row.y, start, end));
+            let _ = index;
+        }
+
+        let current = view!(editor).doc;
+        let docs: Vec<(DocumentId, Label)> = editor
+            .documents()
+            .map(|doc| {
+                let mut name = doc
+                    .path()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .or_else(|| doc.label.clone())
+                    .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string());
+                if doc.is_modified() {
+                    name.push_str(" ●");
+                }
+                let style = if doc.id() == current {
+                    roles.text.add_modifier(Modifier::BOLD)
+                } else {
+                    roles.muted
+                };
+                (doc.id(), Label::new(name, style))
+            })
+            .collect();
+        let end = right.saturating_sub(tabs_width + 1);
+        let (ids, labels): (Vec<DocumentId>, Vec<Label>) = docs.into_iter().unzip();
+        let hits = frame::labels_left(surface, row.y, left, end, &labels);
+        self.buffer_hits = hits
+            .into_iter()
+            .zip(ids)
+            .map(|((start, end), id)| (start, end, id))
+            .collect();
+    }
+
+    /// Mouse on a panel edge: the sidebar's double border or the terminal's divider row. A press
+    /// that moves resizes; one that does not, on a terminal tab label, selects that tab.
+    /// Returns whether the event was used.
     fn resize(&mut self, mouse: &MouseEvent) -> bool {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let on_sidebar_edge = self
-                    .sidebar_span
-                    .is_some_and(|(_, edge)| mouse.column == edge);
-                // The terminal's top edge holds its tab labels; those stay clickable.
-                let on_terminal_edge = self.terminal_span.is_some_and(|(edge, _)| {
-                    mouse.row == edge && self.terminal.tab_at(mouse.column).is_none()
+                let on_sidebar_edge = self.sidebar_box.is_some_and(|sidebar| {
+                    (mouse.column == sidebar.right() - 1 || mouse.column == sidebar.right())
+                        && mouse.row >= sidebar.y
+                        && mouse.row < sidebar.bottom()
                 });
-                self.dragging = if on_sidebar_edge {
-                    Some(Edge::Sidebar)
-                } else if on_terminal_edge {
-                    Some(Edge::Terminal)
+                let on_divider = self.terminal_box.is_some_and(|terminal| {
+                    mouse.row == terminal.y
+                        && mouse.column >= terminal.x
+                        && mouse.column < terminal.right()
+                });
+                let edge = if on_sidebar_edge {
+                    Edge::Sidebar
+                } else if on_divider {
+                    Edge::Terminal
                 } else {
-                    None
+                    return false;
                 };
-                self.dragging.is_some()
+                self.pressed = Some(Press {
+                    edge,
+                    column: mouse.column,
+                    moved: false,
+                });
+                true
             }
-            MouseEventKind::Drag(MouseButton::Left) => match self.dragging {
-                Some(Edge::Sidebar) => {
-                    if let Some((left, _)) = self.sidebar_span {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(press) = self.pressed.as_mut() else {
+                    return false;
+                };
+                press.moved = true;
+                match press.edge {
+                    Edge::Sidebar => {
+                        let left = self.sidebar_box.map_or(0, |sidebar| sidebar.x);
                         self.sidebar_width = Some(mouse.column.saturating_sub(left) + 1);
                     }
-                    true
-                }
-                Some(Edge::Terminal) => {
-                    if let Some((_, bottom)) = self.terminal_span {
-                        self.terminal_height = Some(bottom.saturating_sub(mouse.row));
+                    Edge::Terminal => {
+                        // The divider follows the mouse: the rows below it, less the border.
+                        let bottom = self.main_box.bottom();
+                        self.terminal_height = Some(bottom.saturating_sub(mouse.row + 2));
                     }
-                    true
                 }
-                None => false,
-            },
-            MouseEventKind::Up(MouseButton::Left) => self.dragging.take().is_some(),
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(press) = self.pressed.take() else {
+                    return false;
+                };
+                if !press.moved && press.edge == Edge::Terminal {
+                    if let Some(index) = self.terminal.tab_at(press.column) {
+                        self.terminal.select(index);
+                    }
+                    self.focus_only(Panel::Terminal);
+                }
+                true
+            }
             _ => false,
         }
+    }
+
+    /// Alt+Shift+arrows: left and right resize the sidebar, up and down the terminal.
+    fn resize_with_key(&mut self, key: &KeyEvent) -> bool {
+        if key.modifiers != KeyModifiers::ALT | KeyModifiers::SHIFT {
+            return false;
+        }
+        let sidebar = self.sidebar_box.map(|sidebar| sidebar.width);
+        let terminal = self
+            .terminal_box
+            .map(|terminal| terminal.height.saturating_sub(2));
+        match (key.code, sidebar, terminal) {
+            (KeyCode::Left, Some(width), _) => self.sidebar_width = Some(width.saturating_sub(2)),
+            (KeyCode::Right, Some(width), _) => self.sidebar_width = Some(width + 2),
+            (KeyCode::Up, _, Some(height)) => self.terminal_height = Some(height + 1),
+            (KeyCode::Down, _, Some(height)) => {
+                self.terminal_height = Some(height.saturating_sub(1))
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn focus_editor(&mut self) {
@@ -1684,7 +1917,26 @@ impl EditorView {
         cx: &mut crate::compositor::Context,
     ) -> Option<EventResult> {
         match event {
+            Event::Key(key) if self.resize_with_key(key) => Some(EventResult::Consumed(None)),
             Event::Mouse(mouse) if self.resize(mouse) => Some(EventResult::Consumed(None)),
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && mouse.row == self.editor_box.y
+                    && self
+                        .buffer_hits
+                        .iter()
+                        .any(|&(start, end, _)| (start..end).contains(&mouse.column)) =>
+            {
+                if let Some(&(_, _, doc)) = self
+                    .buffer_hits
+                    .iter()
+                    .find(|&&(start, end, _)| (start..end).contains(&mouse.column))
+                {
+                    cx.editor.switch(doc, Action::Replace);
+                }
+                self.focus_editor();
+                Some(EventResult::Consumed(None))
+            }
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && self.tab_hits.iter().any(|&(y, start, end)| {
@@ -1940,77 +2192,67 @@ impl Component for EditorView {
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();
 
-        // check if bufferline should be rendered
-        use helix_view::editor::BufferLine;
-        let use_bufferline = match config.bufferline {
-            BufferLine::Always => true,
-            BufferLine::Multiple if cx.editor.documents.len() > 1 => true,
-            // tabs live on the bufferline row
-            _ => cx.editor.tree.tab_count() > 1,
+        // Helide's frame: the sidebar box on the left, then the main box holding the editor
+        // and, below a shared divider, the terminal. The last row stays for the command line.
+        let frame = area.clip_bottom(1);
+        self.terminal.update();
+        self.layout_frame(frame);
+        let editor_box = self.editor_box;
+        let inner = |rect: Rect| {
+            Rect::new(
+                rect.x + 1,
+                rect.y + 1,
+                rect.width.saturating_sub(2),
+                rect.height.saturating_sub(2),
+            )
         };
 
-        // -1 for commandline and -1 for bufferline
-        let mut editor_area = area.clip_bottom(1);
-        if use_bufferline {
-            editor_area = editor_area.clip_top(1);
-        }
-
-        // the file tree takes the left of the editor area, the terminal panel the bottom of the rest
-        let tree_area = editor_area;
-        self.sidebar_span = None;
-        if self.git.visible || self.file_tree.visible {
-            let (min, max) = SIDEBAR_DEFAULT;
-            // Dragging can't push the sidebar past the editor's minimum width.
-            let width = self
-                .sidebar_width
-                .unwrap_or((editor_area.width / 5).clamp(min, max))
-                .max(16)
-                .min(editor_area.width.saturating_sub(EDITOR_MIN_WIDTH));
-            if width >= 16 {
-                // (left column, right edge column)
-                self.sidebar_span = Some((editor_area.x, editor_area.x + width - 1));
-                editor_area = editor_area.clip_left(width);
-            }
-        }
-        self.terminal.update();
-        let panel_area = editor_area;
-        let height = self
-            .terminal_height
-            .map(|height| height.min(editor_area.height.saturating_sub(EDITOR_MIN_HEIGHT)));
-        editor_area = self.terminal.layout(editor_area, height);
-        // (edge row, bottom row)
-        self.terminal_span = (editor_area.height != panel_area.height)
-            .then(|| (editor_area.bottom(), panel_area.bottom()));
-
         // if the terminal size suddenly changed, we need to trigger a resize
-        cx.editor.resize(editor_area);
+        cx.editor.resize(inner(editor_box));
 
-        if use_bufferline {
-            Self::render_bufferline(cx.editor, area.with_height(1), surface);
-        }
-        self.render_tabs(cx.editor, area.with_height(1), surface);
-
+        let editor_focused = !self.terminal.focused && !self.file_tree.focused && !self.git.focused;
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            let is_focused = is_focused
-                && !self.terminal.focused
-                && !self.file_tree.focused
-                && !self.git.focused;
-            self.render_view(cx.editor, doc, view, area, surface, is_focused);
+            self.render_view(
+                cx.editor,
+                doc,
+                view,
+                area,
+                surface,
+                is_focused && editor_focused,
+            );
         }
 
-        if editor_area.height != panel_area.height {
-            let panel_area = panel_area.clip_top(editor_area.height);
-            self.terminal.render(panel_area, surface, &cx.editor.theme);
-        }
+        self.render_frame(cx.editor, surface, editor_focused);
 
-        if panel_area.width != tree_area.width {
-            let sidebar = tree_area.with_width(tree_area.width - panel_area.width);
+        if let Some(terminal_box) = self.terminal_box {
+            // The divider row and the inside, without the bottom border.
+            let panel = terminal_box.clip_bottom(1);
+            self.terminal.render(panel, surface, &cx.editor.theme);
+        }
+        if let Some(sidebar) = self.sidebar_box {
             if self.git.visible {
-                self.git.render(sidebar, surface, &cx.editor.theme);
+                self.git.render(inner(sidebar), surface, &cx.editor.theme);
             } else {
-                self.file_tree.render(sidebar, surface, cx.editor);
+                self.file_tree.render(inner(sidebar), surface, cx.editor);
             }
+            // Draw the scrollbar after the rows, which may have just scrolled.
+            let roles = Roles::new(&cx.editor.theme);
+            let state = if self.git.visible {
+                self.git.scroll_state()
+            } else {
+                self.file_tree.scroll_state()
+            };
+            let focused = self.git.focused || self.file_tree.focused;
+            let style = if focused { roles.accent } else { roles.muted };
+            frame::scrollbar(
+                surface,
+                sidebar.right() - 1,
+                sidebar.y + 1,
+                sidebar.bottom() - 1,
+                state,
+                style,
+            );
         }
 
         if config.auto_info {
