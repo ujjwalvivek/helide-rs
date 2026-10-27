@@ -86,6 +86,9 @@ serde = { version = "1.0", features = ["derive"] }
 
 dashmap = "6.2"
 
+# Terminal panes
+alacritty_terminal = "0.26"
+
 parking_lot.workspace = true
 
 [target.'cfg(windows)'.dependencies]

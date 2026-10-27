@@ -338,6 +338,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "C-a" => increment,
         "C-x" => decrement,
+
+        "C-3" => terminal_toggle,
     });
     let mut select = normal.clone();
     select.merge_nodes(keymap!({ "Select mode"
@@ -383,6 +385,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "C-s" => commit_undo_checkpoint,
         "C-x" => completion,
+        "C-3" => terminal_toggle,
         "C-r" => insert_register,
 
         "C-w" | "A-backspace" => delete_word_backward,

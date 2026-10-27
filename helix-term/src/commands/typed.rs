@@ -2649,6 +2649,35 @@ fn pipe_impl(
     Ok(())
 }
 
+fn terminal(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (command, name) = if args.is_empty() {
+        (Vec::new(), None)
+    } else {
+        let mut command = cx.editor.config().shell.clone();
+        command.push(args.join(" "));
+        (command, args.first().map(|arg| arg.to_string()))
+    };
+
+    cx.jobs.callback(async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                let Some(editor_view) = compositor.find::<ui::EditorView>() else {
+                    return;
+                };
+                if let Err(err) = editor_view.terminal.open(&command, name) {
+                    editor.set_error(format!("cannot start terminal: {err}"));
+                }
+            },
+        ));
+        Ok(call)
+    });
+    Ok(())
+}
+
 fn run_shell_command(
     cx: &mut compositor::Context,
     args: Args,
@@ -3965,6 +3994,18 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: pipe_to,
         completer: SHELL_COMPLETER,
         signature: SHELL_SIGNATURE,
+    },
+    TypableCommand {
+        name: "terminal",
+        aliases: &["term"],
+        doc: "Open a terminal tab in the panel, running the given command through the shell, or a plain shell.",
+        fun: terminal,
+        completer: SHELL_COMPLETER,
+        signature: Signature {
+            positionals: (0, Some(2)),
+            raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
     },
     TypableCommand {
         name: "run-shell-command",
