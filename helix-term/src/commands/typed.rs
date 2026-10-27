@@ -2733,6 +2733,22 @@ fn tab_prev(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+fn zen(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.jobs.callback(async {
+        let call: job::Callback =
+            Callback::EditorCompositor(Box::new(|_: &mut Editor, compositor: &mut Compositor| {
+                if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                    editor_view.toggle_zen();
+                }
+            }));
+        Ok(call)
+    });
+    Ok(())
+}
+
 fn accept_proposal(
     _cx: &mut compositor::Context,
     _args: Args,
@@ -4190,6 +4206,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["tabprevious", "tabp"],
         doc: "Go to the previous tab.",
         fun: tab_prev,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "zen",
+        aliases: &[],
+        doc: "Zen mode: hide every panel and the frame, or bring them back.",
+        fun: zen,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

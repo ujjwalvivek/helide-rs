@@ -244,6 +244,7 @@ impl Application {
             signal::SIGUSR1,
             signal::SIGTERM,
             signal::SIGINT,
+            signal::SIGHUP,
         ])
         .context("build signal handler")?;
 
@@ -265,6 +266,10 @@ impl Application {
 
     async fn render(&mut self) {
         self.ide.after_event(&mut self.editor);
+        let summary = self.lsp_summary();
+        if let Some(editor_view) = self.compositor.find::<ui::EditorView>() {
+            editor_view.lsp_summary = summary;
+        }
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;
@@ -391,6 +396,41 @@ impl Application {
                 self.editor.reset_idle_timer();
             }
         }
+    }
+
+    /// Helide: the current document's language servers and what they are doing, for the frame.
+    fn lsp_summary(&self) -> Vec<(String, String)> {
+        let doc = doc!(self.editor);
+        doc.language_servers()
+            .map(|server| {
+                let id = server.id();
+                let state = if !server.is_initialized() {
+                    "starting…".to_string()
+                } else if let Some((title, progress)) =
+                    self.lsp_progress.progress_map(id).and_then(|tokens| {
+                        tokens.values().find_map(|status| match status {
+                            helix_lsp::ProgressStatus::Started { title, progress } => {
+                                Some((title.clone(), progress))
+                            }
+                            helix_lsp::ProgressStatus::Created => None,
+                        })
+                    })
+                {
+                    let percentage = match progress {
+                        lsp::WorkDoneProgress::Begin(p) => p.percentage,
+                        lsp::WorkDoneProgress::Report(p) => p.percentage,
+                        lsp::WorkDoneProgress::End(_) => None,
+                    };
+                    match percentage {
+                        Some(percent) => format!("⟳ {} {percent}%", title.to_lowercase()),
+                        None => format!("⟳ {}", title.to_lowercase()),
+                    }
+                } else {
+                    "✓".to_string()
+                };
+                (server.name().to_string(), state)
+            })
+            .collect()
     }
 
     pub fn handle_config_events(&mut self, config_event: ConfigEvent) {
@@ -585,7 +625,7 @@ impl Application {
                 self.refresh_config();
                 self.render().await;
             }
-            signal::SIGTERM | signal::SIGINT => {
+            signal::SIGTERM | signal::SIGINT | signal::SIGHUP => {
                 self.restore_term().unwrap();
                 return false;
             }
