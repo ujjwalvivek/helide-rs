@@ -1,0 +1,554 @@
+//! Helide file tree: the working directory as an expandable tree, docked left of the editor.
+//!
+//! Directories are listed lazily, one level at a time, with the same ignore rules as the file
+//! picker. The tree is rebuilt from the set of expanded directories whenever it may be stale:
+//! when it gains focus, after a file operation, or on `R`.
+
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
+
+use helix_core::unicode::width::UnicodeWidthStr;
+use helix_view::{
+    editor::Action,
+    graphics::{Modifier, Rect},
+    input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
+    keyboard::{KeyCode, KeyModifiers},
+    Editor,
+};
+use tui::buffer::Buffer as Surface;
+
+use crate::{
+    compositor::{self, Component},
+    job::Callback,
+    ui::{completers, EditorView, Prompt, PromptEvent},
+};
+
+const MIN_WIDTH: u16 = 24;
+const MAX_WIDTH: u16 = 40;
+/// The editor keeps at least this many columns next to the tree.
+const MIN_EDITOR_WIDTH: u16 = 40;
+
+struct Row {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    depth: usize,
+}
+
+/// What the tree asks its host to do after a key or click.
+pub enum TreeAction {
+    None,
+    /// Hand focus back to the editor.
+    FocusEditor,
+    Hide,
+    /// Ask for a name and create a file, or a directory when the name ends in `/`, in this dir.
+    Create(PathBuf),
+    Rename(PathBuf),
+    Delete(PathBuf),
+}
+
+#[derive(Default)]
+pub struct FileTree {
+    root: PathBuf,
+    rows: Vec<Row>,
+    expanded: HashSet<PathBuf>,
+    selected: usize,
+    scroll: usize,
+    /// Shows hidden files regardless of the file picker setting.
+    show_hidden: bool,
+    pub visible: bool,
+    pub focused: bool,
+    /// Where the rows were drawn last frame (below the header).
+    rows_area: Rect,
+    /// Where the whole tree was drawn last frame.
+    area: Rect,
+}
+
+impl FileTree {
+    /// Hidden: show and focus it on the current file. Shown but unfocused: focus. Focused: hide.
+    pub fn toggle(&mut self, editor: &Editor) {
+        if self.visible && self.focused {
+            self.visible = false;
+            self.focused = false;
+        } else {
+            self.visible = true;
+            self.focused = true;
+            self.refresh(editor);
+            self.reveal_current(editor);
+        }
+    }
+
+    /// Re-reads every expanded directory, keeping the selection on the same path.
+    pub fn refresh(&mut self, editor: &Editor) {
+        let root = helix_stdx::env::current_working_dir();
+        if root != self.root {
+            self.expanded.clear();
+            self.selected = 0;
+            self.scroll = 0;
+            self.root = root;
+        }
+        let selected = self.selected_path().map(Path::to_path_buf);
+        self.expanded.retain(|dir| dir.is_dir());
+
+        let mut rows = Vec::new();
+        self.list(editor, &self.root.clone(), 0, &mut rows);
+        self.rows = rows;
+
+        // Follow the selected path; if it is gone (deleted or renamed outside the tree), select
+        // the row before it, which is its previous sibling or its parent.
+        match selected {
+            Some(path) if self.rows.iter().any(|row| row.path == path) => self.select_path(&path),
+            Some(_) => self.selected = self.selected.saturating_sub(1),
+            None => {}
+        }
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn list(&self, editor: &Editor, dir: &Path, depth: usize, rows: &mut Vec<Row>) {
+        for (path, is_dir) in read_dir(editor, dir, self.show_hidden) {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let expanded = is_dir && self.expanded.contains(&path);
+            rows.push(Row {
+                path: path.clone(),
+                name,
+                is_dir,
+                depth,
+            });
+            if expanded {
+                self.list(editor, &path, depth + 1, rows);
+            }
+        }
+    }
+
+    /// Expands the parents of the focused document and selects it.
+    pub fn reveal_current(&mut self, editor: &Editor) {
+        let (_, doc) = current_ref!(editor);
+        let Some(path) = doc.path() else { return };
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return;
+        };
+        let mut dir = self.root.clone();
+        let mut changed = false;
+        if let Some(parent) = relative.parent() {
+            for part in parent.components() {
+                dir.push(part);
+                changed |= self.expanded.insert(dir.clone());
+            }
+        }
+        if changed {
+            self.refresh(editor);
+        }
+        self.select_path(path);
+    }
+
+    fn select_path(&mut self, path: &Path) {
+        if let Some(index) = self.rows.iter().position(|row| row.path == path) {
+            self.selected = index;
+        }
+    }
+
+    fn selected_path(&self) -> Option<&Path> {
+        self.rows.get(self.selected).map(|row| row.path.as_path())
+    }
+
+    /// The directory new files go into: the selected directory, or the selected file's parent.
+    fn target_dir(&self) -> PathBuf {
+        match self.rows.get(self.selected) {
+            Some(row) if row.is_dir => row.path.clone(),
+            Some(row) => row
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.root.clone()),
+            None => self.root.clone(),
+        }
+    }
+
+    /// Gives the tree its slice of `area`, returning what is left for the editor.
+    pub fn layout(&self, area: Rect) -> Rect {
+        if !self.visible {
+            return area;
+        }
+        let width = (area.width / 5).clamp(MIN_WIDTH, MAX_WIDTH);
+        if width + MIN_EDITOR_WIDTH > area.width {
+            return area;
+        }
+        area.clip_left(width)
+    }
+
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        self.visible
+            && column >= self.area.x
+            && column < self.area.right()
+            && row >= self.area.y
+            && row < self.area.bottom()
+    }
+
+    pub fn render(&mut self, area: Rect, surface: &mut Surface, editor: &Editor) {
+        self.area = area;
+        let theme = &editor.theme;
+        if area.width < 4 || area.height < 2 {
+            return;
+        }
+
+        // A one-column separator on the right, like the one between splits.
+        let separator = theme.get("ui.window");
+        for y in area.top()..area.bottom() {
+            if let Some(cell) = surface.get_mut(area.right() - 1, y) {
+                cell.set_symbol(tui::symbols::line::VERTICAL)
+                    .set_style(separator);
+            }
+        }
+        let area = area.clip_right(1);
+
+        let header_style = theme.get("ui.text.directory").add_modifier(Modifier::BOLD);
+        let root_name = self
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string());
+        surface.set_stringn(
+            area.x + 1,
+            area.y,
+            &root_name,
+            area.width.saturating_sub(2) as usize,
+            header_style,
+        );
+
+        let rows_area = area.clip_top(1);
+        self.rows_area = rows_area;
+        let height = rows_area.height as usize;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if height > 0 && self.selected >= self.scroll + height {
+            self.scroll = self.selected + 1 - height;
+        }
+
+        let current = {
+            let (_, doc) = current_ref!(editor);
+            doc.path().map(Path::to_path_buf)
+        };
+        let text = theme.get("ui.text");
+        let directory = theme.get("ui.text.directory");
+        let focus = theme.get("ui.text.focus");
+        let selected_style = if self.focused {
+            theme.get("ui.menu.selected")
+        } else {
+            theme.get("ui.cursorline.primary")
+        };
+
+        for (i, row) in self.rows.iter().enumerate().skip(self.scroll).take(height) {
+            let y = rows_area.y + (i - self.scroll) as u16;
+            let line = Rect::new(rows_area.x, y, rows_area.width, 1);
+            if i == self.selected {
+                surface.set_style(line, selected_style);
+            }
+            let marker = if !row.is_dir {
+                " "
+            } else if self.expanded.contains(&row.path) {
+                "▾"
+            } else {
+                "▸"
+            };
+            let mut style = if row.is_dir { directory } else { text };
+            if current.as_deref() == Some(row.path.as_path()) {
+                style = style.patch(focus).add_modifier(Modifier::BOLD);
+            }
+            if i == self.selected {
+                style = style.patch(selected_style);
+            }
+            let label = format!("{}{} {}", "  ".repeat(row.depth), marker, row.name);
+            let width = line.width.saturating_sub(1) as usize;
+            let label = if label.width() > width {
+                // Keep the end of long names visible rather than the indentation.
+                let mut cut: String = label.chars().take(width.saturating_sub(1)).collect();
+                cut.push('…');
+                cut
+            } else {
+                label
+            };
+            surface.set_stringn(line.x + 1, y, &label, width, style);
+        }
+    }
+
+    pub fn key(&mut self, key: KeyEvent, editor: &mut Editor) -> TreeAction {
+        let page = (self.rows_area.height as usize / 2).max(1);
+        let last = self.rows.len().saturating_sub(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.selected = (self.selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => self.selected = (self.selected + page).min(last),
+            KeyCode::Char('u') if ctrl => self.selected = self.selected.saturating_sub(page),
+            KeyCode::PageDown => self.selected = (self.selected + page * 2).min(last),
+            KeyCode::PageUp => self.selected = self.selected.saturating_sub(page * 2),
+            KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
+            KeyCode::Char('G') | KeyCode::End => self.selected = last,
+            KeyCode::Enter | KeyCode::Char('o') => return self.activate(editor, Action::Replace),
+            KeyCode::Char('l') | KeyCode::Right => {
+                let is_dir = self.rows.get(self.selected).is_some_and(|row| row.is_dir);
+                if is_dir {
+                    self.expand(editor, true);
+                } else {
+                    return self.activate(editor, Action::Replace);
+                }
+            }
+            KeyCode::Char('v') => return self.activate(editor, Action::VerticalSplit),
+            KeyCode::Char('s') => return self.activate(editor, Action::HorizontalSplit),
+            KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(editor),
+            KeyCode::Char('a') => return TreeAction::Create(self.target_dir()),
+            KeyCode::Char('r') => {
+                if let Some(path) = self.selected_path() {
+                    return TreeAction::Rename(path.to_path_buf());
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(path) = self.selected_path() {
+                    return TreeAction::Delete(path.to_path_buf());
+                }
+            }
+            KeyCode::Char('R') => self.refresh(editor),
+            KeyCode::Char('.') => {
+                self.show_hidden = !self.show_hidden;
+                self.refresh(editor);
+            }
+            KeyCode::Char('q') => return TreeAction::Hide,
+            KeyCode::Esc => return TreeAction::FocusEditor,
+            _ => {}
+        }
+        TreeAction::None
+    }
+
+    pub fn mouse(&mut self, event: &MouseEvent, editor: &mut Editor) -> TreeAction {
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                let max = self
+                    .rows
+                    .len()
+                    .saturating_sub(self.rows_area.height as usize);
+                self.scroll = (self.scroll + 3).min(max);
+                self.selected = self.selected.max(self.scroll);
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(3);
+                let bottom = self.scroll + self.rows_area.height as usize;
+                self.selected = self.selected.min(bottom.saturating_sub(1));
+            }
+            MouseEventKind::Down(MouseButton::Left) if event.row >= self.rows_area.y => {
+                let index = self.scroll + (event.row - self.rows_area.y) as usize;
+                if index < self.rows.len() {
+                    self.selected = index;
+                    return self.activate(editor, Action::Replace);
+                }
+            }
+            _ => {}
+        }
+        TreeAction::None
+    }
+
+    /// Opens the selected file, or toggles the selected directory.
+    fn activate(&mut self, editor: &mut Editor, action: Action) -> TreeAction {
+        let Some(row) = self.rows.get(self.selected) else {
+            return TreeAction::None;
+        };
+        if row.is_dir {
+            let expand = !self.expanded.contains(&row.path);
+            self.expand(editor, expand);
+            return TreeAction::None;
+        }
+        let path = row.path.clone();
+        match editor.open(&path, action) {
+            Ok(_) => TreeAction::FocusEditor,
+            Err(err) => {
+                editor.set_error(format!("cannot open {}: {err}", path.display()));
+                TreeAction::None
+            }
+        }
+    }
+
+    fn expand(&mut self, editor: &Editor, expand: bool) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        if !row.is_dir {
+            return;
+        }
+        let path = row.path.clone();
+        if expand {
+            self.expanded.insert(path);
+        } else {
+            self.expanded.remove(&path);
+        }
+        self.refresh(editor);
+    }
+
+    fn collapse_or_parent(&mut self, editor: &Editor) {
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        if row.is_dir && self.expanded.contains(&row.path) {
+            self.expand(editor, false);
+        } else if let Some(parent) = row.path.parent().map(Path::to_path_buf) {
+            self.select_path(&parent);
+        }
+    }
+}
+
+/// One level of `dir`: directories first, then files, each sorted case-insensitively.
+fn read_dir(editor: &Editor, dir: &Path, show_hidden: bool) -> Vec<(PathBuf, bool)> {
+    let config = editor.config();
+    let picker = &config.file_picker;
+    let mut entries: Vec<(PathBuf, bool)> = ignore::WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .hidden(picker.hidden && !show_hidden)
+        .parents(picker.parents)
+        .ignore(picker.ignore)
+        .follow_links(picker.follow_symlinks)
+        .git_ignore(picker.git_ignore)
+        .git_global(picker.git_global)
+        .git_exclude(picker.git_exclude)
+        .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+        .add_custom_ignore_filename(".helix/ignore")
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if entry.depth() == 0 {
+                return None;
+            }
+            let is_dir = entry.path().is_dir();
+            Some((entry.into_path(), is_dir))
+        })
+        .collect();
+    entries.sort_by(|(a, a_dir), (b, b_dir)| {
+        b_dir.cmp(a_dir).then_with(|| {
+            let a = a.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            let b = b.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            a.cmp(&b)
+        })
+    });
+    entries
+}
+
+/// The prompt a file operation needs, or `None` for actions the host handles itself.
+pub fn prompt(action: &TreeAction, editor: &Editor) -> Option<Box<dyn Component>> {
+    let root = helix_stdx::env::current_working_dir();
+    let relative = |path: &Path| {
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    let prompt: Prompt = match action {
+        TreeAction::Create(dir) => {
+            let dir = dir.clone();
+            let label = format!("new in {}/ (end with / for a dir): ", relative(&dir));
+            Prompt::new(
+                label.into(),
+                None,
+                completers::none,
+                move |cx, input, event| {
+                    if event != PromptEvent::Validate || input.is_empty() {
+                        return;
+                    }
+                    let path = dir.join(input);
+                    let result = if input.ends_with('/') {
+                        std::fs::create_dir_all(&path)
+                    } else {
+                        path.parent()
+                            .map_or(Ok(()), std::fs::create_dir_all)
+                            .and_then(|_| std::fs::File::create_new(&path).map(drop))
+                    };
+                    match result {
+                        Err(err) => cx.editor.set_error(format!("cannot create {input}: {err}")),
+                        Ok(()) if path.is_file() => {
+                            match cx.editor.open(&path, Action::Replace) {
+                                // A new file is for writing in, so the editor takes focus.
+                                Ok(_) => return refresh_later(cx, true),
+                                Err(err) => cx.editor.set_error(err.to_string()),
+                            }
+                        }
+                        Ok(()) => {}
+                    }
+                    refresh_later(cx, false);
+                },
+            )
+        }
+        TreeAction::Rename(path) => {
+            let old = path.clone();
+            let name = old
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let label = format!("rename {}: ", relative(&old));
+            Prompt::new(
+                label.into(),
+                None,
+                completers::none,
+                move |cx, input, event| {
+                    if event != PromptEvent::Validate || input.is_empty() {
+                        return;
+                    }
+                    let new = old.with_file_name(input);
+                    if new.exists() {
+                        cx.editor
+                            .set_error(format!("{} already exists", new.display()));
+                        return;
+                    }
+                    if let Err(err) = cx.editor.move_path(&old, &new) {
+                        cx.editor.set_error(format!("cannot rename: {err}"));
+                    }
+                    refresh_later(cx, false);
+                },
+            )
+            .with_line(name, editor)
+        }
+        TreeAction::Delete(path) => {
+            let path = path.clone();
+            let kind = if path.is_dir() { "directory" } else { "file" };
+            let label = format!("delete {kind} {}? [y/N]: ", relative(&path));
+            Prompt::new(
+                label.into(),
+                None,
+                completers::none,
+                move |cx, input, event| {
+                    if event != PromptEvent::Validate || !input.eq_ignore_ascii_case("y") {
+                        return;
+                    }
+                    let result = if path.is_dir() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    if let Err(err) = result {
+                        cx.editor.set_error(format!("cannot delete: {err}"));
+                    }
+                    refresh_later(cx, false);
+                },
+            )
+        }
+        _ => return None,
+    };
+    Some(Box::new(prompt))
+}
+
+/// Prompt callbacks have no access to the compositor, so the tree refresh runs as a job.
+fn refresh_later(cx: &mut compositor::Context, focus_editor: bool) {
+    cx.jobs.callback(async move {
+        Ok(Callback::EditorCompositor(Box::new(
+            move |editor, compositor| {
+                if let Some(editor_view) = compositor.find::<EditorView>() {
+                    editor_view.file_tree.refresh(editor);
+                    if focus_editor {
+                        editor_view.file_tree.focused = false;
+                    }
+                }
+            },
+        )))
+    });
+}

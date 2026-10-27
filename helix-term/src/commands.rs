@@ -617,6 +617,7 @@ impl MappableCommand {
         rotate_selections_first, "Make the first selection your primary one",
         rotate_selections_last, "Make the last selection your primary one",
         terminal_toggle, "Show and focus the terminal panel, or hide it when focused",
+        file_tree_toggle, "Show and focus the file tree, or hide it when focused",
     );
 }
 
@@ -7234,8 +7235,16 @@ fn terminal_toggle(cx: &mut Context) {
             let Some(editor_view) = compositor.find::<ui::EditorView>() else {
                 return;
             };
-            if let Err(err) = editor_view.terminal.toggle() {
-                cx.editor.set_error(format!("cannot start terminal: {err}"));
+            editor_view.toggle_terminal(cx.editor);
+        },
+    ));
+}
+
+fn file_tree_toggle(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.toggle_file_tree(cx.editor);
             }
         },
     ));

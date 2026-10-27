@@ -2668,8 +2668,23 @@ fn terminal(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
                 let Some(editor_view) = compositor.find::<ui::EditorView>() else {
                     return;
                 };
-                if let Err(err) = editor_view.terminal.open(&command, name) {
-                    editor.set_error(format!("cannot start terminal: {err}"));
+                editor_view.open_terminal(&command, name, editor);
+            },
+        ));
+        Ok(call)
+    });
+    Ok(())
+}
+
+fn file_tree(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.jobs.callback(async {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            |editor: &mut Editor, compositor: &mut Compositor| {
+                if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                    editor_view.toggle_file_tree(editor);
                 }
             },
         ));
@@ -4004,6 +4019,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (0, Some(2)),
             raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "file-tree",
+        aliases: &["tree"],
+        doc: "Show and focus the file tree on the current file, or hide it when focused.",
+        fun: file_tree,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },
