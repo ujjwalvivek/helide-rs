@@ -262,7 +262,14 @@ impl FileTree {
             if i == self.selected {
                 style = style.patch(selected_style);
             }
-            let label = format!("{}{} {}", "  ".repeat(row.depth), marker, row.name);
+            let expanded = row.is_dir && self.expanded.contains(&row.path);
+            let label = format!(
+                "{}{} {} {}",
+                "  ".repeat(row.depth),
+                marker,
+                icon(&row.name, row.is_dir, expanded),
+                row.name
+            );
             let width = line.width.saturating_sub(1) as usize;
             let label = if label.width() > width {
                 // Keep the end of long names visible rather than the indentation.
@@ -551,4 +558,62 @@ fn refresh_later(cx: &mut compositor::Context, focus_editor: bool) {
             },
         )))
     });
+}
+
+/// A Nerd Font icon for a tree row, picked by directory state, file name, then extension.
+fn icon(name: &str, is_dir: bool, expanded: bool) -> &'static str {
+    if is_dir {
+        return match (name, expanded) {
+            (".git" | ".github", _) => "\u{e5fb}",
+            ("node_modules", _) => "\u{e5fa}",
+            (_, true) => "\u{f07c}",
+            (_, false) => "\u{f07b}",
+        };
+    }
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "cargo.toml" | "cargo.lock" => return "\u{e7a8}",
+        "dockerfile" | "containerfile" => return "\u{f308}",
+        "makefile" | "justfile" => return "\u{e779}",
+        "license" | "license.md" | "license.txt" | "copying" => return "\u{f0219}",
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return "\u{e702}",
+        "flake.nix" | "flake.lock" => return "\u{f313}",
+        _ => {}
+    }
+    let extension = lower.rsplit_once('.').map_or("", |(_, ext)| ext);
+    match extension {
+        "rs" => "\u{e7a8}",
+        "md" | "markdown" => "\u{e73e}",
+        "toml" => "\u{e6b2}",
+        "json" | "jsonc" | "json5" => "\u{e60b}",
+        "yml" | "yaml" => "\u{e6a8}",
+        "lock" => "\u{f023}",
+        "js" | "mjs" | "cjs" => "\u{e74e}",
+        "ts" | "mts" | "cts" => "\u{e628}",
+        "jsx" | "tsx" => "\u{e7ba}",
+        "py" => "\u{e73c}",
+        "go" => "\u{e627}",
+        "c" | "h" => "\u{e61e}",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "\u{e61d}",
+        "cs" => "\u{f031b}",
+        "java" => "\u{e738}",
+        "kt" | "kts" => "\u{e634}",
+        "swift" => "\u{e755}",
+        "zig" => "\u{e6a9}",
+        "lua" => "\u{e620}",
+        "scm" | "ss" | "rkt" => "\u{e6b1}",
+        "nix" => "\u{f313}",
+        "sh" | "bash" | "zsh" | "fish" | "nu" | "ps1" => "\u{f489}",
+        "html" | "htm" => "\u{e736}",
+        "css" | "scss" | "sass" => "\u{e749}",
+        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" => "\u{f1c5}",
+        "pdf" => "\u{f1c1}",
+        "zip" | "tar" | "gz" | "xz" | "zst" | "7z" => "\u{f410}",
+        "txt" | "log" => "\u{f15c}",
+        "sql" | "db" | "sqlite" => "\u{e706}",
+        "xml" => "\u{f05c0}",
+        "csproj" | "sln" => "\u{e70c}",
+        "kdl" | "conf" | "ini" | "cfg" | "env" => "\u{e615}",
+        _ => "\u{f15b}",
+    }
 }
