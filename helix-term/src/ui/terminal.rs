@@ -18,8 +18,8 @@ use std::{
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
-    grid::Scroll,
-    index::Point,
+    grid::{Dimensions, Scroll},
+    index::{Column, Line, Point},
     sync::FairMutex,
     term::{
         cell::{Cell as TermCell, Flags},
@@ -539,7 +539,77 @@ impl TerminalPanel {
         }
     }
 
-    pub fn mouse(&mut self, event: &MouseEvent) {
+    /// The text of the tab being shown: up to `history` lines of scrollback, then the screen,
+    /// oldest first, with trailing blanks trimmed. Also returns the cursor's index in the list.
+    pub fn text(&self, history: usize) -> Option<(Vec<String>, usize)> {
+        let session = self.sessions.get(self.active)?;
+        let term = session.term.lock();
+        let grid = term.grid();
+        let first = -(grid.history_size().min(history) as i32);
+        let lines: Vec<String> = (first..grid.screen_lines() as i32)
+            .map(|line| row_text(&grid[Line(line)], grid.columns()))
+            .collect();
+        let cursor = (grid.cursor.point.line.0 - first) as usize;
+        Some((lines, cursor))
+    }
+
+    /// `path:line[:col]` locations in the tab being shown, newest first.
+    pub fn locations(&self) -> Vec<Location> {
+        let Some((lines, _)) = self.text(500) else {
+            return Vec::new();
+        };
+        let mut found: Vec<Location> = Vec::new();
+        for line in lines.iter().rev() {
+            for location in parse_locations(line) {
+                if !found.contains(&location) {
+                    found.push(location);
+                }
+            }
+        }
+        found
+    }
+
+    /// The command line and output of the last command: from the previous prompt to the
+    /// current one, recognised by the prompt's first character (`❯`, `$`, `%`). Falls back to the
+    /// visible screen when no earlier prompt is found.
+    pub fn last_output(&self) -> Option<String> {
+        let (lines, cursor) = self.text(2000)?;
+        let cursor = cursor.min(lines.len().saturating_sub(1));
+        let marker = lines[cursor].trim_start().chars().next()?;
+        let previous = (0..cursor)
+            .rev()
+            .find(|&i| lines[i].trim_start().starts_with(marker));
+        let start =
+            previous.unwrap_or_else(|| cursor.saturating_sub(self.grid_area.height as usize));
+        let block: Vec<&str> = lines[start..cursor].iter().map(String::as_str).collect();
+        let text = block.join("\n").trim_matches('\n').to_string();
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    pub fn mouse(&mut self, event: &MouseEvent) -> Option<Location> {
+        // Ctrl+click on a `path:line` opens it.
+        if let MouseEventKind::Down(MouseButton::Left) = event.kind {
+            if event.modifiers.contains(KeyModifiers::CONTROL)
+                && event.row > self.area.y
+                && !self.sessions.is_empty()
+            {
+                let session = &self.sessions[self.active];
+                let term = session.term.lock();
+                let grid = term.grid();
+                let line = event.row.saturating_sub(self.grid_area.y) as i32
+                    - grid.display_offset() as i32;
+                let column = event.column.saturating_sub(self.grid_area.x) as usize;
+                if line < grid.screen_lines() as i32 {
+                    let text = row_text(&grid[Line(line)], grid.columns());
+                    return location_at(&text, column);
+                }
+            }
+        }
+        self.mouse_inner(event);
+        None
+    }
+
+    fn mouse_inner(&mut self, event: &MouseEvent) {
         // Clicking the tab strip switches tabs.
         if event.row == self.area.y {
             if let MouseEventKind::Down(MouseButton::Left) = event.kind {
@@ -603,6 +673,94 @@ fn short_label(label: &str) -> String {
     }
     let tail: String = chars[chars.len() - (MAX - 1)..].iter().collect();
     format!("…{tail}")
+}
+
+/// A place in a file that a program printed, for jumping to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub line: usize,
+    pub column: Option<usize>,
+}
+
+fn row_text(row: &alacritty_terminal::grid::Row<TermCell>, columns: usize) -> String {
+    let mut text = String::with_capacity(columns);
+    for column in 0..columns {
+        let cell = &row[Column(column)];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        text.push(cell.c);
+    }
+    text.trim_end().to_string()
+}
+
+/// `path:line[:col]` (rustc, gcc, tsc, eslint, ripgrep...) and Python's `File "path", line N`.
+/// Only paths that exist, relative to the working directory or absolute, count.
+pub(crate) fn parse_locations(line: &str) -> Vec<Location> {
+    let mut found = Vec::new();
+    // Python tracebacks.
+    if let Some(rest) = line.trim_start().strip_prefix("File \"") {
+        if let Some((path, rest)) = rest.split_once('"') {
+            let number = rest
+                .trim_start_matches(", line ")
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok());
+            if let Some(line) = number {
+                if let Some(path) = existing(path) {
+                    found.push(Location {
+                        path,
+                        line,
+                        column: None,
+                    });
+                }
+            }
+        }
+    }
+    for token in line.split(|c: char| c.is_whitespace() || "()[]<>\"'`,".contains(c)) {
+        if let Some(location) = parse_token(token) {
+            found.push(location);
+        }
+    }
+    found
+}
+
+fn parse_token(token: &str) -> Option<Location> {
+    let token = token.trim_end_matches(['.', ':', ';']);
+    let mut parts = token.split(':');
+    let path = parts.next()?;
+    let line: usize = parts.next()?.parse().ok()?;
+    let column = parts.next().and_then(|c| c.parse().ok());
+    if line == 0 || !(path.contains('.') || path.contains('/')) {
+        return None;
+    }
+    let path = existing(path)?;
+    Some(Location { path, line, column })
+}
+
+fn existing(path: &str) -> Option<PathBuf> {
+    let path = helix_stdx::path::expand_tilde(std::path::Path::new(path));
+    let path = helix_stdx::env::current_working_dir().join(path);
+    path.is_file().then(|| helix_stdx::path::normalize(path))
+}
+
+/// The location under `column` in a line of text, for Ctrl+click.
+fn location_at(line: &str, column: usize) -> Option<Location> {
+    let mut start = 0;
+    for token in line.split_inclusive(|c: char| c.is_whitespace() || "()[]<>\"'`,".contains(c)) {
+        let end = start + token.chars().count();
+        if (start..end).contains(&column) {
+            return parse_token(
+                token.trim_end_matches(|c: char| c.is_whitespace() || "()[]<>\"'`,".contains(c)),
+            );
+        }
+        start = end;
+    }
+    None
 }
 
 fn cell_style(cell: &TermCell) -> Style {
@@ -832,6 +990,22 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         encode_key(KeyEvent { code, modifiers }, TermMode::empty()).unwrap()
+    }
+
+    #[test]
+    fn finds_locations_in_compiler_output() {
+        // Paths must exist: use this crate's own files, relative to the test's working dir.
+        let found = parse_locations("  --> src/ui/terminal.rs:12:5");
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].line, found[0].column), (12, Some(5)));
+        let found = parse_locations("error: src/lib.rs:3: something, see Cargo.toml:1");
+        assert_eq!(found.len(), 2);
+        assert!(parse_locations("version 1.2:3 of nothing.rs:4").is_empty());
+        let python = parse_locations(r#"  File "src/lib.rs", line 7, in <module>"#);
+        assert_eq!(python[0].line, 7);
+        let clicked = location_at("warning at src/lib.rs:9:2 here", 14).unwrap();
+        assert_eq!((clicked.line, clicked.column), (9, Some(2)));
+        assert!(location_at("warning at src/lib.rs:9:2 here", 2).is_none());
     }
 
     #[test]

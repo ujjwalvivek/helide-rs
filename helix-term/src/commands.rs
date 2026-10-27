@@ -621,6 +621,10 @@ impl MappableCommand {
         git_panel_toggle, "Show and focus the git panel, or hide it when focused",
         agent_toggle, "Show and focus the agent panel, starting an agent if there is none",
         agent_mention, "Mention this file (and selected lines) in the agent",
+        zen_toggle, "Zen mode: hide every panel, or bring them back",
+        goto_location, "Open the newest file:line printed in the terminal (again: older)",
+        send_output_to_agent, "Send the last terminal command's output to the agent",
+        open_config, "Open the config file",
         tab_new, "Open the current buffer in a new tab",
         tab_next, "Go to next tab",
         tab_prev, "Go to previous tab",
@@ -7307,4 +7311,42 @@ fn agent_mention(cx: &mut Context) {
             }
         },
     ));
+}
+
+fn zen_toggle(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, _: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.toggle_zen();
+            }
+        },
+    ));
+}
+
+fn goto_location(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.goto_location(cx.editor);
+            }
+        },
+    ));
+}
+
+fn send_output_to_agent(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.send_output_to_agent(cx.editor);
+            }
+        },
+    ));
+}
+
+fn open_config(cx: &mut Context) {
+    let path = helix_loader::config_file();
+    if let Err(err) = cx.editor.open(&path, Action::Replace) {
+        cx.editor
+            .set_error(format!("cannot open {}: {err}", path.display()));
+    }
 }

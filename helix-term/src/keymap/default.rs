@@ -224,6 +224,9 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
 
         "space" => { "Space"
             "@" => agent_mention,
+            "l" => goto_location,
+            ">" => send_output_to_agent,
+            "z" => zen_toggle,
             "f" => file_picker,
             "F" => file_picker_in_current_directory,
             "e" => file_explorer,
@@ -344,6 +347,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-5" => file_tree_toggle,
         "C-1" => git_panel_toggle,
         "C-4" => agent_toggle,
+        "F11" => zen_toggle,
+        "C-," => open_config,
         "C-pageup" => tab_prev,
         "C-pagedown" => tab_next,
     });
@@ -395,6 +400,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-5" => file_tree_toggle,
         "C-1" => git_panel_toggle,
         "C-4" => agent_toggle,
+        "F11" => zen_toggle,
+        "C-," => open_config,
         "C-pageup" => tab_prev,
         "C-pagedown" => tab_next,
         "C-r" => insert_register,

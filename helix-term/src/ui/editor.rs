@@ -105,6 +105,13 @@ pub struct EditorView {
     pub terminal: TerminalPanel,
     /// Helide's agent panel, on the right.
     pub agents: TerminalPanel,
+    /// Zen mode: every panel and the frame hidden. Holds which panels to bring back.
+    zen: Option<[bool; 4]>,
+    /// One line per language server of the current document, set by the Application each
+    /// frame: (name, state), shown in the editor box's bottom border.
+    pub lsp_summary: Vec<(String, String)>,
+    /// Locations found by the last error-location jump, and which one is shown.
+    locations: (Vec<super::terminal::Location>, usize),
     /// The project whose saved agent tabs were last restored or saved.
     agents_project: Option<PathBuf>,
     agents_width: Option<u16>,
@@ -152,6 +159,9 @@ impl EditorView {
             terminal_focused: true,
             terminal: TerminalPanel::new("TERMINAL"),
             agents: TerminalPanel::new("AGENTS"),
+            zen: None,
+            lsp_summary: Vec::new(),
+            locations: (Vec::new(), 0),
             agents_project: None,
             agents_width: None,
             agents_box: None,
@@ -1550,6 +1560,7 @@ impl EditorView {
 impl EditorView {
     /// Shows the terminal panel, or hides it when focused. Only one panel holds focus at a time.
     pub fn toggle_terminal(&mut self, editor: &mut Editor) {
+        self.zen = None;
         if let Err(err) = self.terminal.toggle() {
             editor.set_error(format!("cannot start terminal: {err}"));
         }
@@ -1569,6 +1580,7 @@ impl EditorView {
     /// Shows the file tree on the current file, or hides it when focused. The tree and the git
     /// panel share the left sidebar.
     pub fn toggle_file_tree(&mut self, editor: &Editor) {
+        self.zen = None;
         self.file_tree.toggle(editor);
         if self.file_tree.visible {
             self.git.visible = false;
@@ -1580,6 +1592,7 @@ impl EditorView {
 
     /// Shows the git panel, or hides it when focused.
     pub fn toggle_git(&mut self) {
+        self.zen = None;
         self.git.toggle();
         if self.git.visible {
             self.file_tree.visible = false;
@@ -1587,6 +1600,88 @@ impl EditorView {
         if self.git.focused {
             self.focus_only(Panel::Git);
         }
+    }
+
+    /// F11: hides every panel and the frame, leaving the editor alone; again brings them back.
+    pub fn toggle_zen(&mut self) {
+        match self.zen.take() {
+            Some([tree, git, terminal, agents]) => {
+                self.file_tree.visible = tree;
+                self.git.visible = git;
+                self.terminal.visible = terminal;
+                self.agents.visible = agents;
+            }
+            None => {
+                self.zen = Some([
+                    self.file_tree.visible,
+                    self.git.visible,
+                    self.terminal.visible,
+                    self.agents.visible,
+                ]);
+                self.file_tree.visible = false;
+                self.git.visible = false;
+                self.terminal.visible = false;
+                self.agents.visible = false;
+                self.focus_editor();
+            }
+        }
+    }
+
+    /// Space l: opens the newest `path:line` printed in the terminal (or the agent panel when
+    /// it is focused). Pressed again on the same output, it moves to the next older one.
+    pub fn goto_location(&mut self, editor: &mut Editor) {
+        let panel = if self.agents.focused || (self.terminal.is_empty() && !self.agents.is_empty())
+        {
+            &self.agents
+        } else {
+            &self.terminal
+        };
+        let found = panel.locations();
+        if found.is_empty() {
+            editor.set_status("No file locations in the terminal.");
+            return;
+        }
+        let index = if found == self.locations.0 {
+            (self.locations.1 + 1) % found.len()
+        } else {
+            0
+        };
+        let location = found[index].clone();
+        self.locations = (found, index);
+        self.open_location(&location, editor);
+    }
+
+    fn open_location(&mut self, location: &super::terminal::Location, editor: &mut Editor) {
+        if let Err(err) = editor.open(&location.path, Action::Replace) {
+            editor.set_error(format!("cannot open {}: {err}", location.path.display()));
+            return;
+        }
+        let (view, doc) = current!(editor);
+        let column = location.column.unwrap_or(1).saturating_sub(1);
+        let pos = helix_core::pos_at_coords(
+            doc.text().slice(..),
+            helix_core::Position::new(location.line.saturating_sub(1), column),
+            true,
+        );
+        doc.set_selection(view.id, helix_core::Selection::point(pos));
+        helix_view::align_view(doc, view, helix_view::Align::Center);
+        self.focus_editor();
+    }
+
+    /// Space >: sends the last command's output in the terminal to the agent being shown, as a
+    /// fenced block, and focuses the agent.
+    pub fn send_output_to_agent(&mut self, editor: &mut Editor) {
+        if self.agents.active_agent().is_none() {
+            editor.set_error("No agent is open. Press Ctrl+4 to start one.");
+            return;
+        }
+        let Some(output) = self.terminal.last_output() else {
+            editor.set_error("The terminal has no output to send.");
+            return;
+        };
+        self.agents.paste(&format!("```\n{output}\n```\n"));
+        self.agents.visible = true;
+        self.focus_only(Panel::Agents);
     }
 
     /// Focuses `panel` and takes focus from the others.
@@ -1600,6 +1695,7 @@ impl EditorView {
     /// Ctrl+4. Focused: hide. Hidden or unfocused with tabs: show and focus. Empty: reopen the
     /// project's saved agent tabs, or start an agent, asking which when both are installed.
     pub fn toggle_agents(&mut self, editor: &mut Editor) -> Option<Box<dyn Component>> {
+        self.zen = None;
         if self.agents.visible && self.agents.focused {
             self.agents.visible = false;
             self.agents.focused = false;
@@ -1698,6 +1794,12 @@ impl EditorView {
     fn layout_frame(&mut self, frame: Rect) {
         self.sidebar_box = None;
         self.terminal_box = None;
+        self.agents_box = None;
+        if self.zen.is_some() {
+            self.main_box = frame;
+            self.editor_box = frame;
+            return;
+        }
         let mut main = frame;
         if self.git.visible || self.file_tree.visible {
             let (min, max) = SIDEBAR_DEFAULT;
@@ -1835,6 +1937,7 @@ impl EditorView {
             );
         }
         self.render_editor_labels(editor, surface, &roles);
+        self.render_lsp_status(surface, &roles);
 
         // The focused view's position in its document, on the editor box's right border.
         let (view, doc) = current_ref!(editor);
@@ -1850,6 +1953,34 @@ impl EditorView {
             editor_box.bottom() - 1,
             (total, offset, visible),
             border(editor_focused),
+        );
+    }
+
+    /// Language servers of the current document, on the editor box's bottom border:
+    /// `rust-analyzer ✓`, `rust-analyzer ⟳ indexing 40%`, `starting…`.
+    fn render_lsp_status(&self, surface: &mut Surface, roles: &Roles) {
+        if self.lsp_summary.is_empty() {
+            return;
+        }
+        let bottom = self.editor_box.bottom() - 1;
+        let labels: Vec<Label> = self
+            .lsp_summary
+            .iter()
+            .map(|(name, state)| {
+                let style = match state.chars().next() {
+                    Some('✓') => roles.muted,
+                    Some('✗') => roles.error,
+                    _ => roles.warning,
+                };
+                Label::new(format!("{name} {state}"), style)
+            })
+            .collect();
+        frame::labels_right(
+            surface,
+            bottom,
+            self.editor_box.x,
+            self.editor_box.right() - 1,
+            &labels,
         );
     }
 
@@ -2130,14 +2261,18 @@ impl EditorView {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_only(Panel::Terminal);
                 }
-                self.terminal.mouse(mouse);
+                if let Some(location) = self.terminal.mouse(mouse) {
+                    self.open_location(&location, cx.editor);
+                }
                 Some(EventResult::Consumed(None))
             }
             Event::Mouse(mouse) if self.agents.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_only(Panel::Agents);
                 }
-                self.agents.mouse(mouse);
+                if let Some(location) = self.agents.mouse(mouse) {
+                    self.open_location(&location, cx.editor);
+                }
                 Some(EventResult::Consumed(None))
             }
             Event::Mouse(mouse) => {
@@ -2392,7 +2527,11 @@ impl Component for EditorView {
         }
         self.layout_frame(frame);
         let editor_box = self.editor_box;
+        let zen = self.zen.is_some();
         let inner = |rect: Rect| {
+            if zen {
+                return rect;
+            }
             Rect::new(
                 rect.x + 1,
                 rect.y + 1,
@@ -2420,7 +2559,9 @@ impl Component for EditorView {
             );
         }
 
-        self.render_frame(cx.editor, surface, editor_focused);
+        if !zen {
+            self.render_frame(cx.editor, surface, editor_focused);
+        }
 
         if let Some(terminal_box) = self.terminal_box {
             // The divider row and the inside, without the bottom border.
