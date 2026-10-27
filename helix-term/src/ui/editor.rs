@@ -38,7 +38,6 @@ use super::{
     file_tree::{self, FileTree, TreeAction},
     frame::{self, End, Label},
     git_panel::{GitAction, GitPanel},
-    overlay::overlaid,
     panel_style::Roles,
     terminal::TerminalPanel,
 };
@@ -1636,7 +1635,15 @@ impl EditorView {
                 self.open_agent(*kind, editor);
                 None
             }
-            _ => Some(Box::new(overlaid(agent_picker()))),
+            _ => {
+                // Just inside the editor box's top-right corner, where the panel will open.
+                let anchor = self.editor_box;
+                let position = Position::new(
+                    anchor.y as usize + 1,
+                    anchor.right().saturating_sub(16) as usize,
+                );
+                Some(Box::new(agent_menu(position)))
+            }
         }
     }
 
@@ -1657,7 +1664,7 @@ impl EditorView {
         self.agents_project = Some(project);
     }
 
-    /// Ctrl+Shift+A: types an @-mention of the current file (and selected lines) into the agent
+    /// Space @: types an @-mention of the current file (and selected lines) into the agent
     /// being shown, then focuses it.
     pub fn mention_in_agent(&mut self, editor: &mut Editor) {
         let Some(agent) = self.agents.active_agent().cloned() else {
@@ -2575,27 +2582,32 @@ fn canonicalize_key(key: &mut KeyEvent) {
     }
 }
 
-/// Which agent to start, when both are installed.
-fn agent_picker() -> super::Picker<AgentKind, ()> {
-    let columns = [super::PickerColumn::new("agent", |kind: &AgentKind, _| {
-        kind.command().into()
-    })];
-    super::Picker::new(
-        columns,
-        0,
-        AgentKind::installed(),
-        (),
-        |cx, kind, _action| {
-            let kind = *kind;
-            cx.jobs.callback(async move {
-                Ok(crate::job::Callback::EditorCompositor(Box::new(
-                    move |editor, compositor| {
-                        if let Some(editor_view) = compositor.find::<EditorView>() {
-                            editor_view.open_agent(kind, editor);
-                        }
-                    },
-                )))
-            });
-        },
-    )
+/// Which agent to start, when both are installed: a small menu by the editor's top-right.
+fn agent_menu(position: Position) -> super::Popup<super::Menu<AgentKind>> {
+    let mut menu = super::Menu::new(AgentKind::installed(), (), |_editor, kind, event| {
+        if event != super::PromptEvent::Validate {
+            return;
+        }
+        let Some(kind) = kind.copied() else {
+            return;
+        };
+        crate::job::dispatch_blocking(move |editor, compositor| {
+            if let Some(editor_view) = compositor.find::<EditorView>() {
+                editor_view.open_agent(kind, editor);
+            }
+        });
+    });
+    menu.move_down(); // pre-select the first agent
+    super::Popup::new("agent-menu", menu)
+        .with_scrollbar(false)
+        .position(Some(position))
+        .auto_close(true)
+}
+
+impl super::menu::Item for AgentKind {
+    type Data = ();
+
+    fn format(&self, _data: &Self::Data) -> tui::widgets::Row<'_> {
+        tui::widgets::Row::new([self.command()])
+    }
 }
