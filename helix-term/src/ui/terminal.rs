@@ -37,6 +37,8 @@ use helix_view::{
 };
 use tui::buffer::Buffer as Surface;
 
+use super::panel_style::Roles;
+
 /// Share of the editor area the panel takes when shown.
 const HEIGHT_PERCENT: u16 = 35;
 /// The panel never gets smaller than this, tab strip included.
@@ -188,6 +190,8 @@ pub struct TerminalPanel {
     grid_area: Rect,
     /// Where the whole panel was drawn last frame.
     area: Rect,
+    /// Columns each tab label covered on the top edge last frame.
+    tab_hits: Vec<(u16, u16)>,
 }
 
 impl TerminalPanel {
@@ -237,11 +241,14 @@ impl TerminalPanel {
     }
 
     /// Gives the panel its slice of `area`, returning what is left for the editor.
-    pub fn layout(&self, area: Rect) -> Rect {
+    /// `height` overrides the default share when the user has dragged the panel's edge.
+    pub fn layout(&self, area: Rect, height: Option<u16>) -> Rect {
         if !self.visible {
             return area;
         }
-        let height = (area.height * HEIGHT_PERCENT / 100).max(MIN_HEIGHT);
+        let height = height
+            .unwrap_or(area.height * HEIGHT_PERCENT / 100)
+            .max(MIN_HEIGHT);
         if height + MIN_HEIGHT > area.height {
             return area;
         }
@@ -314,30 +321,31 @@ impl TerminalPanel {
         }
     }
 
-    fn render_tabs(&self, area: Rect, surface: &mut Surface, theme: &Theme) {
-        let inactive = theme.get("ui.bufferline");
-        let active = theme.get("ui.bufferline.active");
-        let background = theme.get("ui.bufferline.background");
-        surface.set_style(area, background);
+    /// The top edge doubles as the tab strip: TERMINAL, then one label per tab, set into a
+    /// line that is solid and accented while the panel has focus.
+    fn render_tabs(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
+        let roles = Roles::new(theme);
+        roles.horizontal_edge(surface, area, self.focused);
+        self.tab_hits.clear();
 
-        let mut x = area.x;
+        let mut x = area.x + 1;
+        let title = " TERMINAL ";
+        surface.set_string(x, area.y, title, roles.label());
+        x += title.width() as u16;
         for (i, session) in self.sessions.iter().enumerate() {
-            let style = if i == self.active { active } else { inactive };
-            let label = format!(" {} {} ", i + 1, session.label());
-            let width = area.right().saturating_sub(x);
-            if width == 0 {
+            let label = format!(" {} {} ", i + 1, short_label(session.label()));
+            let width = area.right().saturating_sub(x + 1) as usize;
+            if width < 4 {
                 break;
             }
-            let (next, _) = surface.set_stringn(x, area.y, &label, width as usize, style);
+            let style = if i == self.active {
+                roles.text.add_modifier(Modifier::BOLD)
+            } else {
+                roles.muted
+            };
+            let (next, _) = surface.set_stringn(x, area.y, &label, width, style);
+            self.tab_hits.push((x, next));
             x = next;
-        }
-        if self.focused {
-            let hint = " C-2 editor  C-3 hide ";
-            if let Some(start) = area.right().checked_sub(hint.width() as u16) {
-                if start > x {
-                    surface.set_string(start, area.y, hint, theme.get("ui.text.inactive"));
-                }
-            }
         }
     }
 
@@ -364,6 +372,13 @@ impl TerminalPanel {
             self.grid_area.x as usize + column.0,
         );
         (Some(pos), kind)
+    }
+
+    /// The tab whose label covers `column` on the top edge.
+    pub fn tab_at(&self, column: u16) -> Option<usize> {
+        self.tab_hits
+            .iter()
+            .position(|&(start, end)| (start..end).contains(&column))
     }
 
     pub fn contains(&self, column: u16, row: u16) -> bool {
@@ -402,14 +417,12 @@ impl TerminalPanel {
         // Clicking the tab strip switches tabs.
         if event.row == self.area.y {
             if let MouseEventKind::Down(MouseButton::Left) = event.kind {
-                let mut x = self.area.x;
-                for (i, session) in self.sessions.iter().enumerate() {
-                    let width = format!(" {} {} ", i + 1, session.label()).width() as u16;
-                    if event.column >= x && event.column < x + width {
-                        self.active = i;
-                        break;
-                    }
-                    x += width;
+                if let Some(i) = self
+                    .tab_hits
+                    .iter()
+                    .position(|&(start, end)| (start..end).contains(&event.column))
+                {
+                    self.active = i;
                 }
             }
             return;
@@ -453,6 +466,17 @@ impl TerminalPanel {
             session.term.lock().scroll_display(Scroll::Delta(lines));
         }
     }
+}
+
+/// Tab labels keep their end: shells put the working directory in the title.
+fn short_label(label: &str) -> String {
+    const MAX: usize = 24;
+    let chars: Vec<char> = label.chars().collect();
+    if chars.len() <= MAX {
+        return label.to_string();
+    }
+    let tail: String = chars[chars.len() - (MAX - 1)..].iter().collect();
+    format!("…{tail}")
 }
 
 fn cell_style(cell: &TermCell) -> Style {

@@ -39,6 +39,19 @@ use super::{
     terminal::TerminalPanel,
 };
 
+/// A panel edge that can be dragged to resize the panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Sidebar,
+    Terminal,
+}
+
+/// The sidebar's default width: a fifth of the editor area, within readable limits.
+const SIDEBAR_DEFAULT: (u16, u16) = (26, 44);
+/// The editor always keeps this many columns, and the terminal this many rows of editor.
+const EDITOR_MIN_WIDTH: u16 = 40;
+const EDITOR_MIN_HEIGHT: u16 = 6;
+
 /// Helide's panels around the editor, for focus handling.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Panel {
@@ -67,6 +80,13 @@ pub struct EditorView {
     pub git: GitPanel,
     /// Where each tab label was drawn last frame: (row, start column, end column).
     tab_hits: Vec<(u16, u16, u16)>,
+    /// Sidebar width and terminal height the user set by dragging their edges.
+    sidebar_width: Option<u16>,
+    terminal_height: Option<u16>,
+    /// The edge being dragged, and where the edges were drawn last frame.
+    dragging: Option<Edge>,
+    sidebar_span: Option<(u16, u16)>,
+    terminal_span: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +114,11 @@ impl EditorView {
             file_tree: FileTree::default(),
             git: GitPanel::default(),
             tab_hits: Vec::new(),
+            sidebar_width: None,
+            terminal_height: None,
+            dragging: None,
+            sidebar_span: None,
+            terminal_span: None,
         }
     }
 
@@ -1571,6 +1596,46 @@ impl EditorView {
         }
     }
 
+    /// Starts, continues or ends dragging a panel edge. Returns whether the mouse event was used.
+    fn resize(&mut self, mouse: &MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let on_sidebar_edge = self
+                    .sidebar_span
+                    .is_some_and(|(_, edge)| mouse.column == edge);
+                // The terminal's top edge holds its tab labels; those stay clickable.
+                let on_terminal_edge = self.terminal_span.is_some_and(|(edge, _)| {
+                    mouse.row == edge && self.terminal.tab_at(mouse.column).is_none()
+                });
+                self.dragging = if on_sidebar_edge {
+                    Some(Edge::Sidebar)
+                } else if on_terminal_edge {
+                    Some(Edge::Terminal)
+                } else {
+                    None
+                };
+                self.dragging.is_some()
+            }
+            MouseEventKind::Drag(MouseButton::Left) => match self.dragging {
+                Some(Edge::Sidebar) => {
+                    if let Some((left, _)) = self.sidebar_span {
+                        self.sidebar_width = Some(mouse.column.saturating_sub(left) + 1);
+                    }
+                    true
+                }
+                Some(Edge::Terminal) => {
+                    if let Some((_, bottom)) = self.terminal_span {
+                        self.terminal_height = Some(bottom.saturating_sub(mouse.row));
+                    }
+                    true
+                }
+                None => false,
+            },
+            MouseEventKind::Up(MouseButton::Left) => self.dragging.take().is_some(),
+            _ => false,
+        }
+    }
+
     fn focus_editor(&mut self) {
         self.focus_only(Panel::None);
     }
@@ -1619,6 +1684,7 @@ impl EditorView {
         cx: &mut crate::compositor::Context,
     ) -> Option<EventResult> {
         match event {
+            Event::Mouse(mouse) if self.resize(mouse) => Some(EventResult::Consumed(None)),
             Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && self.tab_hits.iter().any(|&(y, start, end)| {
@@ -1891,14 +1957,30 @@ impl Component for EditorView {
 
         // the file tree takes the left of the editor area, the terminal panel the bottom of the rest
         let tree_area = editor_area;
-        editor_area = if self.git.visible {
-            self.git.layout(editor_area)
-        } else {
-            self.file_tree.layout(editor_area)
-        };
+        self.sidebar_span = None;
+        if self.git.visible || self.file_tree.visible {
+            let (min, max) = SIDEBAR_DEFAULT;
+            // Dragging can't push the sidebar past the editor's minimum width.
+            let width = self
+                .sidebar_width
+                .unwrap_or((editor_area.width / 5).clamp(min, max))
+                .max(16)
+                .min(editor_area.width.saturating_sub(EDITOR_MIN_WIDTH));
+            if width >= 16 {
+                // (left column, right edge column)
+                self.sidebar_span = Some((editor_area.x, editor_area.x + width - 1));
+                editor_area = editor_area.clip_left(width);
+            }
+        }
         self.terminal.update();
         let panel_area = editor_area;
-        editor_area = self.terminal.layout(editor_area);
+        let height = self
+            .terminal_height
+            .map(|height| height.min(editor_area.height.saturating_sub(EDITOR_MIN_HEIGHT)));
+        editor_area = self.terminal.layout(editor_area, height);
+        // (edge row, bottom row)
+        self.terminal_span = (editor_area.height != panel_area.height)
+            .then(|| (editor_area.bottom(), panel_area.bottom()));
 
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
