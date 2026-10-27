@@ -517,7 +517,7 @@ fn refresh_later(cx: &mut compositor::Context, focus_editor: bool) {
 /// extension. Colours follow nvim-web-devicons and mini.icons (as glyph.hx does), so a file
 /// type looks the same here as in other editors; folders are azure, unknown files grey. A
 /// folder's open or closed icon is its expanded state; there is no separate chevron.
-fn icon(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) {
+pub(crate) fn icon(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) {
     const FOLDER: Color = Color::Rgb(0x7e, 0xba, 0xe4);
     const GREY: Color = Color::Rgb(0x6d, 0x80, 0x86);
     let rgb = |hex: u32| Color::Rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
