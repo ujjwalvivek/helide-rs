@@ -353,7 +353,11 @@ impl Application {
                     self.render().await;
                 }
                 Some((request, reply)) = self.ipc.rx.recv() => {
-                    let response = crate::ipc::handle(&mut self.editor, &mut self.jobs, &self.lsp_progress, request);
+                    let response = if request.method == "keys" {
+                        crate::ipc::send_keys(&mut self.compositor, &mut self.editor, &mut self.jobs, request)
+                    } else {
+                        crate::ipc::handle(&mut self.editor, &mut self.jobs, &self.lsp_progress, request)
+                    };
                     let _ = reply.send(response);
                     self.render().await;
                 }
