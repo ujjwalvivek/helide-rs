@@ -99,39 +99,14 @@ impl AgentSession {
 }
 
 impl AgentSession {
-    /// Environment for the agent's process. OpenCode gets `OPENCODE_CONFIG`, a config file
-    /// that registers this editor's `hx mcp` bridge (see crate::mcp); OpenCode merges it with
-    /// the user's own config. Claude talks to the editor through the IDE server instead.
+    /// Extra environment for the agent's process. Claude finds the editor through the IDE
+    /// server's variables, already exported. OpenCode gets nothing extra: in OpenCode 2.x,
+    /// pointing `OPENCODE_CONFIG` at a file replaced the user's config (their MCP servers
+    /// disappeared) instead of merging with it, so `hx mcp` is registered in the user's own
+    /// config instead (see crate::mcp).
     pub fn env(&self) -> Vec<(String, String)> {
-        match self.kind {
-            AgentKind::Claude => Vec::new(),
-            AgentKind::OpenCode => opencode_config()
-                .map(|file| vec![("OPENCODE_CONFIG".to_string(), file.display().to_string())])
-                .unwrap_or_default(),
-        }
+        Vec::new()
     }
-}
-
-/// Writes `$XDG_STATE_HOME/helide/opencode.json`, registering `<this hx> mcp` as an MCP server.
-fn opencode_config() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let file = workspace_file(Path::new(""))?
-        .parent()?
-        .parent()?
-        .join("opencode.json");
-    let config = serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": {
-            "helide": {
-                "type": "local",
-                "command": [exe, "mcp"],
-                "enabled": true,
-            }
-        }
-    });
-    std::fs::create_dir_all(file.parent()?).ok()?;
-    std::fs::write(&file, serde_json::to_vec_pretty(&config).ok()?).ok()?;
-    Some(file)
 }
 
 fn claude_config_dir() -> Option<PathBuf> {
