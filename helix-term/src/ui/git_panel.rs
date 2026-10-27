@@ -1,4 +1,5 @@
-//! Helide git panel: status, staging, commits and remotes, docked in the left sidebar.
+//! Helide git panel: status, hunks, branches, stashes, commits and remotes, docked in the left
+//! sidebar.
 //!
 //! Everything goes through the `git` command line, so hooks, signing, credentials and config
 //! behave exactly as in a terminal. Commands run in the background and report back to the
@@ -6,32 +7,37 @@
 //! take over the terminal the editor is drawing on.
 
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
 
-use helix_core::{unicode::width::UnicodeWidthStr, Rope};
+use helix_core::{pos_at_coords, unicode::width::UnicodeWidthStr, Position, Range, Rope};
 use helix_view::{
+    align_view,
     document::Document,
     editor::Action,
     graphics::{Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Editor, Theme,
+    Align, Editor, Theme,
 };
+use tokio::io::AsyncWriteExt;
 use tui::buffer::Buffer as Surface;
 
 use crate::{
-    compositor::Component,
-    ui::{completers, EditorView, Prompt, PromptEvent},
+    compositor::{self, Component},
+    ui::{completers, overlay::overlaid, EditorView, Picker, PickerColumn, Prompt, PromptEvent},
 };
 
 /// While shown, the panel re-reads status at most this often (on redraws).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const COMMITS_SHOWN: usize = 12;
+/// Changed lines shown under an expanded hunk before it is cut short.
+const HUNK_LINES_SHOWN: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Section {
     Conflicts,
     Staged,
@@ -50,6 +56,9 @@ impl Section {
     }
 }
 
+/// A file in a section, identified by both, since a file can be staged and changed at once.
+type FileKey = (Section, String);
+
 #[derive(Debug, Clone)]
 struct Entry {
     section: Section,
@@ -60,8 +69,28 @@ struct Entry {
 }
 
 #[derive(Debug, Clone)]
+struct Hunk {
+    /// The `@@ -a,b +c,d @@ context` line.
+    header: String,
+    /// Added and removed lines, for the preview under the hunk.
+    changes: Vec<String>,
+    /// First line of the hunk in the new version of the file, 1-based.
+    new_start: usize,
+    /// The file header plus this hunk: a patch `git apply` takes on its own.
+    patch: String,
+}
+
+#[derive(Debug, Clone)]
 struct Commit {
     hash: String,
+    subject: String,
+    when: String,
+}
+
+#[derive(Debug, Clone)]
+struct Stash {
+    /// `stash@{n}`.
+    name: String,
     subject: String,
     when: String,
 }
@@ -75,13 +104,23 @@ pub struct Snapshot {
     ahead: u32,
     behind: u32,
     entries: Vec<Entry>,
+    hunks: HashMap<FileKey, Vec<Hunk>>,
+    stashes: Vec<Stash>,
     commits: Vec<Commit>,
 }
 
 enum Row {
     Header(Section, usize),
     File(usize),
+    /// File entry index, hunk index.
+    Hunk(usize, usize),
+    /// File entry index, hunk index, changed-line index.
+    HunkLine(usize, usize, usize),
+    /// How many changed lines of a hunk are not shown.
+    HunkMore(usize),
     Gap,
+    StashesHeader,
+    Stash(usize),
     CommitsHeader,
     Commit(usize),
 }
@@ -91,14 +130,16 @@ pub enum GitAction {
     None,
     FocusEditor,
     Hide,
-    /// Show this prompt on top of the editor.
-    Prompt(Box<dyn Component>),
+    /// Show this layer (a prompt or picker) on top of the editor.
+    Layer(Box<dyn Component>),
 }
 
 #[derive(Default)]
 pub struct GitPanel {
     snapshot: Snapshot,
     rows: Vec<Row>,
+    /// Files whose hunks are listed under them.
+    expanded: HashSet<FileKey>,
     selected: usize,
     scroll: usize,
     pub visible: bool,
@@ -132,8 +173,9 @@ impl GitPanel {
         self.refreshing = true;
         self.last_refresh = Some(Instant::now());
         let cwd = helix_stdx::env::current_working_dir();
+        let expanded: Vec<FileKey> = self.expanded.iter().cloned().collect();
         tokio::spawn(async move {
-            let snapshot = read_snapshot(&cwd).await;
+            let snapshot = read_snapshot(&cwd, &expanded).await;
             crate::job::dispatch(move |_, compositor| {
                 if let Some(editor_view) = compositor.find::<EditorView>() {
                     editor_view.git.apply(snapshot);
@@ -143,17 +185,28 @@ impl GitPanel {
         });
     }
 
+    /// Refreshes now, even if a refresh is already on its way (its result may be stale).
+    fn force_refresh(&mut self) {
+        self.refreshing = false;
+        self.refresh();
+    }
+
     fn apply(&mut self, snapshot: Snapshot) {
         let selected = self.selected_key();
         self.snapshot = snapshot;
         self.refreshing = false;
+        let present: HashSet<FileKey> = self
+            .snapshot
+            .entries
+            .iter()
+            .map(|entry| (entry.section, entry.path.clone()))
+            .collect();
+        self.expanded.retain(|key| present.contains(key));
         self.rebuild_rows();
-        // Stay on the same file or commit if it is still listed.
+        // Stay on the same item if it is still listed.
         if let Some(key) = selected {
-            if let Some(index) = self
-                .rows
-                .iter()
-                .position(|row| self.row_key(row) == Some(key.clone()))
+            if let Some(index) =
+                (0..self.rows.len()).find(|&i| self.row_key(i) == Some(key.clone()))
             {
                 self.selected = index;
             }
@@ -162,6 +215,7 @@ impl GitPanel {
     }
 
     fn rebuild_rows(&mut self) {
+        let snapshot = &self.snapshot;
         let mut rows = Vec::new();
         for section in [
             Section::Conflicts,
@@ -169,46 +223,73 @@ impl GitPanel {
             Section::Changes,
             Section::Untracked,
         ] {
-            let files: Vec<usize> = (0..self.snapshot.entries.len())
-                .filter(|&i| self.snapshot.entries[i].section == section)
+            let files: Vec<usize> = (0..snapshot.entries.len())
+                .filter(|&i| snapshot.entries[i].section == section)
                 .collect();
             if files.is_empty() {
                 continue;
             }
             rows.push(Row::Header(section, files.len()));
-            rows.extend(files.into_iter().map(Row::File));
+            for file in files {
+                rows.push(Row::File(file));
+                let entry = &snapshot.entries[file];
+                let key = (entry.section, entry.path.clone());
+                if !self.expanded.contains(&key) {
+                    continue;
+                }
+                for (h, hunk) in snapshot.hunks.get(&key).into_iter().flatten().enumerate() {
+                    rows.push(Row::Hunk(file, h));
+                    let shown = hunk.changes.len().min(HUNK_LINES_SHOWN);
+                    rows.extend((0..shown).map(|l| Row::HunkLine(file, h, l)));
+                    if hunk.changes.len() > shown {
+                        rows.push(Row::HunkMore(hunk.changes.len() - shown));
+                    }
+                }
+            }
         }
-        if !self.snapshot.commits.is_empty() {
+        if !snapshot.stashes.is_empty() {
+            rows.push(Row::Gap);
+            rows.push(Row::StashesHeader);
+            rows.extend((0..snapshot.stashes.len()).map(Row::Stash));
+        }
+        if !snapshot.commits.is_empty() {
             rows.push(Row::Gap);
             rows.push(Row::CommitsHeader);
-            rows.extend((0..self.snapshot.commits.len()).map(Row::Commit));
+            rows.extend((0..snapshot.commits.len()).map(Row::Commit));
         }
         self.rows = rows;
     }
 
-    /// A stable identity for a row, so the selection survives a refresh.
-    fn row_key(&self, row: &Row) -> Option<(Option<Section>, String)> {
-        match row {
+    /// A stable identity for row `index`, so the selection survives a refresh.
+    fn row_key(&self, index: usize) -> Option<String> {
+        let snapshot = &self.snapshot;
+        match self.rows.get(index)? {
             Row::File(i) => {
-                let entry = &self.snapshot.entries[*i];
-                Some((Some(entry.section), entry.path.clone()))
+                let entry = &snapshot.entries[*i];
+                Some(format!("file {:?} {}", entry.section, entry.path))
             }
-            Row::Commit(i) => Some((None, self.snapshot.commits[*i].hash.clone())),
+            Row::Hunk(i, h) => {
+                let entry = &snapshot.entries[*i];
+                Some(format!("hunk {:?} {} {h}", entry.section, entry.path))
+            }
+            Row::Stash(i) => Some(format!("stash {}", snapshot.stashes[*i].name)),
+            Row::Commit(i) => Some(format!("commit {}", snapshot.commits[*i].hash)),
             _ => None,
         }
     }
 
-    fn selected_key(&self) -> Option<(Option<Section>, String)> {
-        self.rows
-            .get(self.selected)
-            .and_then(|row| self.row_key(row))
+    fn selected_key(&self) -> Option<String> {
+        self.row_key(self.selected)
     }
 
     fn selectable(row: &Row) -> bool {
-        matches!(row, Row::File(_) | Row::Commit(_))
+        matches!(
+            row,
+            Row::File(_) | Row::Hunk(..) | Row::Stash(_) | Row::Commit(_)
+        )
     }
 
-    /// Keeps the selection on a file or commit row.
+    /// Keeps the selection on a selectable row.
     fn clamp_selection(&mut self) {
         if self.rows.is_empty() {
             self.selected = 0;
@@ -217,20 +298,22 @@ impl GitPanel {
         self.selected = self.selected.min(self.rows.len() - 1);
         if !Self::selectable(&self.rows[self.selected]) {
             self.step(1);
+            if !Self::selectable(&self.rows[self.selected]) {
+                self.step(-1);
+            }
         }
     }
 
     /// Moves the selection `delta` selectable rows, stopping at the ends.
     fn step(&mut self, delta: isize) {
+        let dir = if delta < 0 { -1 } else { 1 };
+        let mut remaining = delta.unsigned_abs();
         let mut index = self.selected as isize;
-        let mut remaining = delta.abs();
-        let dir = delta.signum().max(-1);
-        let dir = if dir == 0 { 1 } else { dir };
-        let mut last_good = if self.rows.get(self.selected).is_some_and(Self::selectable) {
-            Some(self.selected)
-        } else {
-            None
-        };
+        let mut last_good = self
+            .rows
+            .get(self.selected)
+            .filter(|row| Self::selectable(row))
+            .map(|_| self.selected);
         while remaining > 0 {
             index += dir;
             if index < 0 || index as usize >= self.rows.len() {
@@ -248,16 +331,40 @@ impl GitPanel {
         }
     }
 
+    fn selected_row(&self) -> Option<&Row> {
+        self.rows.get(self.selected)
+    }
+
     fn selected_entry(&self) -> Option<&Entry> {
-        match self.rows.get(self.selected) {
-            Some(Row::File(i)) => self.snapshot.entries.get(*i),
+        match self.selected_row()? {
+            Row::File(i) | Row::Hunk(i, _) => self.snapshot.entries.get(*i),
+            _ => None,
+        }
+    }
+
+    fn selected_hunk(&self) -> Option<(&Entry, &Hunk)> {
+        let Row::Hunk(i, h) = self.selected_row()? else {
+            return None;
+        };
+        let entry = self.snapshot.entries.get(*i)?;
+        let hunk = self
+            .snapshot
+            .hunks
+            .get(&(entry.section, entry.path.clone()))?
+            .get(*h)?;
+        Some((entry, hunk))
+    }
+
+    fn selected_stash(&self) -> Option<&Stash> {
+        match self.selected_row()? {
+            Row::Stash(i) => self.snapshot.stashes.get(*i),
             _ => None,
         }
     }
 
     fn selected_commit(&self) -> Option<&Commit> {
-        match self.rows.get(self.selected) {
-            Some(Row::Commit(i)) => self.snapshot.commits.get(*i),
+        match self.selected_row()? {
+            Row::Commit(i) => self.snapshot.commits.get(*i),
             _ => None,
         }
     }
@@ -267,7 +374,7 @@ impl GitPanel {
         if !self.visible {
             return area;
         }
-        let width = (area.width / 5).clamp(30, 48);
+        let width = (area.width / 4).clamp(32, 56);
         if width + 40 > area.width {
             return area;
         }
@@ -308,7 +415,7 @@ impl GitPanel {
 
         // Header: branch, upstream distance, and whatever is running.
         let header = match &self.snapshot.repo {
-            None if self.refreshing && self.last_refresh.is_some() => "reading…".to_string(),
+            None if self.refreshing => "reading…".to_string(),
             None => "not a git repository".to_string(),
             Some(_) => {
                 let mut header = format!("\u{e725} {}", self.snapshot.branch);
@@ -335,9 +442,8 @@ impl GitPanel {
         }
 
         // Footer: the keys that matter most.
-        let footer_y = area.bottom() - 1;
-        let footer = "spc stage  ⏎ diff  c commit  P push  ? keys";
-        surface.set_stringn(area.x + 1, footer_y, footer, inner_width, dim);
+        let footer = "spc stage  l hunks  b branch  z stash  ? keys";
+        surface.set_stringn(area.x + 1, area.bottom() - 1, footer, inner_width, dim);
 
         let rows_area = Rect::new(
             area.x,
@@ -352,10 +458,10 @@ impl GitPanel {
         } else if height > 0 && self.selected >= self.scroll + height {
             self.scroll = self.selected + 1 - height;
         }
-        if self.snapshot.repo.is_some() && self.rows.is_empty() {
+        if self.snapshot.repo.is_some() && self.snapshot.entries.is_empty() {
             surface.set_stringn(
                 area.x + 1,
-                rows_area.y,
+                area.y + 1,
                 "nothing to commit",
                 inner_width,
                 dim,
@@ -368,6 +474,7 @@ impl GitPanel {
             theme.get("ui.cursorline.primary")
         };
         let section_style = text.add_modifier(Modifier::BOLD);
+        let snapshot = &self.snapshot;
 
         for (i, row) in self.rows.iter().enumerate().skip(self.scroll).take(height) {
             let y = rows_area.y + (i - self.scroll) as u16;
@@ -388,12 +495,15 @@ impl GitPanel {
                     let label = format!("{} {count}", section.title());
                     surface.set_stringn(line.x + 1, y, &label, inner_width, section_style);
                 }
+                Row::StashesHeader => {
+                    surface.set_stringn(line.x + 1, y, "Stashes", inner_width, section_style);
+                }
                 Row::CommitsHeader => {
                     surface.set_stringn(line.x + 1, y, "Commits", inner_width, section_style);
                 }
                 Row::Gap => {}
                 Row::File(index) => {
-                    let entry = &self.snapshot.entries[*index];
+                    let entry = &snapshot.entries[*index];
                     let code_style = match entry.code {
                         'A' | '?' => theme.get("diff.plus"),
                         'D' => theme.get("diff.minus"),
@@ -401,13 +511,72 @@ impl GitPanel {
                         'U' => theme.get("error"),
                         _ => theme.get("diff.delta"),
                     };
+                    let expanded = self.expanded.contains(&(entry.section, entry.path.clone()));
+                    let marker = match (entry.section, expanded) {
+                        (Section::Untracked, _) => " ",
+                        (_, true) => "▾",
+                        (_, false) => "▸",
+                    };
+                    surface.set_string(line.x + 1, y, marker, patch(dim));
                     surface.set_string(line.x + 2, y, &entry.code.to_string(), patch(code_style));
                     let width = inner_width.saturating_sub(3);
                     let path = shorten_left(&entry.path, width);
                     surface.set_stringn(line.x + 4, y, &path, width, patch(text));
                 }
+                Row::Hunk(file, h) => {
+                    let entry = &snapshot.entries[*file];
+                    if let Some(hunk) = snapshot
+                        .hunks
+                        .get(&(entry.section, entry.path.clone()))
+                        .and_then(|hunks| hunks.get(*h))
+                    {
+                        let width = inner_width.saturating_sub(3);
+                        surface.set_stringn(
+                            line.x + 4,
+                            y,
+                            &hunk.header,
+                            width,
+                            patch(theme.get("diff.delta")),
+                        );
+                    }
+                }
+                Row::HunkLine(file, h, l) => {
+                    let entry = &snapshot.entries[*file];
+                    if let Some(change) = snapshot
+                        .hunks
+                        .get(&(entry.section, entry.path.clone()))
+                        .and_then(|hunks| hunks.get(*h))
+                        .and_then(|hunk| hunk.changes.get(*l))
+                    {
+                        let style = if change.starts_with('+') {
+                            theme.get("diff.plus")
+                        } else {
+                            theme.get("diff.minus")
+                        };
+                        let width = inner_width.saturating_sub(5);
+                        surface.set_stringn(line.x + 6, y, change, width, style);
+                    }
+                }
+                Row::HunkMore(count) => {
+                    let label = format!("… {count} more lines");
+                    surface.set_stringn(line.x + 6, y, &label, inner_width, dim);
+                }
+                Row::Stash(index) => {
+                    let stash = &snapshot.stashes[*index];
+                    let tag = stash.name.trim_start_matches("stash@");
+                    surface.set_string(line.x + 2, y, tag, patch(theme.get("constant")));
+                    let subject_x = line.x + 2 + tag.width() as u16 + 1;
+                    let when_width = stash.when.width();
+                    let room =
+                        (line.right() as usize).saturating_sub(subject_x as usize + when_width + 2);
+                    surface.set_stringn(subject_x, y, &stash.subject, room, patch(text));
+                    if room > 0 {
+                        let x = line.right().saturating_sub(when_width as u16 + 1);
+                        surface.set_string(x, y, &stash.when, patch(dim));
+                    }
+                }
                 Row::Commit(index) => {
-                    let commit = &self.snapshot.commits[*index];
+                    let commit = &snapshot.commits[*index];
                     let hash = &commit.hash[..commit.hash.len().min(7)];
                     surface.set_string(line.x + 2, y, hash, patch(theme.get("constant")));
                     let when_width = commit.when.width();
@@ -437,29 +606,28 @@ impl GitPanel {
                 self.clamp_selection();
             }
             KeyCode::Char('G') | KeyCode::End => self.step(isize::MAX / 2),
-            KeyCode::Char(' ') => self.toggle_stage(),
-            KeyCode::Char('s') if !ctrl => self.toggle_stage(),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => self.expand(true),
+            KeyCode::Char('h') | KeyCode::Left => self.expand(false),
+            KeyCode::Char(' ') => self.primary(),
+            KeyCode::Char('s') if !ctrl => self.primary(),
             KeyCode::Char('a') => self.toggle_stage_all(),
-            KeyCode::Enter | KeyCode::Char('d') => self.show_diff(Action::NewTab),
-            KeyCode::Char('v') => self.show_diff(Action::VerticalSplit),
-            KeyCode::Char('s') if ctrl => self.show_diff(Action::HorizontalSplit),
-            KeyCode::Char('o') | KeyCode::Char('l') => {
-                if let (Some(repo), Some(entry)) = (&self.snapshot.repo, self.selected_entry()) {
-                    if entry.code != 'D' {
-                        let path = repo.join(&entry.path);
-                        return match editor.open(&path, Action::Replace) {
-                            Ok(_) => GitAction::FocusEditor,
-                            Err(err) => {
-                                editor.set_error(format!("cannot open {}: {err}", entry.path));
-                                GitAction::None
-                            }
-                        };
-                    }
+            KeyCode::Enter => {
+                if let Some(action) = self.jump_to_hunk(editor) {
+                    return action;
                 }
+                self.show(Action::NewTab);
             }
+            KeyCode::Char('d') => self.show(Action::NewTab),
+            KeyCode::Char('v') => self.show(Action::VerticalSplit),
+            KeyCode::Char('s') if ctrl => self.show(Action::HorizontalSplit),
+            KeyCode::Char('o') => return self.open_file(editor),
             KeyCode::Char('x') => return self.discard_prompt(),
             KeyCode::Char('c') => return self.commit_prompt(false, editor),
             KeyCode::Char('A') => return self.commit_prompt(true, editor),
+            KeyCode::Char('b') => self.branch_picker(),
+            KeyCode::Char('B') => return self.new_branch_prompt(),
+            KeyCode::Char('z') => return self.stash_prompt(),
+            KeyCode::Char('Z') => self.run(&["stash", "pop"], "popping", "stash popped", true),
             KeyCode::Char('P') => {
                 let args: &[&str] = if self.snapshot.upstream.is_some() {
                     &["push"]
@@ -472,13 +640,12 @@ impl GitPanel {
             KeyCode::Char('f') => {
                 self.run(&["fetch", "--all", "--prune"], "fetching", "fetched", false)
             }
-            KeyCode::Char('R') => {
-                self.refreshing = false;
-                self.refresh();
-            }
+            KeyCode::Char('R') => self.force_refresh(),
             KeyCode::Char('?') => editor.set_status(
-                "spc/s stage  a all  ⏎ diff in tab  v/C-s in split  o open  x discard  \
-                 c commit  A amend  P push  p pull  f fetch  R refresh  q hide",
+                "files: spc stage  l/h hunks  ⏎ diff  v/C-s split  o open  x discard  a all  \
+                 hunks: spc stage  x discard  ⏎ jump  stashes: spc pop  ⏎ show  x drop  \
+                 c commit  A amend  b branch  B new branch  z stash  Z pop  P push  p pull  \
+                 f fetch  R refresh  q hide",
             ),
             KeyCode::Char('q') => return GitAction::Hide,
             KeyCode::Esc => return GitAction::FocusEditor,
@@ -496,11 +663,15 @@ impl GitPanel {
             {
                 let index = self.scroll + (event.row - self.rows_area.y) as usize;
                 if self.rows.get(index).is_some_and(Self::selectable) {
-                    if index == self.selected {
-                        // A second click on the selected row opens its diff.
-                        self.show_diff(Action::NewTab);
-                    }
+                    let again = index == self.selected;
                     self.selected = index;
+                    if again {
+                        // A second click on a file expands it; on anything else, shows it.
+                        match self.selected_row() {
+                            Some(Row::File(_)) => self.expand(true),
+                            _ => self.show(Action::NewTab),
+                        }
+                    }
                 }
             }
             _ => {}
@@ -508,7 +679,61 @@ impl GitPanel {
         GitAction::None
     }
 
-    fn toggle_stage(&mut self) {
+    /// `l` toggles a file's hunks; `h` collapses, from the file or one of its hunks.
+    fn expand(&mut self, toggle: bool) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        if entry.section == Section::Untracked {
+            return;
+        }
+        let key = (entry.section, entry.path.clone());
+        let on_hunk = matches!(self.selected_row(), Some(Row::Hunk(..)));
+        if toggle && !on_hunk && !self.expanded.contains(&key) {
+            self.expanded.insert(key);
+            self.force_refresh();
+            return;
+        }
+        if toggle && on_hunk {
+            return;
+        }
+        if self.expanded.remove(&key) {
+            // Move the selection back up to the file.
+            if let Some(file) = (0..=self.selected).rev().find(|&i| {
+                matches!(&self.rows[i], Row::File(f) if self.snapshot.entries[*f].path == key.1
+                    && self.snapshot.entries[*f].section == key.0)
+            }) {
+                self.selected = file;
+            }
+            let selected = self.selected_key();
+            self.rebuild_rows();
+            if let Some(selected) = selected {
+                if let Some(index) =
+                    (0..self.rows.len()).find(|&i| self.row_key(i) == Some(selected.clone()))
+                {
+                    self.selected = index;
+                }
+            }
+            self.clamp_selection();
+        }
+    }
+
+    /// Space: stage or unstage a file or hunk, or pop a stash.
+    fn primary(&mut self) {
+        if let Some((entry, hunk)) = self.selected_hunk() {
+            let (args, busy): (&[&str], _) = match entry.section {
+                Section::Staged => (&["apply", "--cached", "--reverse", "-"], "unstaging hunk"),
+                _ => (&["apply", "--cached", "-"], "staging hunk"),
+            };
+            let patch = hunk.patch.clone();
+            self.run_with_input(args, patch, busy, "", false);
+            return;
+        }
+        if let Some(stash) = self.selected_stash() {
+            let name = stash.name.clone();
+            self.run(&["stash", "pop", &name], "popping", "stash popped", true);
+            return;
+        }
         let Some(entry) = self.selected_entry() else {
             return;
         };
@@ -537,38 +762,79 @@ impl GitPanel {
         }
     }
 
-    /// Opens the selected file's diff, or the selected commit, in a new tab or split.
-    fn show_diff(&mut self, action: Action) {
+    /// Enter on a hunk opens its file at the hunk.
+    fn jump_to_hunk(&self, editor: &mut Editor) -> Option<GitAction> {
+        let (entry, hunk) = self.selected_hunk()?;
+        let repo = self.snapshot.repo.as_ref()?;
+        let path = repo.join(&entry.path);
+        let line = hunk.new_start.saturating_sub(1);
+        Some(match editor.open(&path, Action::Replace) {
+            Ok(_) => {
+                let (view, doc) = current!(editor);
+                let pos = pos_at_coords(doc.text().slice(..), Position::new(line, 0), true);
+                doc.set_selection(view.id, Range::point(pos).into());
+                align_view(doc, view, Align::Center);
+                GitAction::FocusEditor
+            }
+            Err(err) => {
+                editor.set_error(format!("cannot open {}: {err}", entry.path));
+                GitAction::None
+            }
+        })
+    }
+
+    fn open_file(&self, editor: &mut Editor) -> GitAction {
+        let (Some(repo), Some(entry)) = (&self.snapshot.repo, self.selected_entry()) else {
+            return GitAction::None;
+        };
+        if entry.code == 'D' {
+            return GitAction::None;
+        }
+        match editor.open(&repo.join(&entry.path), Action::Replace) {
+            Ok(_) => GitAction::FocusEditor,
+            Err(err) => {
+                editor.set_error(format!("cannot open {}: {err}", entry.path));
+                GitAction::None
+            }
+        }
+    }
+
+    /// Opens the selected file's diff, a stash, or a commit, in a new tab or split.
+    fn show(&mut self, action: Action) {
         let Some(repo) = self.snapshot.repo.clone() else {
             return;
         };
-        let (args, label): (Vec<String>, String) = if let Some(entry) = self.selected_entry() {
+        let (args, label): (Vec<&str>, String) = if let Some(entry) = self.selected_entry() {
             let args = match entry.section {
                 Section::Staged => vec!["diff", "--cached", "--", &entry.path],
                 Section::Untracked => vec!["diff", "--no-index", "--", "/dev/null", &entry.path],
                 _ => vec!["diff", "--", &entry.path],
             };
+            (args, format!("diff {}", entry.path))
+        } else if let Some(stash) = self.selected_stash() {
             (
-                args.into_iter().map(String::from).collect(),
-                format!("diff {}", entry.path),
+                vec![
+                    "stash",
+                    "show",
+                    "--patch",
+                    "--include-untracked",
+                    &stash.name,
+                ],
+                format!("show {}", stash.name),
             )
         } else if let Some(commit) = self.selected_commit() {
             (
-                vec![
-                    "show".into(),
-                    "--stat".into(),
-                    "--patch".into(),
-                    commit.hash.clone(),
-                ],
+                vec!["show", "--stat", "--patch", &commit.hash],
                 format!("show {}", &commit.hash[..commit.hash.len().min(7)]),
             )
         } else {
             return;
         };
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
 
         tokio::spawn(async move {
             // `diff --no-index` exits with 1 when there are differences.
-            let output = git(&repo, &args).await;
+            let output = git(&repo, &args, None).await;
             crate::job::dispatch(move |editor, _| match output {
                 Ok(out) if !out.stdout.is_empty() => {
                     open_scratch(editor, &label, &out.stdout, "diff", action);
@@ -584,6 +850,37 @@ impl GitPanel {
     }
 
     fn discard_prompt(&mut self) -> GitAction {
+        if let Some((entry, hunk)) = self.selected_hunk() {
+            if entry.section != Section::Changes {
+                return GitAction::None;
+            }
+            let label = format!("discard this hunk of {}? [y/N]: ", entry.path);
+            let patch = hunk.patch.clone();
+            return confirm(label, move |cx| {
+                run_from_prompt(
+                    cx,
+                    args(&["apply", "--reverse", "-"]),
+                    Some(patch.clone()),
+                    "discarding",
+                    "hunk discarded",
+                    true,
+                )
+            });
+        }
+        if let Some(stash) = self.selected_stash() {
+            let name = stash.name.clone();
+            let label = format!("drop {name} ({})? [y/N]: ", stash.subject);
+            return confirm(label, move |cx| {
+                run_from_prompt(
+                    cx,
+                    args(&["stash", "drop", &name]),
+                    None,
+                    "dropping",
+                    "stash dropped",
+                    false,
+                )
+            });
+        }
         let Some(entry) = self.selected_entry().cloned() else {
             return GitAction::None;
         };
@@ -593,25 +890,15 @@ impl GitPanel {
             "discard changes to"
         };
         let label = format!("{what} {}? [y/N]: ", entry.path);
-        let prompt = Prompt::new(
-            label.into(),
-            None,
-            completers::none,
-            move |cx, input, event| {
-                if event != PromptEvent::Validate || !input.eq_ignore_ascii_case("y") {
-                    return;
-                }
-                let path = entry.path.clone();
-                let args: Vec<&str> = match entry.section {
-                    Section::Untracked => vec!["clean", "--force", "--", &path],
-                    Section::Staged => vec!["restore", "--staged", "--worktree", "--", &path],
-                    _ => vec!["restore", "--", &path],
-                };
-                let args: Vec<String> = args.into_iter().map(String::from).collect();
-                run_from_prompt(cx, args, "discarding", "discarded", true);
-            },
-        );
-        GitAction::Prompt(Box::new(prompt))
+        confirm(label, move |cx| {
+            let path = entry.path.as_str();
+            let list: &[&str] = match entry.section {
+                Section::Untracked => &["clean", "--force", "--", path],
+                Section::Staged => &["restore", "--staged", "--worktree", "--", path],
+                _ => &["restore", "--", path],
+            };
+            run_from_prompt(cx, args(list), None, "discarding", "discarded", true);
+        })
     }
 
     fn commit_prompt(&mut self, amend: bool, editor: &Editor) -> GitAction {
@@ -627,12 +914,12 @@ impl GitPanel {
                 if event != PromptEvent::Validate || input.trim().is_empty() {
                     return;
                 }
-                let mut args = vec!["commit".to_string()];
+                let mut list = vec!["commit"];
                 if amend {
-                    args.push("--amend".into());
+                    list.push("--amend");
                 }
-                args.extend(["--message".into(), input.to_string()]);
-                run_from_prompt(cx, args, "committing", "committed", false);
+                list.extend(["--message", input]);
+                run_from_prompt(cx, args(&list), None, "committing", "committed", false);
             },
         );
         if amend {
@@ -640,28 +927,211 @@ impl GitPanel {
                 prompt = prompt.with_line(last.subject.clone(), editor);
             }
         }
-        GitAction::Prompt(Box::new(prompt))
+        GitAction::Layer(Box::new(prompt))
+    }
+
+    fn new_branch_prompt(&mut self) -> GitAction {
+        if self.snapshot.repo.is_none() {
+            return GitAction::None;
+        }
+        let prompt = Prompt::new(
+            "new branch: ".into(),
+            None,
+            completers::none,
+            move |cx, input, event| {
+                let name = input.trim();
+                if event != PromptEvent::Validate || name.is_empty() {
+                    return;
+                }
+                run_from_prompt(
+                    cx,
+                    args(&["switch", "--create", name]),
+                    None,
+                    "creating branch",
+                    "switched to new branch",
+                    false,
+                );
+            },
+        );
+        GitAction::Layer(Box::new(prompt))
+    }
+
+    fn stash_prompt(&mut self) -> GitAction {
+        if self.snapshot.repo.is_none() {
+            return GitAction::None;
+        }
+        let prompt = Prompt::new(
+            "stash message (optional): ".into(),
+            None,
+            completers::none,
+            move |cx, input, event| {
+                if event != PromptEvent::Validate {
+                    return;
+                }
+                let mut list = vec!["stash", "push", "--include-untracked"];
+                if !input.trim().is_empty() {
+                    list.extend(["--message", input.trim()]);
+                }
+                run_from_prompt(cx, args(&list), None, "stashing", "stashed", true);
+            },
+        );
+        GitAction::Layer(Box::new(prompt))
+    }
+
+    /// Lists local and remote branches, most recent first, and switches to the one picked.
+    fn branch_picker(&mut self) {
+        let Some(repo) = self.snapshot.repo.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let output = git(
+                &repo,
+                &args(&[
+                    "for-each-ref",
+                    "--sort=-committerdate",
+                    "--format=%(HEAD)%1f%(refname)%1f%(refname:short)%1f%(committerdate:relative)%1f%(subject)",
+                    "refs/heads",
+                    "refs/remotes",
+                ]),
+                None,
+            )
+            .await;
+            crate::job::dispatch(move |editor, compositor| {
+                let output = match output {
+                    Ok(out) if out.success => out.stdout,
+                    Ok(out) => return editor.set_error(last_line(&out.stderr)),
+                    Err(err) => return editor.set_error(format!("git: {err}")),
+                };
+                let branches = parse_branches(&output);
+                if branches.is_empty() {
+                    return editor.set_status("no branches yet");
+                }
+                compositor.push(Box::new(overlaid(branch_picker(branches))));
+            })
+            .await;
+        });
     }
 
     /// Runs git in the background, then reports and refreshes. `reload` re-reads unmodified open
     /// buffers afterwards, for commands that change files on disk.
-    fn run(&mut self, args: &[&str], busy: &str, done: &str, reload: bool) {
+    fn run(&mut self, list: &[&str], busy: &str, done: &str, reload: bool) {
         let Some(repo) = self.snapshot.repo.clone() else {
             return;
         };
         self.busy = Some(busy.to_string());
-        spawn_git(
-            repo,
-            args.iter().map(|arg| arg.to_string()).collect(),
-            done.to_string(),
-            reload,
-        );
+        spawn_git(repo, args(list), None, done.to_string(), reload);
+    }
+
+    fn run_with_input(
+        &mut self,
+        list: &[&str],
+        input: String,
+        busy: &str,
+        done: &str,
+        reload: bool,
+    ) {
+        let Some(repo) = self.snapshot.repo.clone() else {
+            return;
+        };
+        self.busy = Some(busy.to_string());
+        spawn_git(repo, args(list), Some(input), done.to_string(), reload);
     }
 }
 
+#[derive(Debug, Clone)]
+struct Branch {
+    /// What the picker shows and matches: the short ref name, marked when checked out.
+    label: String,
+    when: String,
+    subject: String,
+    /// The `git switch` arguments that check it out.
+    switch: Vec<String>,
+}
+
+fn parse_branches(output: &str) -> Vec<Branch> {
+    let rows: Vec<Vec<&str>> = output
+        .lines()
+        .map(|line| line.split('\x1f').collect())
+        .filter(|fields: &Vec<&str>| fields.len() == 5)
+        .collect();
+    let locals: HashSet<&str> = rows
+        .iter()
+        .filter(|f| f[1].starts_with("refs/heads/"))
+        .map(|f| f[2])
+        .collect();
+    rows.iter()
+        .filter(|f| !f[1].ends_with("/HEAD"))
+        .map(|f| {
+            let (head, refname, short) = (f[0] == "*", f[1], f[2]);
+            let switch = if refname.starts_with("refs/heads/") {
+                vec!["switch".into(), short.into()]
+            } else {
+                // A remote branch: switch to the local one if it exists, else start tracking it.
+                let local = short.split_once('/').map_or(short, |(_, name)| name);
+                if locals.contains(local) {
+                    vec!["switch".into(), local.into()]
+                } else {
+                    vec!["switch".into(), "--track".into(), short.into()]
+                }
+            };
+            Branch {
+                label: if head {
+                    format!("* {short}")
+                } else {
+                    format!("  {short}")
+                },
+                when: short_age(f[3]),
+                subject: f[4].to_string(),
+                switch,
+            }
+        })
+        .collect()
+}
+
+fn branch_picker(branches: Vec<Branch>) -> Picker<Branch, ()> {
+    let columns = [
+        PickerColumn::new("branch", |branch: &Branch, _| branch.label.as_str().into()),
+        PickerColumn::new("when", |branch: &Branch, _| branch.when.as_str().into()),
+        PickerColumn::new("subject", |branch: &Branch, _| {
+            branch.subject.as_str().into()
+        }),
+    ];
+    Picker::new(columns, 0, branches, (), |cx, branch, _action| {
+        run_from_prompt(
+            cx,
+            branch.switch.clone(),
+            None,
+            "switching",
+            "switched branch",
+            true,
+        );
+    })
+}
+
+fn args(list: &[&str]) -> Vec<String> {
+    list.iter().map(|arg| arg.to_string()).collect()
+}
+
+/// A y/N prompt that runs `then` on "y".
+fn confirm(label: String, then: impl Fn(&mut compositor::Context) + 'static) -> GitAction {
+    let prompt = Prompt::new(
+        label.into(),
+        None,
+        completers::none,
+        move |cx, input, event| {
+            if event == PromptEvent::Validate && input.eq_ignore_ascii_case("y") {
+                then(cx);
+            }
+        },
+    );
+    GitAction::Layer(Box::new(prompt))
+}
+
+/// Starts a git command from a prompt or picker callback, which has no access to the panel.
 fn run_from_prompt(
-    cx: &mut crate::compositor::Context,
+    cx: &mut compositor::Context,
     args: Vec<String>,
+    input: Option<String>,
     busy: &'static str,
     done: &'static str,
     reload: bool,
@@ -672,7 +1142,7 @@ fn run_from_prompt(
                 if let Some(editor_view) = compositor.find::<EditorView>() {
                     if let Some(repo) = editor_view.git.snapshot.repo.clone() {
                         editor_view.git.busy = Some(busy.to_string());
-                        spawn_git(repo, args, done.to_string(), reload);
+                        spawn_git(repo, args, input, done.to_string(), reload);
                     }
                 }
             },
@@ -680,9 +1150,9 @@ fn run_from_prompt(
     });
 }
 
-fn spawn_git(repo: PathBuf, args: Vec<String>, done: String, reload: bool) {
+fn spawn_git(repo: PathBuf, args: Vec<String>, input: Option<String>, done: String, reload: bool) {
     tokio::spawn(async move {
-        let output = git(&repo, &args).await;
+        let output = git(&repo, &args, input).await;
         crate::job::dispatch(move |editor, compositor| {
             match output {
                 Ok(out) if out.success => {
@@ -705,8 +1175,7 @@ fn spawn_git(repo: PathBuf, args: Vec<String>, done: String, reload: bool) {
             }
             if let Some(editor_view) = compositor.find::<EditorView>() {
                 editor_view.git.busy = None;
-                editor_view.git.refreshing = false;
-                editor_view.git.refresh();
+                editor_view.git.force_refresh();
             }
         })
         .await;
@@ -719,13 +1188,17 @@ struct GitOutput {
     stderr: String,
 }
 
-async fn git(repo: &Path, args: &[String]) -> std::io::Result<GitOutput> {
+async fn git(repo: &Path, args: &[String], input: Option<String>) -> std::io::Result<GitOutput> {
     let mut command = tokio::process::Command::new("git");
     command
         .arg("-C")
         .arg(repo)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Never let git, ssh or an editor prompt on the terminal the editor is drawing on.
@@ -736,7 +1209,12 @@ async fn git(repo: &Path, args: &[String]) -> std::io::Result<GitOutput> {
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
-    let output = command.output().await?;
+    let mut child = command.spawn()?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin.write_all(input.as_bytes()).await?;
+        drop(stdin);
+    }
+    let output = child.wait_with_output().await?;
     Ok(GitOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -744,9 +1222,8 @@ async fn git(repo: &Path, args: &[String]) -> std::io::Result<GitOutput> {
     })
 }
 
-async fn read_snapshot(cwd: &Path) -> Snapshot {
-    let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-    let Ok(root) = git(cwd, &args(&["rev-parse", "--show-toplevel"])).await else {
+async fn read_snapshot(cwd: &Path, expanded: &[FileKey]) -> Snapshot {
+    let Ok(root) = git(cwd, &args(&["rev-parse", "--show-toplevel"]), None).await else {
         return Snapshot::default();
     };
     if !root.success {
@@ -766,30 +1243,62 @@ async fn read_snapshot(cwd: &Path) -> Snapshot {
         &format!("-n{COMMITS_SHOWN}"),
         "--format=%H%x1f%s%x1f%cr",
     ]);
-    let (status, log) = tokio::join!(git(&repo, &status_args), git(&repo, &log_args));
+    let stash_args = args(&["stash", "list", "--format=%gd%x1f%s%x1f%cr"]);
+    let (status, log, stashes) = tokio::join!(
+        git(&repo, &status_args, None),
+        git(&repo, &log_args, None),
+        git(&repo, &stash_args, None),
+    );
 
-    let mut snapshot = Snapshot {
-        repo: Some(repo),
-        ..Default::default()
-    };
+    let mut snapshot = Snapshot::default();
     if let Ok(status) = status {
         parse_status(&status.stdout, &mut snapshot);
     }
     if let Ok(log) = log {
-        snapshot.commits = log
-            .stdout
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split('\x1f');
-                Some(Commit {
-                    hash: parts.next()?.to_string(),
-                    subject: parts.next()?.to_string(),
-                    when: short_age(parts.next()?),
-                })
+        snapshot.commits = parse_records(&log.stdout)
+            .map(|[hash, subject, when]| Commit {
+                hash,
+                subject,
+                when: short_age(&when),
             })
             .collect();
     }
+    if let Ok(stashes) = stashes {
+        snapshot.stashes = parse_records(&stashes.stdout)
+            .map(|[name, subject, when]| Stash {
+                name,
+                subject,
+                when: short_age(&when),
+            })
+            .collect();
+    }
+    for key in expanded {
+        let (section, path) = key;
+        let diff_args = match section {
+            Section::Staged => args(&["diff", "--cached", "--", path]),
+            Section::Untracked => continue,
+            _ => args(&["diff", "--", path]),
+        };
+        if let Ok(diff) = git(&repo, &diff_args, None).await {
+            snapshot
+                .hunks
+                .insert(key.clone(), parse_hunks(&diff.stdout));
+        }
+    }
+    snapshot.repo = Some(repo);
     snapshot
+}
+
+/// Lines of three `\x1f`-separated fields.
+fn parse_records(output: &str) -> impl Iterator<Item = [String; 3]> + '_ {
+    output.lines().filter_map(|line| {
+        let mut parts = line.split('\x1f');
+        Some([
+            parts.next()?.to_string(),
+            parts.next()?.to_string(),
+            parts.next()?.to_string(),
+        ])
+    })
 }
 
 /// Parses `git status --porcelain=v2 --branch -z` output.
@@ -852,13 +1361,61 @@ fn parse_status(output: &str, snapshot: &mut Snapshot) {
     }
 }
 
-/// "3 hours ago" -> "3h", for the commit list.
+/// Splits one file's `git diff` output into hunks, each a patch `git apply` takes on its own.
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut lines = diff.split_inclusive('\n').peekable();
+    let mut file_header = String::new();
+    while let Some(line) = lines.peek() {
+        if line.starts_with("@@") {
+            break;
+        }
+        file_header.push_str(line);
+        lines.next();
+    }
+    let mut hunks = Vec::new();
+    while let Some(header) = lines.next() {
+        if !header.starts_with("@@") {
+            continue;
+        }
+        let mut body = String::new();
+        let mut changes = Vec::new();
+        while let Some(line) = lines.peek() {
+            if line.starts_with("@@") || line.starts_with("diff --git") {
+                break;
+            }
+            if (line.starts_with('+') || line.starts_with('-'))
+                && !line.starts_with("+++")
+                && !line.starts_with("---")
+            {
+                changes.push(line.trim_end_matches(['\n', '\r']).to_string());
+            }
+            body.push_str(line);
+            lines.next();
+        }
+        // "@@ -a,b +c,d @@": c is where the hunk starts in the new version.
+        let new_start = header
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix('+'))
+            .and_then(|range| range.split(',').next())
+            .and_then(|start| start.parse().ok())
+            .unwrap_or(1);
+        hunks.push(Hunk {
+            header: header.trim_end().to_string(),
+            changes,
+            new_start,
+            patch: format!("{file_header}{header}{body}"),
+        });
+    }
+    hunks
+}
+
+/// "3 hours ago" -> "3h", for the commit and stash lists.
 fn short_age(age: &str) -> String {
     let mut parts = age.split_whitespace();
     let (Some(n), Some(unit)) = (parts.next(), parts.next()) else {
         return age.to_string();
     };
-    let unit = match unit.trim_end_matches('s') {
+    let unit = match unit.trim_end_matches('s').trim_end_matches(',') {
         "second" => "s",
         "minute" => "m",
         "hour" => "h",
@@ -891,7 +1448,7 @@ fn shorten_left(path: &str, width: usize) -> String {
     format!("…{tail}")
 }
 
-/// Opens `text` in a new tab as a read-only, unnamed buffer labelled `label`.
+/// Opens `text` as a read-only, unnamed buffer labelled `label`.
 fn open_scratch(editor: &mut Editor, label: &str, text: &str, language: &str, action: Action) {
     let mut doc = Document::from(
         Rope::from(text),
@@ -984,6 +1541,67 @@ mod tests {
                 (Section::Untracked, "untracked.txt", '?'),
             ]
         );
+    }
+
+    #[test]
+    fn splits_a_diff_into_standalone_hunks() {
+        let diff = "\
+diff --git a/f.rs b/f.rs
+index 111..222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -1,3 +1,3 @@ fn a()
+ one
+-two
++TWO
+ three
+@@ -10,2 +10,3 @@ fn b()
+ ten
++ten and a half
+ eleven
+";
+        let hunks = parse_hunks(diff);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -1,3 +1,3 @@ fn a()");
+        assert_eq!(hunks[0].changes, vec!["-two", "+TWO"]);
+        assert_eq!(hunks[1].new_start, 10);
+        assert_eq!(hunks[1].changes, vec!["+ten and a half"]);
+        // Each patch carries the file header and only its own hunk.
+        assert!(hunks[1].patch.starts_with("diff --git a/f.rs b/f.rs\n"));
+        assert!(hunks[1].patch.contains("+++ b/f.rs\n@@ -10,2 +10,3 @@"));
+        assert!(!hunks[1].patch.contains("TWO"));
+    }
+
+    #[test]
+    fn parses_branches_and_how_to_switch() {
+        let output = [
+            "*\x1frefs/heads/main\x1fmain\x1f2 hours ago\x1ftip",
+            " \x1frefs/heads/feature\x1ffeature\x1f3 days ago\x1fwip",
+            " \x1frefs/remotes/origin/HEAD\x1forigin\x1f2 hours ago\x1ftip",
+            " \x1frefs/remotes/origin/feature\x1forigin/feature\x1f3 days ago\x1fwip",
+            " \x1frefs/remotes/origin/other\x1forigin/other\x1f1 week ago\x1fnew",
+        ]
+        .join("\n");
+        let branches = parse_branches(&output);
+        let summary: Vec<(&str, Vec<&str>)> = branches
+            .iter()
+            .map(|b| {
+                (
+                    b.label.as_str(),
+                    b.switch.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("* main", vec!["switch", "main"]),
+                ("  feature", vec!["switch", "feature"]),
+                ("  origin/feature", vec!["switch", "feature"]),
+                ("  origin/other", vec!["switch", "--track", "origin/other"]),
+            ]
+        );
+        assert_eq!(branches[1].when, "3d");
     }
 
     #[test]

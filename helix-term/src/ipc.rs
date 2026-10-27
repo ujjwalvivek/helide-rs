@@ -161,9 +161,7 @@ pub fn send_keys(
     request: Request,
 ) -> Value {
     let id = request.id;
-    let keys = match str_param(&request.params, "keys")
-        .and_then(helix_view::input::parse_macro)
-    {
+    let keys = match str_param(&request.params, "keys").and_then(helix_view::input::parse_macro) {
         Ok(keys) => keys,
         Err(err) => return error(id, err),
     };
