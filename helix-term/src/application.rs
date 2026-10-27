@@ -81,6 +81,7 @@ pub struct Application {
     theme_mode: Option<theme::Mode>,
 
     ipc: crate::ipc::Ipc,
+    ide: crate::ide::Ide,
 }
 
 #[cfg(feature = "integration")]
@@ -256,12 +257,14 @@ impl Application {
             lsp_progress: LspProgressMap::new(),
             theme_mode,
             ipc: crate::ipc::Ipc::start(),
+            ide: crate::ide::Ide::start(),
         };
 
         Ok(app)
     }
 
     async fn render(&mut self) {
+        self.ide.after_event(&mut self.editor);
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;
@@ -359,6 +362,10 @@ impl Application {
                         crate::ipc::handle(&mut self.editor, &mut self.jobs, &self.lsp_progress, request)
                     };
                     let _ = reply.send(response);
+                    self.render().await;
+                }
+                Some(call) = self.ide.rx.recv() => {
+                    self.ide.handle(&mut self.editor, call);
                     self.render().await;
                 }
                 event = self.editor.wait_event() => {
