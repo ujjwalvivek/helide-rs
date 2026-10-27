@@ -18,13 +18,15 @@ use helix_view::{
     align_view,
     document::Document,
     editor::Action,
-    graphics::{Modifier, Rect, Style},
+    graphics::Rect,
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
     Align, Editor, Theme,
 };
 use tokio::io::AsyncWriteExt;
 use tui::buffer::Buffer as Surface;
+
+use super::panel_style::Roles;
 
 use crate::{
     compositor::{self, Component},
@@ -229,6 +231,9 @@ impl GitPanel {
             if files.is_empty() {
                 continue;
             }
+            if !rows.is_empty() {
+                rows.push(Row::Gap);
+            }
             rows.push(Row::Header(section, files.len()));
             for file in files {
                 rows.push(Row::File(file));
@@ -369,18 +374,6 @@ impl GitPanel {
         }
     }
 
-    /// Gives the panel its slice of `area`, returning what is left for the editor.
-    pub fn layout(&self, area: Rect) -> Rect {
-        if !self.visible {
-            return area;
-        }
-        let width = (area.width / 4).clamp(32, 56);
-        if width + 40 > area.width {
-            return area;
-        }
-        area.clip_left(width)
-    }
-
     pub fn contains(&self, column: u16, row: u16) -> bool {
         self.visible
             && column >= self.area.x
@@ -400,56 +393,47 @@ impl GitPanel {
         if area.width < 8 || area.height < 4 {
             return;
         }
-
-        let separator = theme.get("ui.window");
-        for y in area.top()..area.bottom() {
-            if let Some(cell) = surface.get_mut(area.right() - 1, y) {
-                cell.set_symbol(tui::symbols::line::VERTICAL)
-                    .set_style(separator);
-            }
-        }
+        let roles = Roles::new(theme);
+        roles.vertical_edge(
+            surface,
+            area.right() - 1,
+            area.top(),
+            area.bottom(),
+            self.focused,
+        );
         let area = area.clip_right(1);
         let inner_width = area.width.saturating_sub(2) as usize;
-        let text = theme.get("ui.text");
-        let dim = theme.get("ui.text.inactive");
 
-        // Header: branch, upstream distance, and whatever is running.
-        let header = match &self.snapshot.repo {
-            None if self.refreshing => "reading…".to_string(),
-            None => "not a git repository".to_string(),
-            Some(_) => {
-                let mut header = format!("\u{e725} {}", self.snapshot.branch);
+        // GIT, with the branch (or the running command) on the right.
+        surface.set_string(area.x + 1, area.y, "GIT", roles.label());
+        let (status, style) = match (&self.busy, &self.snapshot.repo) {
+            (Some(busy), _) => (format!("{busy}…"), roles.warning),
+            (None, None) => (String::new(), roles.muted),
+            (None, Some(_)) => {
+                let mut branch = format!("\u{e725} {}", self.snapshot.branch);
                 if self.snapshot.upstream.is_some() {
-                    header.push_str(&format!(
-                        "  ↑{} ↓{}",
-                        self.snapshot.ahead, self.snapshot.behind
-                    ));
+                    if self.snapshot.ahead > 0 {
+                        branch.push_str(&format!(" ↑{}", self.snapshot.ahead));
+                    }
+                    if self.snapshot.behind > 0 {
+                        branch.push_str(&format!(" ↓{}", self.snapshot.behind));
+                    }
                 }
-                header
+                (branch, roles.muted)
             }
         };
-        surface.set_stringn(
-            area.x + 1,
-            area.y,
-            &header,
-            inner_width,
-            theme.get("ui.text.directory").add_modifier(Modifier::BOLD),
-        );
-        if let Some(busy) = &self.busy {
-            let label = format!("{busy}…");
-            let x = area.right().saturating_sub(label.width() as u16 + 1);
-            surface.set_string(x, area.y, &label, theme.get("warning"));
+        let room = inner_width.saturating_sub(5);
+        if room > 2 && !status.is_empty() {
+            let status = shorten_left(&status, room);
+            let x = area.right().saturating_sub(status.width() as u16 + 1);
+            surface.set_string(x, area.y, &status, style);
         }
-
-        // Footer: the keys that matter most.
-        let footer = "spc stage  l hunks  b branch  z stash  ? keys";
-        surface.set_stringn(area.x + 1, area.bottom() - 1, footer, inner_width, dim);
 
         let rows_area = Rect::new(
             area.x,
             area.y + 2,
             area.width,
-            area.height.saturating_sub(3),
+            area.height.saturating_sub(2),
         );
         self.rows_area = rows_area;
         let height = rows_area.height as usize;
@@ -458,70 +442,69 @@ impl GitPanel {
         } else if height > 0 && self.selected >= self.scroll + height {
             self.scroll = self.selected + 1 - height;
         }
-        if self.snapshot.repo.is_some() && self.snapshot.entries.is_empty() {
-            surface.set_stringn(
-                area.x + 1,
-                area.y + 1,
-                "nothing to commit",
-                inner_width,
-                dim,
-            );
-        }
 
-        let selected_style = if self.focused {
-            theme.get("ui.menu.selected")
-        } else {
-            theme.get("ui.cursorline.primary")
+        // Empty states say what is going on, in a sentence.
+        let empty = match &self.snapshot.repo {
+            None if self.refreshing => Some("Reading the repository."),
+            None => Some("Not a git repository."),
+            Some(_) if self.snapshot.entries.is_empty() => Some("Nothing to commit."),
+            Some(_) => None,
         };
-        let section_style = text.add_modifier(Modifier::BOLD);
+        let mut rows_y = rows_area.y;
+        if let Some(empty) = empty {
+            surface.set_stringn(area.x + 1, rows_area.y, empty, inner_width, roles.muted);
+            rows_y += 1;
+        }
         let snapshot = &self.snapshot;
 
-        for (i, row) in self.rows.iter().enumerate().skip(self.scroll).take(height) {
-            let y = rows_area.y + (i - self.scroll) as u16;
-            let line = Rect::new(rows_area.x, y, rows_area.width, 1);
-            let is_selected = i == self.selected;
-            if is_selected {
-                surface.set_style(line, selected_style);
+        for (i, row) in self.rows.iter().enumerate().skip(self.scroll) {
+            let y = rows_y + (i - self.scroll) as u16;
+            if y >= rows_area.bottom() {
+                break;
             }
-            let patch = |style: Style| {
-                if is_selected {
-                    style.patch(selected_style)
-                } else {
-                    style
-                }
-            };
+            let line = Rect::new(rows_area.x, y, rows_area.width, 1);
+            if i == self.selected {
+                roles.select_row(surface, line, self.focused);
+            }
             match row {
                 Row::Header(section, count) => {
-                    let label = format!("{} {count}", section.title());
-                    surface.set_stringn(line.x + 1, y, &label, inner_width, section_style);
+                    let label = section.title().to_uppercase();
+                    surface.set_string(line.x + 1, y, &label, roles.label());
+                    let x = line.x + 2 + label.width() as u16;
+                    surface.set_string(x, y, &count.to_string(), roles.faint);
                 }
                 Row::StashesHeader => {
-                    surface.set_stringn(line.x + 1, y, "Stashes", inner_width, section_style);
+                    surface.set_string(line.x + 1, y, "STASHES", roles.label());
                 }
                 Row::CommitsHeader => {
-                    surface.set_stringn(line.x + 1, y, "Commits", inner_width, section_style);
+                    surface.set_string(line.x + 1, y, "COMMITS", roles.label());
                 }
                 Row::Gap => {}
                 Row::File(index) => {
                     let entry = &snapshot.entries[*index];
                     let code_style = match entry.code {
-                        'A' | '?' => theme.get("diff.plus"),
-                        'D' => theme.get("diff.minus"),
-                        'R' | 'C' => theme.get("diff.delta.moved"),
-                        'U' => theme.get("error"),
-                        _ => theme.get("diff.delta"),
+                        'A' | '?' => roles.plus,
+                        'D' => roles.minus,
+                        'U' => roles.error,
+                        _ => roles.delta,
                     };
                     let expanded = self.expanded.contains(&(entry.section, entry.path.clone()));
-                    let marker = match (entry.section, expanded) {
+                    let chevron = match (entry.section, expanded) {
                         (Section::Untracked, _) => " ",
                         (_, true) => "▾",
                         (_, false) => "▸",
                     };
-                    surface.set_string(line.x + 1, y, marker, patch(dim));
-                    surface.set_string(line.x + 2, y, &entry.code.to_string(), patch(code_style));
-                    let width = inner_width.saturating_sub(3);
+                    surface.set_string(line.x + 1, y, chevron, roles.muted);
+                    surface.set_string(line.x + 3, y, &entry.code.to_string(), code_style);
+                    let width = inner_width.saturating_sub(4);
+                    // The directory in muted ink, the file name in full ink.
                     let path = shorten_left(&entry.path, width);
-                    surface.set_stringn(line.x + 4, y, &path, width, patch(text));
+                    let (dir, name) = match path.rfind('/') {
+                        Some(slash) => path.split_at(slash + 1),
+                        None => ("", path.as_str()),
+                    };
+                    surface.set_string(line.x + 5, y, dir, roles.muted);
+                    surface.set_string(line.x + 5 + dir.width() as u16, y, name, roles.text);
                 }
                 Row::Hunk(file, h) => {
                     let entry = &snapshot.entries[*file];
@@ -530,14 +513,8 @@ impl GitPanel {
                         .get(&(entry.section, entry.path.clone()))
                         .and_then(|hunks| hunks.get(*h))
                     {
-                        let width = inner_width.saturating_sub(3);
-                        surface.set_stringn(
-                            line.x + 4,
-                            y,
-                            &hunk.header,
-                            width,
-                            patch(theme.get("diff.delta")),
-                        );
+                        let width = inner_width.saturating_sub(5);
+                        surface.set_stringn(line.x + 5, y, &hunk.header, width, roles.muted);
                     }
                 }
                 Row::HunkLine(file, h, l) => {
@@ -549,44 +526,44 @@ impl GitPanel {
                         .and_then(|hunk| hunk.changes.get(*l))
                     {
                         let style = if change.starts_with('+') {
-                            theme.get("diff.plus")
+                            roles.plus
                         } else {
-                            theme.get("diff.minus")
+                            roles.minus
                         };
-                        let width = inner_width.saturating_sub(5);
-                        surface.set_stringn(line.x + 6, y, change, width, style);
+                        let width = inner_width.saturating_sub(6);
+                        surface.set_stringn(line.x + 7, y, change, width, style);
                     }
                 }
                 Row::HunkMore(count) => {
-                    let label = format!("… {count} more lines");
-                    surface.set_stringn(line.x + 6, y, &label, inner_width, dim);
+                    let label = format!("{count} more lines");
+                    surface.set_stringn(line.x + 7, y, &label, inner_width, roles.faint);
                 }
                 Row::Stash(index) => {
                     let stash = &snapshot.stashes[*index];
                     let tag = stash.name.trim_start_matches("stash@");
-                    surface.set_string(line.x + 2, y, tag, patch(theme.get("constant")));
-                    let subject_x = line.x + 2 + tag.width() as u16 + 1;
+                    surface.set_string(line.x + 3, y, tag, roles.muted);
+                    let subject_x = line.x + 3 + tag.width() as u16 + 1;
                     let when_width = stash.when.width();
                     let room =
                         (line.right() as usize).saturating_sub(subject_x as usize + when_width + 2);
-                    surface.set_stringn(subject_x, y, &stash.subject, room, patch(text));
+                    surface.set_stringn(subject_x, y, &stash.subject, room, roles.text);
                     if room > 0 {
                         let x = line.right().saturating_sub(when_width as u16 + 1);
-                        surface.set_string(x, y, &stash.when, patch(dim));
+                        surface.set_string(x, y, &stash.when, roles.faint);
                     }
                 }
                 Row::Commit(index) => {
                     let commit = &snapshot.commits[*index];
                     let hash = &commit.hash[..commit.hash.len().min(7)];
-                    surface.set_string(line.x + 2, y, hash, patch(theme.get("constant")));
+                    surface.set_string(line.x + 3, y, hash, roles.muted);
                     let when_width = commit.when.width();
-                    let subject_x = line.x + 2 + hash.width() as u16 + 1;
+                    let subject_x = line.x + 3 + hash.width() as u16 + 1;
                     let room =
                         (line.right() as usize).saturating_sub(subject_x as usize + when_width + 2);
-                    surface.set_stringn(subject_x, y, &commit.subject, room, patch(text));
+                    surface.set_stringn(subject_x, y, &commit.subject, room, roles.text);
                     if room > 0 {
                         let x = line.right().saturating_sub(when_width as u16 + 1);
-                        surface.set_string(x, y, &commit.when, patch(dim));
+                        surface.set_string(x, y, &commit.when, roles.faint);
                     }
                 }
             }
@@ -627,19 +604,22 @@ impl GitPanel {
             KeyCode::Char('b') => self.branch_picker(),
             KeyCode::Char('B') => return self.new_branch_prompt(),
             KeyCode::Char('z') => return self.stash_prompt(),
-            KeyCode::Char('Z') => self.run(&["stash", "pop"], "popping", "stash popped", true),
+            KeyCode::Char('Z') => self.run(&["stash", "pop"], "popping", "Stash popped.", true),
             KeyCode::Char('P') => {
                 let args: &[&str] = if self.snapshot.upstream.is_some() {
                     &["push"]
                 } else {
                     &["push", "--set-upstream", "origin", "HEAD"]
                 };
-                self.run(args, "pushing", "pushed", false);
+                self.run(args, "pushing", "Pushed.", false);
             }
-            KeyCode::Char('p') => self.run(&["pull"], "pulling", "pulled", true),
-            KeyCode::Char('f') => {
-                self.run(&["fetch", "--all", "--prune"], "fetching", "fetched", false)
-            }
+            KeyCode::Char('p') => self.run(&["pull"], "pulling", "Pulled.", true),
+            KeyCode::Char('f') => self.run(
+                &["fetch", "--all", "--prune"],
+                "fetching",
+                "Fetched.",
+                false,
+            ),
             KeyCode::Char('R') => self.force_refresh(),
             KeyCode::Char('?') => editor.set_status(
                 "files: spc stage  l/h hunks  ⏎ diff  v/C-s split  o open  x discard  a all  \
@@ -731,7 +711,7 @@ impl GitPanel {
         }
         if let Some(stash) = self.selected_stash() {
             let name = stash.name.clone();
-            self.run(&["stash", "pop", &name], "popping", "stash popped", true);
+            self.run(&["stash", "pop", &name], "popping", "Stash popped.", true);
             return;
         }
         let Some(entry) = self.selected_entry() else {
@@ -842,7 +822,7 @@ impl GitPanel {
                 Ok(out) if !out.success && !out.stderr.is_empty() => {
                     editor.set_error(last_line(&out.stderr))
                 }
-                Ok(_) => editor.set_status(format!("{label}: no changes")),
+                Ok(_) => editor.set_status(format!("{label}: no changes.")),
                 Err(err) => editor.set_error(format!("git: {err}")),
             })
             .await;
@@ -862,7 +842,7 @@ impl GitPanel {
                     args(&["apply", "--reverse", "-"]),
                     Some(patch.clone()),
                     "discarding",
-                    "hunk discarded",
+                    "Hunk discarded.",
                     true,
                 )
             });
@@ -876,7 +856,7 @@ impl GitPanel {
                     args(&["stash", "drop", &name]),
                     None,
                     "dropping",
-                    "stash dropped",
+                    "Stash dropped.",
                     false,
                 )
             });
@@ -897,7 +877,14 @@ impl GitPanel {
                 Section::Staged => &["restore", "--staged", "--worktree", "--", path],
                 _ => &["restore", "--", path],
             };
-            run_from_prompt(cx, args(list), None, "discarding", "discarded", true);
+            run_from_prompt(
+                cx,
+                args(list),
+                None,
+                "discarding",
+                "Changes discarded.",
+                true,
+            );
         })
     }
 
@@ -919,7 +906,7 @@ impl GitPanel {
                     list.push("--amend");
                 }
                 list.extend(["--message", input]);
-                run_from_prompt(cx, args(&list), None, "committing", "committed", false);
+                run_from_prompt(cx, args(&list), None, "committing", "Committed.", false);
             },
         );
         if amend {
@@ -948,7 +935,7 @@ impl GitPanel {
                     args(&["switch", "--create", name]),
                     None,
                     "creating branch",
-                    "switched to new branch",
+                    "Switched to the new branch.",
                     false,
                 );
             },
@@ -972,7 +959,7 @@ impl GitPanel {
                 if !input.trim().is_empty() {
                     list.extend(["--message", input.trim()]);
                 }
-                run_from_prompt(cx, args(&list), None, "stashing", "stashed", true);
+                run_from_prompt(cx, args(&list), None, "stashing", "Stashed.", true);
             },
         );
         GitAction::Layer(Box::new(prompt))
@@ -1004,7 +991,7 @@ impl GitPanel {
                 };
                 let branches = parse_branches(&output);
                 if branches.is_empty() {
-                    return editor.set_status("no branches yet");
+                    return editor.set_status("No branches yet.");
                 }
                 compositor.push(Box::new(overlaid(branch_picker(branches))));
             })
@@ -1102,7 +1089,7 @@ fn branch_picker(branches: Vec<Branch>) -> Picker<Branch, ()> {
             branch.switch.clone(),
             None,
             "switching",
-            "switched branch",
+            "Switched branch.",
             true,
         );
     })
@@ -1166,7 +1153,7 @@ fn spawn_git(repo: PathBuf, args: Vec<String>, input: Option<String>, done: Stri
                     } else {
                         last_line(&out.stderr)
                     };
-                    editor.set_error(format!("git {}: {message}", args[0]));
+                    editor.set_error(format!("git {} failed: {message}", args[0]));
                 }
                 Err(err) => editor.set_error(format!("git: {err}")),
             }
@@ -1387,7 +1374,9 @@ fn parse_hunks(diff: &str) -> Vec<Hunk> {
                 && !line.starts_with("+++")
                 && !line.starts_with("---")
             {
-                changes.push(line.trim_end_matches(['\n', '\r']).to_string());
+                // The sign, then the code without its indentation: the panel is narrow.
+                let (sign, code) = line.split_at(1);
+                changes.push(format!("{sign} {}", code.trim()));
             }
             body.push_str(line);
             lines.next();
@@ -1563,9 +1552,9 @@ index 111..222 100644
         let hunks = parse_hunks(diff);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0].header, "@@ -1,3 +1,3 @@ fn a()");
-        assert_eq!(hunks[0].changes, vec!["-two", "+TWO"]);
+        assert_eq!(hunks[0].changes, vec!["- two", "+ TWO"]);
         assert_eq!(hunks[1].new_start, 10);
-        assert_eq!(hunks[1].changes, vec!["+ten and a half"]);
+        assert_eq!(hunks[1].changes, vec!["+ ten and a half"]);
         // Each patch carries the file header and only its own hunk.
         assert!(hunks[1].patch.starts_with("diff --git a/f.rs b/f.rs\n"));
         assert!(hunks[1].patch.contains("+++ b/f.rs\n@@ -10,2 +10,3 @@"));

@@ -19,16 +19,13 @@ use helix_view::{
 };
 use tui::buffer::Buffer as Surface;
 
+use super::panel_style::Roles;
+
 use crate::{
     compositor::{self, Component},
     job::Callback,
     ui::{completers, EditorView, Prompt, PromptEvent},
 };
-
-const MIN_WIDTH: u16 = 24;
-const MAX_WIDTH: u16 = 40;
-/// The editor keeps at least this many columns next to the tree.
-const MIN_EDITOR_WIDTH: u16 = 40;
 
 struct Row {
     path: PathBuf,
@@ -169,18 +166,6 @@ impl FileTree {
         }
     }
 
-    /// Gives the tree its slice of `area`, returning what is left for the editor.
-    pub fn layout(&self, area: Rect) -> Rect {
-        if !self.visible {
-            return area;
-        }
-        let width = (area.width / 5).clamp(MIN_WIDTH, MAX_WIDTH);
-        if width + MIN_EDITOR_WIDTH > area.width {
-            return area;
-        }
-        area.clip_left(width)
-    }
-
     pub fn contains(&self, column: u16, row: u16) -> bool {
         self.visible
             && column >= self.area.x
@@ -191,36 +176,35 @@ impl FileTree {
 
     pub fn render(&mut self, area: Rect, surface: &mut Surface, editor: &Editor) {
         self.area = area;
-        let theme = &editor.theme;
-        if area.width < 4 || area.height < 2 {
+        if area.width < 6 || area.height < 3 {
             return;
         }
-
-        // A one-column separator on the right, like the one between splits.
-        let separator = theme.get("ui.window");
-        for y in area.top()..area.bottom() {
-            if let Some(cell) = surface.get_mut(area.right() - 1, y) {
-                cell.set_symbol(tui::symbols::line::VERTICAL)
-                    .set_style(separator);
-            }
-        }
+        let roles = Roles::new(&editor.theme);
+        roles.vertical_edge(
+            surface,
+            area.right() - 1,
+            area.top(),
+            area.bottom(),
+            self.focused,
+        );
         let area = area.clip_right(1);
+        let inner = area.width.saturating_sub(2);
 
-        let header_style = theme.get("ui.text.directory").add_modifier(Modifier::BOLD);
+        // FILES, with the root's name on the right.
+        surface.set_string(area.x + 1, area.y, "FILES", roles.label());
         let root_name = self
             .root
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.root.display().to_string());
-        surface.set_stringn(
-            area.x + 1,
-            area.y,
-            &root_name,
-            area.width.saturating_sub(2) as usize,
-            header_style,
-        );
+        let room = inner.saturating_sub(7) as usize;
+        if room > 2 {
+            let name = shorten(&root_name, room);
+            let x = area.right().saturating_sub(name.width() as u16 + 1);
+            surface.set_string(x, area.y, &name, roles.muted);
+        }
 
-        let rows_area = area.clip_top(1);
+        let rows_area = area.clip_top(2);
         self.rows_area = rows_area;
         let height = rows_area.height as usize;
         if self.selected < self.scroll {
@@ -233,53 +217,41 @@ impl FileTree {
             let (_, doc) = current_ref!(editor);
             doc.path().map(Path::to_path_buf)
         };
-        let text = theme.get("ui.text");
-        let directory = theme.get("ui.text.directory");
-        let focus = theme.get("ui.text.focus");
-        let selected_style = if self.focused {
-            theme.get("ui.menu.selected")
-        } else {
-            theme.get("ui.cursorline.primary")
-        };
 
         for (i, row) in self.rows.iter().enumerate().skip(self.scroll).take(height) {
             let y = rows_area.y + (i - self.scroll) as u16;
             let line = Rect::new(rows_area.x, y, rows_area.width, 1);
             if i == self.selected {
-                surface.set_style(line, selected_style);
+                roles.select_row(surface, line, self.focused);
             }
-            let marker = if !row.is_dir {
-                " "
-            } else if self.expanded.contains(&row.path) {
-                "▾"
-            } else {
-                "▸"
-            };
-            let mut style = if row.is_dir { directory } else { text };
-            if current.as_deref() == Some(row.path.as_path()) {
-                style = style.patch(focus).add_modifier(Modifier::BOLD);
-            }
-            if i == self.selected {
-                style = style.patch(selected_style);
-            }
+            let is_current = current.as_deref() == Some(row.path.as_path());
             let expanded = row.is_dir && self.expanded.contains(&row.path);
-            let label = format!(
-                "{}{} {} {}",
-                "  ".repeat(row.depth),
-                marker,
-                icon(&row.name, row.is_dir, expanded),
-                row.name
-            );
-            let width = line.width.saturating_sub(1) as usize;
-            let label = if label.width() > width {
-                // Keep the end of long names visible rather than the indentation.
-                let mut cut: String = label.chars().take(width.saturating_sub(1)).collect();
-                cut.push('…');
-                cut
-            } else {
-                label
+            let chevron = match (row.is_dir, expanded) {
+                (false, _) => " ",
+                (true, true) => "▾",
+                (true, false) => "▸",
             };
-            surface.set_stringn(line.x + 1, y, &label, width, style);
+            let indent = 2 * row.depth as u16;
+            let mut x = line.x + 1 + indent;
+            if x + 4 >= line.right() {
+                continue;
+            }
+            surface.set_string(x, y, chevron, roles.muted);
+            x += 2;
+            let icon_style = if is_current {
+                roles.accent
+            } else {
+                roles.muted
+            };
+            surface.set_string(x, y, icon(&row.name, row.is_dir, expanded), icon_style);
+            x += 2;
+            let name_style = if is_current {
+                roles.accent.add_modifier(Modifier::BOLD)
+            } else {
+                roles.text
+            };
+            let room = line.right().saturating_sub(x + 1) as usize;
+            surface.set_string(x, y, &shorten(&row.name, room), name_style);
         }
     }
 
@@ -617,4 +589,20 @@ fn icon(name: &str, is_dir: bool, expanded: bool) -> &'static str {
         "kdl" | "conf" | "ini" | "cfg" | "env" => "\u{e615}",
         _ => "\u{f15b}",
     }
+}
+
+/// Cuts `text` to `width` columns, ending in an ellipsis when it does not fit.
+fn shorten(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut cut = String::new();
+    for ch in text.chars() {
+        if cut.width() + 2 > width {
+            break;
+        }
+        cut.push(ch);
+    }
+    cut.push('…');
+    cut
 }
