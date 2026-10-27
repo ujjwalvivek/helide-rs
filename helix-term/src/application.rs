@@ -416,7 +416,7 @@ impl Application {
 
         // reset view position in case softwrap was enabled/disabled
         let scrolloff = self.editor.config().scrolloff;
-        for (view, _) in self.editor.tree.views() {
+        for (view, _) in self.editor.tree.all_views() {
             let doc = doc_mut!(self.editor, &view.doc);
             view.ensure_cursor_in_view(doc, scrolloff);
         }

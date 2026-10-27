@@ -1390,6 +1390,8 @@ pub enum Action {
     Replace,
     HorizontalSplit,
     VerticalSplit,
+    /// Helide: open in a new tab.
+    NewTab,
 }
 
 impl Action {
@@ -1912,7 +1914,7 @@ impl Editor {
             }
         }
 
-        for (view, _) in self.tree.views_mut() {
+        for (view, _) in self.tree.all_views_mut() {
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
             view.gutters = config.gutters.clone();
@@ -1960,8 +1962,8 @@ impl Editor {
                     // Ensure the buffer is not displayed in any other splits.
                     && !self
                         .tree
-                        .traverse()
-                        .any(|(_, v)| v.doc == doc.id && v.id != view.id);
+                        .all_views()
+                        .any(|(v, _)| v.doc == doc.id && v.id != view.id);
 
                 let (view, doc) = current!(self);
                 let view_id = view.id;
@@ -1976,7 +1978,7 @@ impl Editor {
                     self.documents.remove(&id);
 
                     // Remove the scratch buffer from any jumplists
-                    for (view, _) in self.tree.views_mut() {
+                    for (view, _) in self.tree.all_views_mut() {
                         view.remove_document(&id);
                     }
                 } else {
@@ -2027,6 +2029,15 @@ impl Editor {
                     },
                 );
                 // initialize selection for view
+                let doc = doc_mut!(self, &id);
+                doc.ensure_view_init(view_id);
+                doc.mark_as_focused();
+                focus_lost
+            }
+            Action::NewTab => {
+                let focus_lost = self.tree.try_get(self.tree.focus).map(|view| view.doc);
+                let view = View::new(id, self.config().gutters.clone());
+                let view_id = self.tree.new_tab(view);
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
                 doc.mark_as_focused();
@@ -2145,6 +2156,31 @@ impl Editor {
         Ok(id)
     }
 
+    /// Helide: focuses the tab at `index`, committing pending changes like any focus change.
+    pub fn switch_tab(&mut self, index: usize) {
+        if let Some(view_id) = self.tree.tab_focus(index) {
+            self.focus(view_id);
+        }
+    }
+
+    /// Helide: moves `delta` tabs forward (or back), wrapping around.
+    pub fn cycle_tab(&mut self, delta: isize) {
+        let count = self.tree.tab_count() as isize;
+        let index = (self.tree.active_tab() as isize + delta).rem_euclid(count);
+        self.switch_tab(index as usize);
+    }
+
+    /// Helide: closes every view in the active tab. The last tab cannot be closed this way.
+    pub fn close_tab(&mut self) -> bool {
+        if self.tree.tab_count() <= 1 {
+            return false;
+        }
+        for view_id in self.tree.tab_views(self.tree.active_tab()) {
+            self.close(view_id);
+        }
+        true
+    }
+
     pub fn close(&mut self, id: ViewId) {
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
@@ -2173,7 +2209,7 @@ impl Editor {
 
         let actions: Vec<Action> = self
             .tree
-            .views_mut()
+            .all_views_mut()
             .filter_map(|(view, _focus)| {
                 view.remove_document(&doc_id);
 
@@ -2287,12 +2323,17 @@ impl Editor {
         doc.append_changes_to_history(view);
         self.ensure_cursor_in_view(view_id);
         // Update jumplist selections with new document changes.
-        for (view, _focused) in self.tree.views_mut() {
+        for (view, _focused) in self.tree.all_views_mut() {
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
         }
 
-        let prev_id = std::mem::replace(&mut self.tree.focus, view_id);
+        let prev_id = self.tree.focus;
+        let tab = self.tree.tab_of(view_id);
+        if tab != self.tree.active_tab() {
+            self.tree.switch_tab(tab);
+        }
+        self.tree.focus = view_id;
         doc_mut!(self).mark_as_focused();
 
         let focus_lost = self.tree.get(prev_id).doc;

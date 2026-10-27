@@ -116,7 +116,7 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
     }
 
     // last view and we have unsaved changes
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.tree.all_views().count() == 1 {
         buffers_remaining_impl(cx.editor)?
     }
 
@@ -1049,7 +1049,12 @@ fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()
     }
 
     // close all views
-    let views: Vec<_> = cx.editor.tree.views().map(|(view, _)| view.id).collect();
+    let views: Vec<_> = cx
+        .editor
+        .tree
+        .all_views()
+        .map(|(view, _)| view.id)
+        .collect();
     for view_id in views {
         cx.editor.close(view_id);
     }
@@ -2676,6 +2681,58 @@ fn terminal(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
     Ok(())
 }
 
+fn tab_new(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    match args.first() {
+        Some(path) => {
+            let path = helix_stdx::path::expand_tilde(Path::new(path));
+            cx.editor.open(&path, Action::NewTab)?;
+        }
+        None => {
+            let doc = doc!(cx.editor).id();
+            cx.editor.switch(doc, Action::NewTab);
+        }
+    }
+    Ok(())
+}
+
+fn tab_close(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    if !cx.editor.close_tab() {
+        bail!("cannot close the last tab");
+    }
+    Ok(())
+}
+
+fn tab_next(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    match args.first() {
+        Some(n) => {
+            let n: usize = n.parse().map_err(|_| anyhow!("not a tab number: {n}"))?;
+            if n == 0 || n > cx.editor.tree.tab_count() {
+                bail!("no tab {n}");
+            }
+            cx.editor.switch_tab(n - 1);
+        }
+        None => cx.editor.cycle_tab(1),
+    }
+    Ok(())
+}
+
+fn tab_prev(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.editor.cycle_tab(-1);
+    Ok(())
+}
+
 fn file_tree(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -4019,6 +4076,50 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (0, Some(2)),
             raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "tab-new",
+        aliases: &["tabnew"],
+        doc: "Open a file, or the current buffer, in a new tab.",
+        fun: tab_new,
+        completer: CommandCompleter::positional(&[completers::filename]),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "tab-close",
+        aliases: &["tabclose", "tabc"],
+        doc: "Close the current tab and its splits.",
+        fun: tab_close,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "tab-next",
+        aliases: &["tabnext", "tabn"],
+        doc: "Go to the next tab, or tab N (1-based).",
+        fun: tab_next,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "tab-prev",
+        aliases: &["tabprevious", "tabp"],
+        doc: "Go to the previous tab.",
+        fun: tab_prev,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

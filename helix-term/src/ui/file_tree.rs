@@ -307,6 +307,7 @@ impl FileTree {
             }
             KeyCode::Char('v') => return self.activate(editor, Action::VerticalSplit),
             KeyCode::Char('s') => return self.activate(editor, Action::HorizontalSplit),
+            KeyCode::Char('t') => return self.activate(editor, Action::NewTab),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(editor),
             KeyCode::Char('a') => return TreeAction::Create(self.target_dir()),
             KeyCode::Char('r') => {

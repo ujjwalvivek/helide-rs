@@ -618,6 +618,10 @@ impl MappableCommand {
         rotate_selections_last, "Make the last selection your primary one",
         terminal_toggle, "Show and focus the terminal panel, or hide it when focused",
         file_tree_toggle, "Show and focus the file tree, or hide it when focused",
+        tab_new, "Open the current buffer in a new tab",
+        tab_next, "Go to next tab",
+        tab_prev, "Go to previous tab",
+        tab_close, "Close the current tab",
     );
 }
 
@@ -3403,7 +3407,7 @@ fn jumplist_picker(cx: &mut Context) {
         is_current: bool,
     }
 
-    for (view, _) in cx.editor.tree.views_mut() {
+    for (view, _) in cx.editor.tree.all_views_mut() {
         for doc_id in view.jumps.iter().map(|e| e.0).collect::<Vec<_>>().iter() {
             let doc = doc_mut!(cx.editor, doc_id);
             view.sync_changes(doc);
@@ -3456,7 +3460,7 @@ fn jumplist_picker(cx: &mut Context) {
     let picker = Picker::new(
         columns,
         1, // path
-        cx.editor.tree.views().flat_map(|(view, _)| {
+        cx.editor.tree.all_views().flat_map(|(view, _)| {
             view.jumps
                 .iter()
                 .rev()
@@ -6011,7 +6015,7 @@ fn vsplit_new(cx: &mut Context) {
 }
 
 fn wclose(cx: &mut Context) {
-    if cx.editor.tree.views().count() == 1 {
+    if cx.editor.tree.all_views().count() == 1 {
         if let Err(err) = typed::buffers_remaining_impl(cx.editor) {
             cx.editor.set_error(err.to_string());
             return;
@@ -7248,4 +7252,23 @@ fn file_tree_toggle(cx: &mut Context) {
             }
         },
     ));
+}
+
+fn tab_new(cx: &mut Context) {
+    let doc = doc!(cx.editor).id();
+    cx.editor.switch(doc, Action::NewTab);
+}
+
+fn tab_next(cx: &mut Context) {
+    cx.editor.cycle_tab(cx.count() as isize);
+}
+
+fn tab_prev(cx: &mut Context) {
+    cx.editor.cycle_tab(-(cx.count() as isize));
+}
+
+fn tab_close(cx: &mut Context) {
+    if !cx.editor.close_tab() {
+        cx.editor.set_error("cannot close the last tab");
+    }
 }

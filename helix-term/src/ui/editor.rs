@@ -53,6 +53,8 @@ pub struct EditorView {
     pub terminal: TerminalPanel,
     /// Helide's file tree, docked left of the editor.
     pub file_tree: FileTree,
+    /// Where each tab label was drawn last frame: (row, start column, end column).
+    tab_hits: Vec<(u16, u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,7 @@ impl EditorView {
             terminal_focused: true,
             terminal: TerminalPanel::default(),
             file_tree: FileTree::default(),
+            tab_hits: Vec::new(),
         }
     }
 
@@ -1484,6 +1487,52 @@ impl EditorView {
         }
     }
 
+    /// Draws the tab labels right-aligned on the bufferline row, when there is more than one tab.
+    fn render_tabs(&mut self, editor: &Editor, row: Rect, surface: &mut Surface) {
+        self.tab_hits.clear();
+        let count = editor.tree.tab_count();
+        if count < 2 {
+            return;
+        }
+        let active = editor.theme.get("ui.bufferline.active");
+        let inactive = editor.theme.get("ui.bufferline");
+        let labels: Vec<String> = (0..count)
+            .map(|index| {
+                let views = editor.tree.tab_views(index).len();
+                let name = editor
+                    .tree
+                    .tab_focus(index)
+                    .and_then(|view| editor.document(editor.tree.get(view).doc))
+                    .map(|doc| {
+                        doc.path()
+                            .and_then(|path| path.file_name())
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string())
+                    })
+                    .unwrap_or_default();
+                let more = if views > 1 {
+                    format!(" +{}", views - 1)
+                } else {
+                    String::new()
+                };
+                format!(" {} {name}{more} ", index + 1)
+            })
+            .collect();
+        let total: u16 = labels.iter().map(|label| label.width() as u16).sum();
+        let mut x = row.right().saturating_sub(total).max(row.x);
+        for (index, label) in labels.iter().enumerate() {
+            let style = if index == editor.tree.active_tab() {
+                active
+            } else {
+                inactive
+            };
+            let start = x;
+            let width = row.right().saturating_sub(x) as usize;
+            (x, _) = surface.set_stringn(x, row.y, label, width, style);
+            self.tab_hits.push((row.y, start, x));
+        }
+    }
+
     fn focus_editor(&mut self) {
         self.terminal.focused = false;
         self.file_tree.focused = false;
@@ -1516,6 +1565,23 @@ impl EditorView {
         cx: &mut crate::compositor::Context,
     ) -> Option<EventResult> {
         match event {
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && self.tab_hits.iter().any(|&(y, start, end)| {
+                        mouse.row == y && (start..end).contains(&mouse.column)
+                    }) =>
+            {
+                let index = self
+                    .tab_hits
+                    .iter()
+                    .position(|&(y, start, end)| {
+                        mouse.row == y && (start..end).contains(&mouse.column)
+                    })
+                    .unwrap_or_default();
+                cx.editor.switch_tab(index);
+                self.focus_editor();
+                Some(EventResult::Consumed(None))
+            }
             Event::Mouse(mouse) if self.file_tree.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.file_tree.focused = true;
@@ -1747,7 +1813,8 @@ impl Component for EditorView {
         let use_bufferline = match config.bufferline {
             BufferLine::Always => true,
             BufferLine::Multiple if cx.editor.documents.len() > 1 => true,
-            _ => false,
+            // tabs live on the bufferline row
+            _ => cx.editor.tree.tab_count() > 1,
         };
 
         // -1 for commandline and -1 for bufferline
@@ -1769,6 +1836,7 @@ impl Component for EditorView {
         if use_bufferline {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
         }
+        self.render_tabs(cx.editor, area.with_height(1), surface);
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
