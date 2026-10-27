@@ -374,6 +374,48 @@ impl GitPanel {
         }
     }
 
+    /// What the frame's top border shows on the right: the running command, or the branch and
+    /// its distance from upstream. The flag is true while a command runs.
+    pub fn meta(&self) -> (String, bool) {
+        if let Some(busy) = &self.busy {
+            return (format!("{busy}…"), true);
+        }
+        if self.snapshot.repo.is_none() {
+            return (String::new(), false);
+        }
+        let mut branch = format!("\u{e725} {}", self.snapshot.branch);
+        if self.snapshot.upstream.is_some() {
+            if self.snapshot.ahead > 0 {
+                branch.push_str(&format!(" ↑{}", self.snapshot.ahead));
+            }
+            if self.snapshot.behind > 0 {
+                branch.push_str(&format!(" ↓{}", self.snapshot.behind));
+            }
+        }
+        (branch, false)
+    }
+
+    /// What the frame's bottom border shows: how many files changed.
+    pub fn footer(&self) -> Option<String> {
+        self.snapshot.repo.as_ref()?;
+        let files: HashSet<&str> = self
+            .snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        Some(match files.len() {
+            0 => "clean".to_string(),
+            1 => "1 file".to_string(),
+            n => format!("{n} files"),
+        })
+    }
+
+    /// (rows, first row shown, rows that fit), for the frame's scrollbar.
+    pub fn scroll_state(&self) -> (usize, usize, usize) {
+        (self.rows.len(), self.scroll, self.rows_area.height as usize)
+    }
+
     pub fn contains(&self, column: u16, row: u16) -> bool {
         self.visible
             && column >= self.area.x
@@ -390,51 +432,12 @@ impl GitPanel {
         {
             self.refresh();
         }
-        if area.width < 8 || area.height < 4 {
+        if area.width < 8 || area.height < 1 {
             return;
         }
         let roles = Roles::new(theme);
-        roles.vertical_edge(
-            surface,
-            area.right() - 1,
-            area.top(),
-            area.bottom(),
-            self.focused,
-        );
-        let area = area.clip_right(1);
         let inner_width = area.width.saturating_sub(2) as usize;
-
-        // GIT, with the branch (or the running command) on the right.
-        surface.set_string(area.x + 1, area.y, "GIT", roles.label());
-        let (status, style) = match (&self.busy, &self.snapshot.repo) {
-            (Some(busy), _) => (format!("{busy}…"), roles.warning),
-            (None, None) => (String::new(), roles.muted),
-            (None, Some(_)) => {
-                let mut branch = format!("\u{e725} {}", self.snapshot.branch);
-                if self.snapshot.upstream.is_some() {
-                    if self.snapshot.ahead > 0 {
-                        branch.push_str(&format!(" ↑{}", self.snapshot.ahead));
-                    }
-                    if self.snapshot.behind > 0 {
-                        branch.push_str(&format!(" ↓{}", self.snapshot.behind));
-                    }
-                }
-                (branch, roles.muted)
-            }
-        };
-        let room = inner_width.saturating_sub(5);
-        if room > 2 && !status.is_empty() {
-            let status = shorten_left(&status, room);
-            let x = area.right().saturating_sub(status.width() as u16 + 1);
-            surface.set_string(x, area.y, &status, style);
-        }
-
-        let rows_area = Rect::new(
-            area.x,
-            area.y + 2,
-            area.width,
-            area.height.saturating_sub(2),
-        );
+        let rows_area = area;
         self.rows_area = rows_area;
         let height = rows_area.height as usize;
         if self.selected < self.scroll {

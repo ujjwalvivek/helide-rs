@@ -2,6 +2,7 @@ mod completion;
 mod document;
 pub(crate) mod editor;
 pub mod file_tree;
+pub mod frame;
 pub mod git_panel;
 mod info;
 pub mod lsp;

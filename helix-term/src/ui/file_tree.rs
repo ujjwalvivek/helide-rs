@@ -174,37 +174,27 @@ impl FileTree {
             && row < self.area.bottom()
     }
 
+    /// The project's folder name, shown in the frame's top border.
+    pub fn root_name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string())
+    }
+
+    /// (rows, first row shown, rows that fit), for the frame's scrollbar.
+    pub fn scroll_state(&self) -> (usize, usize, usize) {
+        (self.rows.len(), self.scroll, self.rows_area.height as usize)
+    }
+
+    /// Draws the rows inside `area`, the inside of the frame's box.
     pub fn render(&mut self, area: Rect, surface: &mut Surface, editor: &Editor) {
         self.area = area;
-        if area.width < 6 || area.height < 3 {
+        if area.width < 6 || area.height < 1 {
             return;
         }
         let roles = Roles::new(&editor.theme);
-        roles.vertical_edge(
-            surface,
-            area.right() - 1,
-            area.top(),
-            area.bottom(),
-            self.focused,
-        );
-        let area = area.clip_right(1);
-        let inner = area.width.saturating_sub(2);
-
-        // FILES, with the root's name on the right.
-        surface.set_string(area.x + 1, area.y, "FILES", roles.label());
-        let root_name = self
-            .root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.root.display().to_string());
-        let room = inner.saturating_sub(7) as usize;
-        if room > 2 {
-            let name = shorten(&root_name, room);
-            let x = area.right().saturating_sub(name.width() as u16 + 1);
-            surface.set_string(x, area.y, &name, roles.muted);
-        }
-
-        let rows_area = area.clip_top(2);
+        let rows_area = area;
         self.rows_area = rows_area;
         let height = rows_area.height as usize;
         if self.selected < self.scroll {
