@@ -213,6 +213,8 @@ pub struct Document {
     pub focused_at: std::time::Instant,
 
     pub readonly: bool,
+    /// Helide: the name shown for a buffer without a path (diffs, logs), instead of `[scratch]`.
+    pub label: Option<String>,
 
     pub previous_diagnostic_ids: HashMap<LanguageServerId, String>,
 
@@ -764,6 +766,7 @@ impl Document {
             version_control_head: None,
             focused_at: std::time::Instant::now(),
             readonly: false,
+            label: None,
             jump_labels: HashMap::new(),
             document_highlights: HashMap::new(),
             code_action_hints: HashSet::new(),
@@ -2131,8 +2134,16 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.relative_path()
-            .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
+        self.relative_path().map_or_else(
+            || {
+                self.label
+                    .as_deref()
+                    .unwrap_or(SCRATCH_BUFFER_NAME)
+                    .to_string()
+                    .into()
+            },
+            |path| path.to_string_lossy(),
+        )
     }
 
     // transact(Fn) ?

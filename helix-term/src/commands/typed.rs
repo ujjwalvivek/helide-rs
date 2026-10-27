@@ -2733,6 +2733,22 @@ fn tab_prev(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+fn git_panel(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    cx.jobs.callback(async {
+        let call: job::Callback =
+            Callback::EditorCompositor(Box::new(|_: &mut Editor, compositor: &mut Compositor| {
+                if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                    editor_view.toggle_git();
+                }
+            }));
+        Ok(call)
+    });
+    Ok(())
+}
+
 fn file_tree(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -4117,6 +4133,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["tabprevious", "tabp"],
         doc: "Go to the previous tab.",
         fun: tab_prev,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "git",
+        aliases: &[],
+        doc: "Show and focus the git panel, or hide it when focused.",
+        fun: git_panel,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

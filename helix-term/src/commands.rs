@@ -618,6 +618,7 @@ impl MappableCommand {
         rotate_selections_last, "Make the last selection your primary one",
         terminal_toggle, "Show and focus the terminal panel, or hide it when focused",
         file_tree_toggle, "Show and focus the file tree, or hide it when focused",
+        git_panel_toggle, "Show and focus the git panel, or hide it when focused",
         tab_new, "Open the current buffer in a new tab",
         tab_next, "Go to next tab",
         tab_prev, "Go to previous tab",
@@ -7271,4 +7272,14 @@ fn tab_close(cx: &mut Context) {
     if !cx.editor.close_tab() {
         cx.editor.set_error("cannot close the last tab");
     }
+}
+
+fn git_panel_toggle(cx: &mut Context) {
+    cx.callback.push(Box::new(
+        |compositor: &mut Compositor, _: &mut compositor::Context| {
+            if let Some(editor_view) = compositor.find::<ui::EditorView>() {
+                editor_view.toggle_git();
+            }
+        },
+    ));
 }
