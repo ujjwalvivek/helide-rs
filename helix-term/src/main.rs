@@ -24,6 +24,12 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn main_impl() -> Result<i32> {
+    // `hx msg ...` talks to a running editor over its IPC socket.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("msg") {
+        return helix_term::ipc::client::run(&argv[2..]);
+    }
+
     let args = Args::parse_args().context("could not parse arguments")?;
 
     helix_loader::initialize_config_file(args.config_file.clone());
@@ -39,6 +45,7 @@ async fn main_impl() -> Result<i32> {
 
 USAGE:
     hx [FLAGS] [files]...
+    hx msg <method> [args]         Talk to a running editor (see `hx msg help`)
 
 ARGS:
     <files>...    Set the input file to use, position can also be specified via file[:row[:col]]
