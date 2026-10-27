@@ -75,6 +75,8 @@ struct Session {
     events: Receiver<TermEvent>,
     /// What the tab strip shows: the program's name.
     name: String,
+    /// The tab this session belongs to; sessions sharing a tab sit side by side as panes.
+    group: u32,
     /// The agent session this tab runs, for agent tabs.
     agent: Option<AgentSession>,
     /// When the current busy stretch started, and when the program last wrote.
@@ -146,6 +148,7 @@ impl Session {
             pty,
             events,
             name,
+            group: 0,
             agent,
             busy_since: None,
             last_output: None,
@@ -252,6 +255,9 @@ pub struct TerminalPanel {
     tab_hits: Vec<(u16, u16)>,
     /// A redraw is already scheduled to settle busy tabs.
     tick: Arc<AtomicBool>,
+    next_group: u32,
+    /// The panes of the shown tab as drawn last frame: (session index, area).
+    panes: Vec<(usize, Rect)>,
 }
 
 impl TerminalPanel {
@@ -269,14 +275,19 @@ impl TerminalPanel {
     /// Opens a new tab running `command`, or the user's shell when it is empty. `name` labels the
     /// tab; it defaults to the program's name.
     pub fn open(&mut self, command: &[String], name: Option<String>) -> anyhow::Result<()> {
-        self.open_session(command, name, None)
+        self.open_session(command, name, None, false)
+    }
+
+    /// Opens `command` (a shell when empty) as a new pane beside the focused one.
+    pub fn split(&mut self, command: &[String], name: Option<String>) -> anyhow::Result<()> {
+        self.open_session(command, name, None, true)
     }
 
     /// Opens an agent tab on `agent`'s session.
     pub fn open_agent(&mut self, agent: AgentSession) -> anyhow::Result<()> {
         let command = agent.command();
         let name = Some(agent.kind.command().to_string());
-        self.open_session(&command, name, Some(agent))
+        self.open_session(&command, name, Some(agent), false)
     }
 
     fn open_session(
@@ -284,15 +295,24 @@ impl TerminalPanel {
         command: &[String],
         name: Option<String>,
         agent: Option<AgentSession>,
+        split: bool,
     ) -> anyhow::Result<()> {
         let size = if self.grid_area.width > 0 {
             (self.grid_area.width, self.grid_area.height)
         } else {
             (80, 24)
         };
-        self.sessions
-            .push(Session::spawn(command, name, agent, size)?);
-        self.active = self.sessions.len() - 1;
+        let mut session = Session::spawn(command, name, agent, size)?;
+        if split && !self.sessions.is_empty() {
+            session.group = self.sessions[self.active].group;
+            self.active += 1;
+            self.sessions.insert(self.active, session);
+        } else {
+            session.group = self.next_group;
+            self.next_group += 1;
+            self.sessions.push(session);
+            self.active = self.sessions.len() - 1;
+        }
         self.visible = true;
         self.focused = true;
         Ok(())
@@ -324,11 +344,76 @@ impl TerminalPanel {
         }
     }
 
-    /// Shows tab `index`.
-    pub fn select(&mut self, index: usize) {
-        if index < self.sessions.len() {
-            self.active = index;
+    /// The tabs, in order, by group.
+    fn groups(&self) -> Vec<u32> {
+        let mut groups: Vec<u32> = Vec::new();
+        for session in &self.sessions {
+            if !groups.contains(&session.group) {
+                groups.push(session.group);
+            }
         }
+        groups
+    }
+
+    /// Shows tab `index`, focusing its first pane.
+    pub fn select(&mut self, index: usize) {
+        if let Some(group) = self.groups().get(index) {
+            if let Some(first) = self.sessions.iter().position(|s| s.group == *group) {
+                self.active = first;
+            }
+        }
+    }
+
+    /// Reorders sessions so their tabs follow `order`, keeping each tab's panes in order and
+    /// the focused session focused.
+    fn arrange(&mut self, order: &[u32]) {
+        let active = self.active;
+        let mut indexed: Vec<(usize, Session)> = std::mem::take(&mut self.sessions)
+            .into_iter()
+            .enumerate()
+            .collect();
+        indexed.sort_by_key(|(_, session)| {
+            order
+                .iter()
+                .position(|group| *group == session.group)
+                .unwrap_or(usize::MAX)
+        });
+        self.active = indexed
+            .iter()
+            .position(|(index, _)| *index == active)
+            .unwrap_or(0);
+        self.sessions = indexed.into_iter().map(|(_, session)| session).collect();
+    }
+
+    /// Moves tab `from` to position `to`.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        let mut order = self.groups();
+        if from >= order.len() || to >= order.len() || from == to {
+            return;
+        }
+        let group = order.remove(from);
+        order.insert(to, group);
+        self.arrange(&order);
+    }
+
+    /// Moves tab `index`'s panes into the shown tab, beside its panes.
+    pub fn merge_into_shown(&mut self, index: usize) {
+        let order = self.groups();
+        let (Some(&source), Some(target)) = (
+            order.get(index),
+            self.sessions.get(self.active).map(|s| s.group),
+        ) else {
+            return;
+        };
+        if source == target {
+            return;
+        }
+        for session in &mut self.sessions {
+            if session.group == source {
+                session.group = target;
+            }
+        }
+        self.arrange(&order);
     }
 
     /// The agent sessions of the open tabs, in tab order.
@@ -410,65 +495,66 @@ impl TerminalPanel {
             area.width.saturating_sub(2),
             area.height - 1,
         );
-        self.grid_area = grid;
-        let session = &mut self.sessions[self.active];
-        session.resize((grid.width, grid.height));
-
         let base = theme.get("ui.background");
         surface.set_style(grid, base);
 
-        let term = session.term.lock();
-        let content = term.renderable_content();
-        let offset = content.display_offset as i32;
-        for indexed in content.display_iter {
-            let line = indexed.point.line.0 + offset;
-            let col = indexed.point.column.0 as u16;
-            if line < 0 || line as u16 >= grid.height || col >= grid.width {
-                continue;
-            }
-            let (x, y) = (grid.x + col, grid.y + line as u16);
-            let Some(cell) = surface.get_mut(x, y) else {
-                continue;
+        // The shown tab's panes, side by side, with a one-column divider between them.
+        let group = self.sessions[self.active].group;
+        let members: Vec<usize> = (0..self.sessions.len())
+            .filter(|&i| self.sessions[i].group == group)
+            .collect();
+        let count = members.len() as u16;
+        let usable = grid.width.saturating_sub(count - 1);
+        let width = usable / count.max(1);
+        let divider = Roles::new(theme).muted;
+        self.panes.clear();
+        let mut x = grid.x;
+        for (n, &index) in members.iter().enumerate() {
+            let w = if n + 1 == members.len() {
+                grid.right().saturating_sub(x)
+            } else {
+                width
             };
-            let term_cell: &TermCell = &indexed;
-            if term_cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                cell.reset();
-                continue;
+            let pane = Rect::new(x, grid.y, w, grid.height);
+            self.panes.push((index, pane));
+            draw_session(&mut self.sessions[index], pane, surface, base);
+            x += w;
+            if n + 1 < members.len() {
+                for y in grid.top()..grid.bottom() {
+                    if let Some(cell) = surface.get_mut(x, y) {
+                        cell.set_symbol("│").set_style(divider);
+                    }
+                }
+                x += 1;
             }
-            let mut symbol = String::from(term_cell.c);
-            if let Some(zerowidth) = term_cell.zerowidth() {
-                symbol.extend(zerowidth);
-            }
-            if term_cell.flags.contains(Flags::HIDDEN) || symbol.width() == 0 {
-                symbol = " ".into();
-            }
-            cell.set_symbol(&symbol);
-            cell.set_style(base.patch(cell_style(term_cell)));
         }
+        self.grid_area = self
+            .panes
+            .iter()
+            .find(|(index, _)| *index == self.active)
+            .map_or(grid, |(_, pane)| *pane);
     }
 
     /// Sets TERMINAL and one label per tab into the divider row the frame drew above the panel.
     fn render_tabs(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
         let roles = Roles::new(theme);
         let mut labels = vec![Label::new(self.title, roles.label())];
-        labels.extend(self.sessions.iter().enumerate().map(|(i, session)| {
+        let shown = self.sessions.get(self.active).map(|s| s.group);
+        labels.extend(self.groups().into_iter().enumerate().map(|(i, group)| {
+            let members: Vec<&Session> =
+                self.sessions.iter().filter(|s| s.group == group).collect();
+            let names: Vec<String> = members.iter().map(|s| short_label(s.label())).collect();
             // Status is a glyph, never colour alone: ● working, ✓ finished while away.
-            let (mark, style) = if session.is_busy() {
+            let (mark, style) = if members.iter().any(|s| s.is_busy()) {
                 (" ●", roles.warning)
-            } else if session.attention {
+            } else if members.iter().any(|s| s.attention) {
                 (" ✓", roles.accent.add_modifier(Modifier::BOLD))
-            } else if i == self.active {
+            } else if Some(group) == shown {
                 ("", roles.text.add_modifier(Modifier::BOLD))
             } else {
                 ("", roles.muted)
             };
-            Label::new(
-                format!("{} {}{mark}", i + 1, short_label(session.label())),
-                style,
-            )
+            Label::new(format!("{} {}{mark}", i + 1, names.join(" · ")), style)
         }));
         let hits = labels_left(surface, area.y, area.x, area.right() - 1, &labels);
         // The first label is the title; the rest are tabs.
@@ -485,7 +571,7 @@ impl TerminalPanel {
             return (None, CursorKind::Hidden);
         }
         let Point { line, column } = content.cursor.point;
-        if line.0 < 0 || line.0 as u16 >= self.grid_area.height {
+        if line.0 < 0 || line.0 as u16 >= self.grid_area.height || self.grid_area.width == 0 {
             return (None, CursorKind::Hidden);
         }
         let kind = match content.cursor.shape {
@@ -593,12 +679,14 @@ impl TerminalPanel {
                 && event.row > self.area.y
                 && !self.sessions.is_empty()
             {
-                let session = &self.sessions[self.active];
+                let (index, pane) = self
+                    .pane_at(event.column)
+                    .unwrap_or((self.active, self.grid_area));
+                let session = &self.sessions[index];
                 let term = session.term.lock();
                 let grid = term.grid();
-                let line = event.row.saturating_sub(self.grid_area.y) as i32
-                    - grid.display_offset() as i32;
-                let column = event.column.saturating_sub(self.grid_area.x) as usize;
+                let line = event.row.saturating_sub(pane.y) as i32 - grid.display_offset() as i32;
+                let column = event.column.saturating_sub(pane.x) as usize;
                 if line < grid.screen_lines() as i32 {
                     let text = row_text(&grid[Line(line)], grid.columns());
                     return location_at(&text, column);
@@ -609,25 +697,35 @@ impl TerminalPanel {
         None
     }
 
+    /// The pane under `column`: (session index, area).
+    fn pane_at(&self, column: u16) -> Option<(usize, Rect)> {
+        self.panes
+            .iter()
+            .find(|(_, pane)| column >= pane.x && column < pane.right())
+            .copied()
+    }
+
     fn mouse_inner(&mut self, event: &MouseEvent) {
         // Clicking the tab strip switches tabs.
         if event.row == self.area.y {
             if let MouseEventKind::Down(MouseButton::Left) = event.kind {
-                if let Some(i) = self
-                    .tab_hits
-                    .iter()
-                    .position(|&(start, end)| (start..end).contains(&event.column))
-                {
-                    self.active = i;
+                if let Some(i) = self.tab_at(event.column) {
+                    self.select(i);
                 }
             }
             return;
         }
 
-        let Some(session) = self.sessions.get(self.active) else {
+        // A click focuses the pane under it; events go to that pane.
+        let Some((index, grid)) = self.pane_at(event.column) else {
             return;
         };
-        let grid = self.grid_area;
+        if let MouseEventKind::Down(_) = event.kind {
+            self.active = index;
+        }
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
         let col = event.column.saturating_sub(grid.x);
         let row = event.row.saturating_sub(grid.y);
         let mode = session.mode();
@@ -673,6 +771,41 @@ fn short_label(label: &str) -> String {
     }
     let tail: String = chars[chars.len() - (MAX - 1)..].iter().collect();
     format!("…{tail}")
+}
+
+/// Draws a session's screen into `pane`, resizing it to fit.
+fn draw_session(session: &mut Session, pane: Rect, surface: &mut Surface, base: Style) {
+    session.resize((pane.width, pane.height));
+    let term = session.term.lock();
+    let content = term.renderable_content();
+    let offset = content.display_offset as i32;
+    for indexed in content.display_iter {
+        let line = indexed.point.line.0 + offset;
+        let col = indexed.point.column.0 as u16;
+        if line < 0 || line as u16 >= pane.height || col >= pane.width {
+            continue;
+        }
+        let Some(cell) = surface.get_mut(pane.x + col, pane.y + line as u16) else {
+            continue;
+        };
+        let term_cell: &TermCell = &indexed;
+        if term_cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            cell.reset();
+            continue;
+        }
+        let mut symbol = String::from(term_cell.c);
+        if let Some(zerowidth) = term_cell.zerowidth() {
+            symbol.extend(zerowidth);
+        }
+        if term_cell.flags.contains(Flags::HIDDEN) || symbol.width() == 0 {
+            symbol = " ".into();
+        }
+        cell.set_symbol(&symbol);
+        cell.set_style(base.patch(cell_style(term_cell)));
+    }
 }
 
 /// A place in a file that a program printed, for jumping to it.

@@ -29,7 +29,7 @@ use helix_view::{
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, DocumentId, Editor, Theme, View,
+    Document, DocumentId, Editor, Theme, View, ViewId,
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
@@ -50,11 +50,29 @@ enum Edge {
     Agents,
 }
 
-/// A mouse press on a panel edge: dragging resizes, a press without movement is a click.
+/// What a mouse press took hold of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grab {
+    /// A panel edge: dragging resizes.
+    Edge(Edge),
+    /// A tab number on the editor box's top border: dragging along it reorders.
+    EditorTab(usize),
+    /// A buffer name on the editor box's top border: dropping it on a view splits it there.
+    Buffer(DocumentId),
+    /// A terminal or agent tab label: dragging along the strip reorders, dropping it in the
+    /// panel puts it beside the shown tab as a pane.
+    PanelTab(bool, usize),
+}
+
+/// A mouse press, until it is released: a press that moves is a drag, one that does not is a
+/// click.
 struct Press {
-    edge: Edge,
+    grab: Grab,
     column: u16,
+    row: u16,
     moved: bool,
+    /// What follows the mouse while dragging.
+    label: String,
 }
 
 /// The sidebar's default width: a fifth of the window, within readable limits.
@@ -127,8 +145,10 @@ pub struct EditorView {
     /// Sidebar width and terminal rows the user set by dragging or with Alt+Shift+arrows.
     sidebar_width: Option<u16>,
     terminal_height: Option<u16>,
-    /// A mouse press on a panel edge, until it is released.
+    /// A mouse press on a label or panel edge, until it is released.
     pressed: Option<Press>,
+    /// Where the mouse is while dragging.
+    drag_at: (u16, u16),
     /// The frame's boxes, as laid out for the last frame.
     sidebar_box: Option<Rect>,
     main_box: Rect,
@@ -172,6 +192,7 @@ impl EditorView {
             sidebar_width: None,
             terminal_height: None,
             pressed: None,
+            drag_at: (0, 0),
             sidebar_box: None,
             main_box: Rect::default(),
             editor_box: Rect::default(),
@@ -1569,6 +1590,13 @@ impl EditorView {
         }
     }
 
+    /// Shows and focuses the terminal panel.
+    pub fn toggle_terminal_focus(&mut self) {
+        self.zen = None;
+        self.terminal.visible = true;
+        self.focus_only(Panel::Terminal);
+    }
+
     /// Opens a terminal tab running `command` (a shell when empty) and focuses it.
     pub fn open_terminal(&mut self, command: &[String], name: Option<String>, editor: &mut Editor) {
         match self.terminal.open(command, name) {
@@ -2049,62 +2077,104 @@ impl EditorView {
             .collect();
     }
 
-    /// Mouse on a panel edge: the sidebar's double border or the terminal's divider row. A press
-    /// that moves resizes; one that does not, on a terminal tab label, selects that tab.
-    /// Returns whether the event was used.
-    fn resize(&mut self, mouse: &MouseEvent) -> bool {
+    /// What a left press at (column, row) takes hold of, if anything.
+    fn grab_at(&self, column: u16, row: u16, editor: &Editor) -> Option<(Grab, String)> {
+        let within = |rect: Rect| column >= rect.x && column < rect.right();
+        if self.zen.is_none() && row == self.editor_box.y && within(self.editor_box) {
+            if let Some(&(_, _, doc)) = self
+                .buffer_hits
+                .iter()
+                .find(|&&(start, end, _)| (start..end).contains(&column))
+            {
+                let name = editor
+                    .document(doc)
+                    .map(|doc| doc.display_name().into_owned())
+                    .unwrap_or_default();
+                return Some((Grab::Buffer(doc), name));
+            }
+            if let Some(index) = self
+                .tab_hits
+                .iter()
+                .position(|&(y, start, end)| y == row && (start..end).contains(&column))
+            {
+                return Some((Grab::EditorTab(index), format!("tab {}", index + 1)));
+            }
+        }
+        if let Some(terminal) = self.terminal_box {
+            if row == terminal.y && within(terminal) {
+                return Some(match self.terminal.tab_at(column) {
+                    Some(index) => (
+                        Grab::PanelTab(false, index),
+                        format!("terminal {}", index + 1),
+                    ),
+                    None => (Grab::Edge(Edge::Terminal), String::new()),
+                });
+            }
+        }
+        if let Some(agents) = self.agents_box {
+            if row == agents.y && within(agents) {
+                if let Some(index) = self.agents.tab_at(column) {
+                    return Some((Grab::PanelTab(true, index), format!("agent {}", index + 1)));
+                }
+            }
+            if (column == agents.x || column + 1 == agents.x)
+                && row >= agents.y
+                && row < agents.bottom()
+            {
+                return Some((Grab::Edge(Edge::Agents), String::new()));
+            }
+        }
+        if let Some(sidebar) = self.sidebar_box {
+            if (column == sidebar.right() - 1 || column == sidebar.right())
+                && row >= sidebar.y
+                && row < sidebar.bottom()
+            {
+                return Some((Grab::Edge(Edge::Sidebar), String::new()));
+            }
+        }
+        None
+    }
+
+    /// Presses, drags and releases on labels and panel edges. Returns whether the event was used.
+    fn drag(&mut self, mouse: &MouseEvent, editor: &mut Editor) -> bool {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let on_sidebar_edge = self.sidebar_box.is_some_and(|sidebar| {
-                    (mouse.column == sidebar.right() - 1 || mouse.column == sidebar.right())
-                        && mouse.row >= sidebar.y
-                        && mouse.row < sidebar.bottom()
-                });
-                let on_divider = self.terminal_box.is_some_and(|terminal| {
-                    mouse.row == terminal.y
-                        && mouse.column >= terminal.x
-                        && mouse.column < terminal.right()
-                });
-                let on_agents_edge = self.agents_box.is_some_and(|agents| {
-                    (mouse.column == agents.x || mouse.column + 1 == agents.x)
-                        && mouse.row >= agents.y
-                        && mouse.row < agents.bottom()
-                });
-                let edge = if on_sidebar_edge {
-                    Edge::Sidebar
-                } else if on_agents_edge {
-                    Edge::Agents
-                } else if on_divider {
-                    Edge::Terminal
-                } else {
+                let Some((grab, label)) = self.grab_at(mouse.column, mouse.row, editor) else {
                     return false;
                 };
                 self.pressed = Some(Press {
-                    edge,
+                    grab,
                     column: mouse.column,
+                    row: mouse.row,
                     moved: false,
+                    label,
                 });
+                self.drag_at = (mouse.column, mouse.row);
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(press) = self.pressed.as_mut() else {
                     return false;
                 };
-                press.moved = true;
-                match press.edge {
-                    Edge::Sidebar => {
+                if (mouse.column, mouse.row) != (press.column, press.row) {
+                    press.moved = true;
+                }
+                self.drag_at = (mouse.column, mouse.row);
+                match press.grab {
+                    Grab::Edge(Edge::Sidebar) => {
                         let left = self.sidebar_box.map_or(0, |sidebar| sidebar.x);
                         self.sidebar_width = Some(mouse.column.saturating_sub(left) + 1);
                     }
-                    Edge::Agents => {
+                    Grab::Edge(Edge::Agents) => {
                         let right = self.agents_box.map_or(0, |agents| agents.right());
                         self.agents_width = Some(right.saturating_sub(mouse.column));
                     }
-                    Edge::Terminal => {
+                    Grab::Edge(Edge::Terminal) => {
                         // The divider follows the mouse: the rows below it, less the border.
                         let bottom = self.main_box.bottom();
                         self.terminal_height = Some(bottom.saturating_sub(mouse.row + 2));
                     }
+                    _ => {}
                 }
                 true
             }
@@ -2112,16 +2182,128 @@ impl EditorView {
                 let Some(press) = self.pressed.take() else {
                     return false;
                 };
-                if !press.moved && press.edge == Edge::Terminal {
-                    if let Some(index) = self.terminal.tab_at(press.column) {
-                        self.terminal.select(index);
-                    }
-                    self.focus_only(Panel::Terminal);
-                }
+                self.release(press, mouse.column, mouse.row, editor);
                 true
             }
             _ => false,
         }
+    }
+
+    fn release(&mut self, press: Press, column: u16, row: u16, editor: &mut Editor) {
+        match press.grab {
+            Grab::Edge(_) => {}
+            Grab::Buffer(doc) if !press.moved => {
+                editor.switch(doc, Action::Replace);
+                self.focus_editor();
+            }
+            Grab::Buffer(doc) => {
+                if let Some((view, action, _)) = self.drop_target(column, row, editor) {
+                    editor.focus(view);
+                    editor.switch(doc, action);
+                    self.focus_editor();
+                }
+            }
+            Grab::EditorTab(index) if !press.moved => {
+                editor.switch_tab(index);
+                self.focus_editor();
+            }
+            Grab::EditorTab(from) => {
+                if let Some(to) = self
+                    .tab_hits
+                    .iter()
+                    .position(|&(y, start, end)| y == row && (start..end).contains(&column))
+                {
+                    editor.tree.move_tab(from, to);
+                }
+            }
+            Grab::PanelTab(agents, index) => {
+                let (panel, strip) = if agents {
+                    (&mut self.agents, self.agents_box.map(|b| b.y))
+                } else {
+                    (&mut self.terminal, self.terminal_box.map(|b| b.y))
+                };
+                if !press.moved {
+                    panel.select(index);
+                } else if Some(row) == strip {
+                    if let Some(to) = panel.tab_at(column) {
+                        panel.move_tab(index, to);
+                    }
+                } else if panel.contains(column, row) {
+                    panel.merge_into_shown(index);
+                }
+                self.focus_only(if agents {
+                    Panel::Agents
+                } else {
+                    Panel::Terminal
+                });
+                if agents {
+                    self.save_agents();
+                }
+            }
+        }
+    }
+
+    /// Where a buffer dropped at (column, row) goes: the view under it, and a vertical split
+    /// near its left or right edge, a horizontal split near its top or bottom, or a
+    /// replacement in the middle. Also the area that will change, for the drop hint.
+    fn drop_target(
+        &self,
+        column: u16,
+        row: u16,
+        editor: &Editor,
+    ) -> Option<(ViewId, Action, Rect)> {
+        let (view, _) = editor.tree.views().find(|(view, _)| {
+            let area = view.area;
+            column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+        })?;
+        let area = view.area;
+        let (dx, dy) = (column - area.x, row - area.y);
+        let (w, h) = (area.width.max(1), area.height.max(1));
+        let half_w = area.width / 2;
+        let half_h = area.height / 2;
+        Some(if dx < w / 4 || dx >= w * 3 / 4 {
+            (
+                view.id,
+                Action::VerticalSplit,
+                Rect::new(area.x + half_w, area.y, area.width - half_w, area.height),
+            )
+        } else if dy < h / 4 || dy >= h * 3 / 4 {
+            (
+                view.id,
+                Action::HorizontalSplit,
+                Rect::new(area.x, area.y + half_h, area.width, area.height - half_h),
+            )
+        } else {
+            (view.id, Action::Replace, area)
+        })
+    }
+
+    /// While dragging a label: the label follows the mouse, and a buffer shows where it will land.
+    fn render_drag(&self, editor: &Editor, surface: &mut Surface) {
+        let Some(press) = self.pressed.as_ref().filter(|press| press.moved) else {
+            return;
+        };
+        if matches!(press.grab, Grab::Edge(_)) {
+            return;
+        }
+        let roles = Roles::new(&editor.theme);
+        let (column, row) = self.drag_at;
+        if let Grab::Buffer(_) = press.grab {
+            if let Some((_, _, area)) = self.drop_target(column, row, editor) {
+                frame::draw_box(surface, area, roles.accent, End::Corner, End::Corner);
+            }
+        }
+        let ghost = roles
+            .selected
+            .patch(roles.accent)
+            .add_modifier(Modifier::BOLD);
+        surface.set_stringn(
+            column.saturating_add(1),
+            row,
+            &format!(" {} ", press.label),
+            surface.area.right().saturating_sub(column + 1) as usize,
+            ghost,
+        );
     }
 
     /// Alt+Shift+arrows: left and right resize the sidebar, up and down the terminal.
@@ -2207,42 +2389,7 @@ impl EditorView {
     ) -> Option<EventResult> {
         match event {
             Event::Key(key) if self.resize_with_key(key) => Some(EventResult::Consumed(None)),
-            Event::Mouse(mouse) if self.resize(mouse) => Some(EventResult::Consumed(None)),
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && mouse.row == self.editor_box.y
-                    && self
-                        .buffer_hits
-                        .iter()
-                        .any(|&(start, end, _)| (start..end).contains(&mouse.column)) =>
-            {
-                if let Some(&(_, _, doc)) = self
-                    .buffer_hits
-                    .iter()
-                    .find(|&&(start, end, _)| (start..end).contains(&mouse.column))
-                {
-                    cx.editor.switch(doc, Action::Replace);
-                }
-                self.focus_editor();
-                Some(EventResult::Consumed(None))
-            }
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                    && self.tab_hits.iter().any(|&(y, start, end)| {
-                        mouse.row == y && (start..end).contains(&mouse.column)
-                    }) =>
-            {
-                let index = self
-                    .tab_hits
-                    .iter()
-                    .position(|&(y, start, end)| {
-                        mouse.row == y && (start..end).contains(&mouse.column)
-                    })
-                    .unwrap_or_default();
-                cx.editor.switch_tab(index);
-                self.focus_editor();
-                Some(EventResult::Consumed(None))
-            }
+            Event::Mouse(mouse) if self.drag(mouse, cx.editor) => Some(EventResult::Consumed(None)),
             Event::Mouse(mouse) if self.file_tree.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_only(Panel::Tree);
@@ -2312,6 +2459,13 @@ impl EditorView {
                     KeyCode::PageUp if ctrl && self.agents.focused => self.agents.cycle(false),
                     KeyCode::PageDown if ctrl && self.agents.focused => self.agents.cycle(true),
                     _ if self.agents.focused => self.agents.key(*key),
+                    KeyCode::Char('\\')
+                        if key.modifiers == KeyModifiers::ALT && self.terminal.focused =>
+                    {
+                        if let Err(err) = self.terminal.split(&[], None) {
+                            cx.editor.set_error(format!("cannot start terminal: {err}"));
+                        }
+                    }
                     KeyCode::PageUp if ctrl => self.terminal.cycle(false),
                     KeyCode::PageDown if ctrl => self.terminal.cycle(true),
                     _ => self.terminal.key(*key),
@@ -2597,6 +2751,8 @@ impl Component for EditorView {
                 style,
             );
         }
+
+        self.render_drag(cx.editor, surface);
 
         if config.auto_info {
             if let Some(mut info) = cx.editor.autoinfo.take() {
