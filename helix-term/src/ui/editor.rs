@@ -2161,16 +2161,24 @@ impl EditorView {
         let (left, right) = (row.x, row.right() - 1);
 
         let tab_count = editor.tree.tab_count();
+        // The active file and layout are filled chips, so they stand out on a focused (accent)
+        // border as well as on a muted one.
+        let chip = roles
+            .selected
+            .patch(roles.accent)
+            .add_modifier(Modifier::BOLD);
+        // Layouts: whole arrangements of splits, numbered on the right after HELIDE when there are
+        // several. Files are the tabs on the left.
         let tab_labels: Vec<Label> = if tab_count > 1 {
-            (0..tab_count)
-                .map(|index| {
+            std::iter::once(Label::new("HELIDE", roles.label()))
+                .chain((0..tab_count).map(|index| {
                     let style = if index == editor.tree.active_tab() {
-                        roles.accent.add_modifier(Modifier::BOLD)
+                        chip
                     } else {
                         roles.muted
                     };
                     Label::new((index + 1).to_string(), style)
-                })
+                }))
                 .collect()
         } else {
             Vec::new()
@@ -2179,12 +2187,12 @@ impl EditorView {
             .iter()
             .map(|label| label.text.width() as u16 + 2)
             .sum();
-        for (index, (start, end)) in frame::labels_right(surface, row.y, left, right, &tab_labels)
+        // The first label is HELIDE; the rest are the layouts.
+        for (start, end) in frame::labels_right(surface, row.y, left, right, &tab_labels)
             .into_iter()
-            .enumerate()
+            .skip(1)
         {
             self.tab_hits.push((row.y, start, end));
-            let _ = index;
         }
 
         let current = view!(editor).doc;
@@ -2200,8 +2208,10 @@ impl EditorView {
                 if doc.is_modified() {
                     name.push_str(" ●");
                 }
+                // The trailing × closes the file.
+                name.push_str(" ×");
                 let style = if doc.id() == current {
-                    roles.text.add_modifier(Modifier::BOLD)
+                    chip
                 } else {
                     roles.muted
                 };
@@ -2216,6 +2226,39 @@ impl EditorView {
             .zip(ids)
             .map(|((start, end), id)| (start, end, id))
             .collect();
+    }
+
+    /// A click on a tab's ×: closes the file, terminal tab or agent tab. Returns whether it was
+    /// one.
+    fn close_click(&mut self, mouse: &MouseEvent, editor: &mut Editor) -> bool {
+        let (column, row) = (mouse.column, mouse.row);
+        if self.zen.is_none() && row == self.editor_box.y {
+            if let Some(&(_, _, doc)) = self
+                .buffer_hits
+                .iter()
+                .find(|&&(_, end, _)| end >= 2 && column == end - 2)
+            {
+                if editor.close_document(doc, false).is_err() {
+                    editor
+                        .set_error("This file has unsaved changes. Save it, or close it with :bc!");
+                }
+                return true;
+            }
+        }
+        if self.terminal_box.is_some_and(|b| row == b.y) {
+            if let Some(index) = self.terminal.close_at(column) {
+                self.terminal.close_tab(index);
+                return true;
+            }
+        }
+        if self.agents_box.is_some_and(|b| row == b.y) {
+            if let Some(index) = self.agents.close_at(column) {
+                self.agents.close_tab(index);
+                self.save_agents();
+                return true;
+            }
+        }
+        false
     }
 
     /// What a left press at (column, row) takes hold of, if anything.
@@ -2279,6 +2322,19 @@ impl EditorView {
     /// Presses, drags and releases on labels and panel edges. Returns whether the event was used.
     fn drag(&mut self, mouse: &MouseEvent, editor: &mut Editor) -> bool {
         match mouse.kind {
+            // Middle-click closes a file tab.
+            MouseEventKind::Down(MouseButton::Middle) => {
+                let Some((Grab::Buffer(doc), _)) = self.grab_at(mouse.column, mouse.row, editor)
+                else {
+                    return false;
+                };
+                if editor.close_document(doc, false).is_err() {
+                    editor
+                        .set_error("This file has unsaved changes. Save it, or close it with :bc!");
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.close_click(mouse, editor) => true,
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some((grab, label)) = self.grab_at(mouse.column, mouse.row, editor) else {
                     return false;

@@ -625,10 +625,10 @@ impl MappableCommand {
         goto_location, "Open the newest file:line printed in the terminal (again: older)",
         send_output_to_agent, "Send the last terminal command's output to the agent",
         open_config, "Open the config file",
-        tab_new, "Open the current buffer in a new tab",
-        tab_next, "Go to next tab",
-        tab_prev, "Go to previous tab",
-        tab_close, "Close the current tab",
+        tab_new, "Open the current buffer in a new layout",
+        tab_next, "Go to the next layout",
+        tab_prev, "Go to the previous layout",
+        tab_close, "Close the current layout and its splits",
     );
 }
 

@@ -349,8 +349,10 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-4" => agent_toggle,
         "F11" => zen_toggle,
         "C-," => open_config,
-        "C-pageup" => tab_prev,
-        "C-pagedown" => tab_next,
+        "C-pageup" => goto_previous_buffer,
+        "C-pagedown" => goto_next_buffer,
+        "A-pageup" => tab_prev,
+        "A-pagedown" => tab_next,
     });
     let mut select = normal.clone();
     select.merge_nodes(keymap!({ "Select mode"
@@ -402,8 +404,10 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-4" => agent_toggle,
         "F11" => zen_toggle,
         "C-," => open_config,
-        "C-pageup" => tab_prev,
-        "C-pagedown" => tab_next,
+        "C-pageup" => goto_previous_buffer,
+        "C-pagedown" => goto_next_buffer,
+        "A-pageup" => tab_prev,
+        "A-pagedown" => tab_next,
         "C-r" => insert_register,
 
         "C-w" | "A-backspace" => delete_word_backward,
