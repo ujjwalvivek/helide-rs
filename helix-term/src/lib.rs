@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod job;
 pub mod keymap;
 pub mod logging;
+pub mod mcp;
 pub mod ui;
 
 #[cfg(not(windows))]

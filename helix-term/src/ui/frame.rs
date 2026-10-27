@@ -50,6 +50,32 @@ pub fn draw_box(surface: &mut Surface, rect: Rect, style: Style, top: End, botto
     set(surface, right, lower, br, style);
 }
 
+/// Joins vertical lines (split and pane dividers) to the horizontal border on `row`, between
+/// columns `left` and `right` (exclusive): `┬` where a line starts below, `┴` where one ends
+/// above, `┼` where it crosses. The border keeps its colour.
+pub fn join_verticals(surface: &mut Surface, row: u16, left: u16, right: u16) {
+    let area = surface.area;
+    let inside =
+        |x: u16, y: u16| x >= area.x && x < area.right() && y >= area.y && y < area.bottom();
+    let is_vertical = |surface: &Surface, x: u16, y: u16| {
+        inside(x, y) && matches!(surface[(x, y)].symbol.as_str(), "│" | "┃")
+    };
+    for x in left..right {
+        if !inside(x, row) || surface[(x, row)].symbol.as_str() != "─" {
+            continue;
+        }
+        let up = row > 0 && is_vertical(surface, x, row - 1);
+        let down = is_vertical(surface, x, row + 1);
+        let symbol = match (up, down) {
+            (true, true) => "┼",
+            (true, false) => "┴",
+            (false, true) => "┬",
+            (false, false) => continue,
+        };
+        surface[(x, row)].set_symbol(symbol);
+    }
+}
+
 /// One piece of text set into a border, padded by a space each side.
 pub struct Label {
     pub text: String,

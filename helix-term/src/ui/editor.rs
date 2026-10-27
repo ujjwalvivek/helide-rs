@@ -130,6 +130,9 @@ pub struct EditorView {
     pub lsp_summary: Vec<(String, String)>,
     /// Locations found by the last error-location jump, and which one is shown.
     locations: (Vec<super::terminal::Location>, usize),
+    /// When the workspace was last saved, and what was saved; it is saved again when it changes.
+    saved_at: Option<std::time::Instant>,
+    saved: Option<(Option<agents::EditorLayout>, agents::Panels)>,
     /// The project whose saved agent tabs were last restored or saved.
     agents_project: Option<PathBuf>,
     agents_width: Option<u16>,
@@ -182,6 +185,8 @@ impl EditorView {
             zen: None,
             lsp_summary: Vec::new(),
             locations: (Vec::new(), 0),
+            saved_at: None,
+            saved: None,
             agents_project: None,
             agents_width: None,
             agents_box: None,
@@ -1630,6 +1635,142 @@ impl EditorView {
         }
     }
 
+    /// Saves the project's editor tabs and splits (with cursors) and its panels, keeping the
+    /// saved agent tabs, so the project reopens as it is now.
+    pub fn save_workspace(&mut self, editor: &Editor) {
+        let project = helix_stdx::env::current_working_dir();
+        let mut workspace = agents::load_workspace(&project);
+        let (layout, panels) = self.capture(editor);
+        // Quitting closes the views before the last save; keep the layout they had.
+        if layout.is_some() {
+            workspace.editor = layout.clone();
+        }
+        workspace.panels = Some(panels.clone());
+        workspace.opened = agents::now();
+        agents::save_workspace(&workspace);
+        self.saved_at = Some(std::time::Instant::now());
+        self.saved = Some((layout, panels));
+    }
+
+    /// Saves the workspace if it changed since the last save: right away when `now`, at most
+    /// every few seconds otherwise. Nothing is saved before a file is open.
+    fn save_if_changed(&mut self, editor: &Editor, now: bool) {
+        if cfg!(feature = "integration") || !editor.documents().any(|doc| doc.path().is_some()) {
+            return;
+        }
+        let due = now
+            || self
+                .saved_at
+                .is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(3));
+        if due && self.saved.as_ref() != Some(&self.capture(editor)) {
+            self.save_workspace(editor);
+        }
+    }
+
+    /// The editor's tabs and splits (with cursors), and the panels, as they are now.
+    fn capture(&self, editor: &Editor) -> (Option<agents::EditorLayout>, agents::Panels) {
+        let mut tabs = Vec::new();
+        let mut active_tab = 0;
+        for index in 0..editor.tree.tab_count() {
+            let pane = editor
+                .tree
+                .tab_layout(index)
+                .and_then(|node| capture_pane(editor, &node));
+            if let Some(pane) = pane {
+                if index == editor.tree.active_tab() {
+                    active_tab = tabs.len();
+                }
+                tabs.push(pane);
+            }
+        }
+        let layout = (!tabs.is_empty()).then_some(agents::EditorLayout { tabs, active_tab });
+        let [tree, git, terminal, agents_shown] = self.zen.unwrap_or([
+            self.file_tree.visible,
+            self.git.visible,
+            self.terminal.visible,
+            self.agents.visible,
+        ]);
+        let panels = agents::Panels {
+            tree,
+            git,
+            terminal,
+            agents: agents_shown,
+            sidebar_width: self.sidebar_width,
+            terminal_height: self.terminal_height,
+            agents_width: self.agents_width,
+        };
+        (layout, panels)
+    }
+
+    /// Reopens the project as it was saved: tabs, splits, cursors, panels and their sizes, and
+    /// the agent tabs if the agent panel was open. Returns false when nothing was saved.
+    pub fn restore_workspace(&mut self, editor: &mut Editor) -> bool {
+        let project = helix_stdx::env::current_working_dir();
+        let workspace = agents::load_workspace(&project);
+        log::info!(
+            "workspace: restoring {} (editor saved: {}, panels saved: {})",
+            project.display(),
+            workspace.editor.is_some(),
+            workspace.panels.is_some()
+        );
+        if workspace.editor.is_none() && workspace.panels.is_none() {
+            return false;
+        }
+        if let Some(layout) = &workspace.editor {
+            let tabs: Vec<agents::Pane> = layout
+                .tabs
+                .iter()
+                .cloned()
+                .filter_map(agents::Pane::prune)
+                .collect();
+            let mut opened = 0;
+            for pane in &tabs {
+                let Some(first) = pane.first_file() else {
+                    continue;
+                };
+                let action = if opened == 0 {
+                    Action::Replace
+                } else {
+                    Action::NewTab
+                };
+                if editor.open(first, action).is_ok() {
+                    fill_pane(editor, pane);
+                    opened += 1;
+                }
+            }
+            if opened > 0 {
+                editor.switch_tab(layout.active_tab.min(opened - 1));
+            }
+        }
+        if let Some(panels) = &workspace.panels {
+            self.sidebar_width = panels.sidebar_width;
+            self.terminal_height = panels.terminal_height;
+            self.agents_width = panels.agents_width;
+            if panels.git {
+                self.git.visible = true;
+                self.git.refresh();
+            } else if panels.tree {
+                self.file_tree.visible = true;
+                self.file_tree.refresh(editor);
+            }
+            if panels.terminal {
+                if let Err(err) = self.terminal.open(&[], None) {
+                    editor.set_error(format!("cannot start terminal: {err}"));
+                }
+            }
+            if panels.agents {
+                for session in workspace.agents.clone() {
+                    if let Err(err) = self.agents.open_agent(session) {
+                        editor.set_error(format!("cannot start agent: {err}"));
+                    }
+                }
+            }
+        }
+        self.agents_project = Some(project);
+        self.focus_editor();
+        true
+    }
+
     /// F11: hides every panel and the frame, leaving the editor alone; again brings them back.
     pub fn toggle_zen(&mut self) {
         match self.zen.take() {
@@ -2197,9 +2338,14 @@ impl EditorView {
                 self.focus_editor();
             }
             Grab::Buffer(doc) => {
-                if let Some((view, action, _)) = self.drop_target(column, row, editor) {
+                if let Some((view, action, _, swap)) = self.drop_target(column, row, editor) {
                     editor.focus(view);
                     editor.switch(doc, action);
+                    // Helix puts a new split to the right or below; a drop on the left or
+                    // top half moves it there.
+                    if let Some(direction) = swap {
+                        editor.tree.swap_split_in_direction(direction);
+                    }
                     self.focus_editor();
                 }
             }
@@ -2229,7 +2375,14 @@ impl EditorView {
                         panel.move_tab(index, to);
                     }
                 } else if panel.contains(column, row) {
-                    panel.merge_into_shown(index);
+                    if panel.shown_tab() == Some(index) && !agents {
+                        // The shown tab dropped on itself: a new shell beside it.
+                        if let Err(err) = panel.split(&[], None) {
+                            editor.set_error(format!("cannot start terminal: {err}"));
+                        }
+                    } else {
+                        panel.merge_into_shown(index);
+                    }
                 }
                 self.focus_only(if agents {
                     Panel::Agents
@@ -2251,7 +2404,8 @@ impl EditorView {
         column: u16,
         row: u16,
         editor: &Editor,
-    ) -> Option<(ViewId, Action, Rect)> {
+    ) -> Option<(ViewId, Action, Rect, Option<helix_view::tree::Direction>)> {
+        use helix_view::tree::Direction;
         let (view, _) = editor.tree.views().find(|(view, _)| {
             let area = view.area;
             column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
@@ -2259,22 +2413,22 @@ impl EditorView {
         let area = view.area;
         let (dx, dy) = (column - area.x, row - area.y);
         let (w, h) = (area.width.max(1), area.height.max(1));
-        let half_w = area.width / 2;
-        let half_h = area.height / 2;
-        Some(if dx < w / 4 || dx >= w * 3 / 4 {
-            (
-                view.id,
-                Action::VerticalSplit,
-                Rect::new(area.x + half_w, area.y, area.width - half_w, area.height),
-            )
-        } else if dy < h / 4 || dy >= h * 3 / 4 {
-            (
-                view.id,
-                Action::HorizontalSplit,
-                Rect::new(area.x, area.y + half_h, area.width, area.height - half_h),
-            )
+        let (half_w, half_h) = (area.width / 2, area.height / 2);
+        let left = Rect::new(area.x, area.y, half_w, area.height);
+        let right = Rect::new(area.x + half_w, area.y, area.width - half_w, area.height);
+        let top = Rect::new(area.x, area.y, area.width, half_h);
+        let bottom = Rect::new(area.x, area.y + half_h, area.width, area.height - half_h);
+        // The quarter of the view the mouse is in decides the side.
+        Some(if dx < w / 4 {
+            (view.id, Action::VerticalSplit, left, Some(Direction::Left))
+        } else if dx >= w * 3 / 4 {
+            (view.id, Action::VerticalSplit, right, None)
+        } else if dy < h / 4 {
+            (view.id, Action::HorizontalSplit, top, Some(Direction::Up))
+        } else if dy >= h * 3 / 4 {
+            (view.id, Action::HorizontalSplit, bottom, None)
         } else {
-            (view.id, Action::Replace, area)
+            (view.id, Action::Replace, area, None)
         })
     }
 
@@ -2288,10 +2442,31 @@ impl EditorView {
         }
         let roles = Roles::new(&editor.theme);
         let (column, row) = self.drag_at;
-        if let Grab::Buffer(_) = press.grab {
-            if let Some((_, _, area)) = self.drop_target(column, row, editor) {
-                frame::draw_box(surface, area, roles.accent, End::Corner, End::Corner);
+        match press.grab {
+            Grab::Buffer(_) => {
+                if let Some((_, _, area, _)) = self.drop_target(column, row, editor) {
+                    frame::draw_box(surface, area, roles.accent, End::Corner, End::Corner);
+                }
             }
+            // A tab over its panel's contents joins it as a pane: outline the panel.
+            Grab::PanelTab(agents, _) => {
+                let (panel, area) = if agents {
+                    (&self.agents, self.agents_box)
+                } else {
+                    (&self.terminal, self.terminal_box)
+                };
+                if let Some(area) = area.filter(|area| row > area.y && panel.contains(column, row))
+                {
+                    let inside = Rect::new(
+                        area.x + 1,
+                        area.y + 1,
+                        area.width.saturating_sub(2),
+                        area.height.saturating_sub(2),
+                    );
+                    frame::draw_box(surface, inside, roles.accent, End::Corner, End::Corner);
+                }
+            }
+            _ => {}
         }
         let ghost = roles
             .selected
@@ -2635,7 +2810,11 @@ impl Component for EditorView {
             }
 
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
-            Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
+            Event::IdleTimeout => {
+                // Whatever changed since the last save is written once the editor goes idle.
+                self.save_if_changed(cx.editor, true);
+                self.handle_idle_timeout(&mut cx)
+            }
             Event::FocusGained => {
                 self.terminal_focused = true;
                 EventResult::Consumed(None)
@@ -2667,6 +2846,9 @@ impl Component for EditorView {
         // and, below a shared divider, the terminal. The last row stays for the command line.
         let frame = area.clip_bottom(1);
         self.terminal.update();
+        // Keep the workspace saved while a project is open, so even a killed window loses
+        // little. Integration tests leave the user's state alone.
+        self.save_if_changed(cx.editor, false);
         let (finished, closed) = self.agents.update();
         if closed {
             self.save_agents();
@@ -2750,6 +2932,18 @@ impl Component for EditorView {
                 state,
                 style,
             );
+        }
+
+        // Split and pane dividers meet the borders with junctions, not gaps.
+        if self.zen.is_none() {
+            let editor_box = self.editor_box;
+            let (left, right) = (editor_box.x + 1, editor_box.right().saturating_sub(1));
+            frame::join_verticals(surface, editor_box.y, left, right);
+            frame::join_verticals(surface, editor_box.bottom().saturating_sub(1), left, right);
+            if let Some(terminal) = self.terminal_box {
+                let (left, right) = (terminal.x + 1, terminal.right().saturating_sub(1));
+                frame::join_verticals(surface, terminal.bottom().saturating_sub(1), left, right);
+            }
         }
 
         self.render_drag(cx.editor, surface);
@@ -2876,6 +3070,84 @@ fn canonicalize_key(key: &mut KeyEvent) {
     } = key
     {
         key.modifiers.remove(KeyModifiers::SHIFT)
+    }
+}
+
+/// A saved pane from a tab's split structure: files with their cursors, splits with their
+/// direction. Views without a file (scratch, diffs, proposals) are left out.
+fn capture_pane(editor: &Editor, node: &helix_view::tree::LayoutNode) -> Option<agents::Pane> {
+    use helix_view::tree::{Layout, LayoutNode};
+    match node {
+        LayoutNode::View(id) => {
+            let view = editor.tree.try_get(*id)?;
+            let doc = editor.document(view.doc)?;
+            let path = doc.path()?.to_path_buf();
+            let text = doc.text().slice(..);
+            let cursor = doc.selection(view.id).primary().cursor(text);
+            let position = helix_core::coords_at_pos(text, cursor);
+            Some(agents::Pane::File {
+                path,
+                line: position.row + 1,
+                column: position.col + 1,
+            })
+        }
+        LayoutNode::Split(layout, children) => {
+            let mut panes: Vec<agents::Pane> = children
+                .iter()
+                .filter_map(|child| capture_pane(editor, child))
+                .collect();
+            match panes.len() {
+                0 => None,
+                1 => panes.pop(),
+                _ => Some(agents::Pane::Split {
+                    vertical: *layout == Layout::Vertical,
+                    panes,
+                }),
+            }
+        }
+    }
+}
+
+/// Fills the focused view with `pane`: a file at its cursor, or a split whose panes are opened
+/// beside (or below) one another, then filled in turn.
+fn fill_pane(editor: &mut Editor, pane: &agents::Pane) {
+    match pane {
+        agents::Pane::File { path, line, column } => {
+            if editor.open(path, Action::Replace).is_ok() {
+                let (view, doc) = current!(editor);
+                let pos = helix_core::pos_at_coords(
+                    doc.text().slice(..),
+                    helix_core::Position::new(line.saturating_sub(1), column.saturating_sub(1)),
+                    true,
+                );
+                doc.set_selection(view.id, helix_core::Selection::point(pos));
+                helix_view::align_view(doc, view, helix_view::Align::Center);
+            }
+        }
+        agents::Pane::Split { vertical, panes } => {
+            let action = if *vertical {
+                Action::VerticalSplit
+            } else {
+                Action::HorizontalSplit
+            };
+            // Make the sibling views first, in order, then fill each one.
+            let mut views = vec![editor.tree.focus];
+            for pane in panes.iter().skip(1) {
+                let Some(first) = pane.first_file() else {
+                    continue;
+                };
+                if let Some(&last) = views.last() {
+                    editor.focus(last);
+                }
+                if editor.open(first, action).is_ok() {
+                    views.push(editor.tree.focus);
+                }
+            }
+            for (pane, view) in panes.iter().zip(views) {
+                editor.focus(view);
+                fill_pane(editor, pane);
+            }
+        }
     }
 }
 

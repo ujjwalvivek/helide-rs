@@ -143,6 +143,9 @@ impl Application {
         compositor.push(editor_view);
 
         let jobs = Jobs::new();
+        // Helide: started on no file (or just a folder), the project reopens as it was left,
+        // or the welcome screen shows.
+        let mut restore = false;
 
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
@@ -152,10 +155,15 @@ impl Application {
         } else if !args.files.is_empty() {
             let mut files_it = args.files.into_iter().peekable();
 
-            // If the first file is a directory, skip it and open a picker
+            // If the first file is a directory, skip it and open a picker; Helide restores the
+            // project instead when the folder is all that was given.
             if let Some((first, _)) = files_it.next_if(|(p, _)| p.is_dir()) {
-                let picker = ui::file_picker(&editor, first);
-                compositor.push(Box::new(overlaid(picker)));
+                if files_it.peek().is_none() && !cfg!(feature = "integration") {
+                    restore = true;
+                } else {
+                    let picker = ui::file_picker(&editor, first);
+                    compositor.push(Box::new(overlaid(picker)));
+                }
             }
 
             // If there are any more files specified, open them
@@ -229,10 +237,20 @@ impl Application {
             }
         } else if stdin().is_terminal() || cfg!(feature = "integration") {
             editor.new_file(Action::VerticalSplit);
+            restore = !cfg!(feature = "integration");
         } else {
             editor
                 .new_file_from_stdin(Action::VerticalSplit)
                 .unwrap_or_else(|_| editor.new_file(Action::VerticalSplit));
+        }
+
+        if restore {
+            let editor_view = compositor
+                .find::<ui::EditorView>()
+                .expect("the editor view was pushed above");
+            if !editor_view.restore_workspace(&mut editor) {
+                compositor.push(Box::new(ui::welcome::Welcome::new()));
+            }
         }
 
         #[cfg(windows)]
@@ -626,6 +644,13 @@ impl Application {
                 self.render().await;
             }
             signal::SIGTERM | signal::SIGINT | signal::SIGHUP => {
+                if !cfg!(feature = "integration")
+                    && self.editor.documents().any(|doc| doc.path().is_some())
+                {
+                    if let Some(editor_view) = self.compositor.find::<ui::EditorView>() {
+                        editor_view.save_workspace(&self.editor);
+                    }
+                }
                 self.restore_term().unwrap();
                 return false;
             }

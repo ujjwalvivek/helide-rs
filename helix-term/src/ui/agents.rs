@@ -98,6 +98,42 @@ impl AgentSession {
     }
 }
 
+impl AgentSession {
+    /// Environment for the agent's process. OpenCode gets `OPENCODE_CONFIG`, a config file
+    /// that registers this editor's `hx mcp` bridge (see crate::mcp); OpenCode merges it with
+    /// the user's own config. Claude talks to the editor through the IDE server instead.
+    pub fn env(&self) -> Vec<(String, String)> {
+        match self.kind {
+            AgentKind::Claude => Vec::new(),
+            AgentKind::OpenCode => opencode_config()
+                .map(|file| vec![("OPENCODE_CONFIG".to_string(), file.display().to_string())])
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Writes `$XDG_STATE_HOME/helide/opencode.json`, registering `<this hx> mcp` as an MCP server.
+fn opencode_config() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let file = workspace_file(Path::new(""))?
+        .parent()?
+        .parent()?
+        .join("opencode.json");
+    let config = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {
+            "helide": {
+                "type": "local",
+                "command": [exe, "mcp"],
+                "enabled": true,
+            }
+        }
+    });
+    std::fs::create_dir_all(file.parent()?).ok()?;
+    std::fs::write(&file, serde_json::to_vec_pretty(&config).ok()?).ok()?;
+    Some(file)
+}
+
 fn claude_config_dir() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
@@ -194,40 +230,142 @@ fn workspace_file(project: &Path) -> Option<PathBuf> {
     )
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Workspace {
-    project: PathBuf,
+/// Everything Helide keeps per project: agent tabs, the editor's tabs and splits, and the
+/// panels, so a project reopens as it was left.
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub project: PathBuf,
     #[serde(default)]
-    agents: Vec<AgentSession>,
+    pub agents: Vec<AgentSession>,
+    #[serde(default)]
+    pub editor: Option<EditorLayout>,
+    #[serde(default)]
+    pub panels: Option<Panels>,
+    /// Seconds since the epoch when the project was last open, for the recent list.
+    #[serde(default)]
+    pub opened: u64,
 }
 
-/// The agent tabs saved for `project`, oldest first.
-pub fn load(project: &Path) -> Vec<AgentSession> {
+/// The editor's tabs, each a tree of splits with files at the leaves.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct EditorLayout {
+    pub tabs: Vec<Pane>,
+    pub active_tab: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Pane {
+    /// A file, with the cursor's line and column (1-based).
+    File {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    /// Panes side by side (`vertical`) or stacked.
+    Split { vertical: bool, panes: Vec<Pane> },
+}
+
+impl Pane {
+    /// The first file in reading order: what a split shows before its own panes are restored.
+    pub fn first_file(&self) -> Option<&Path> {
+        match self {
+            Pane::File { path, .. } => Some(path),
+            Pane::Split { panes, .. } => panes.iter().find_map(Pane::first_file),
+        }
+    }
+
+    /// Drops files that no longer exist, and splits left with one pane or none.
+    pub fn prune(self) -> Option<Pane> {
+        match self {
+            Pane::File { ref path, .. } if path.is_file() => Some(self),
+            Pane::File { .. } => None,
+            Pane::Split { vertical, panes } => {
+                let mut panes: Vec<Pane> = panes.into_iter().filter_map(Pane::prune).collect();
+                match panes.len() {
+                    0 => None,
+                    1 => panes.pop(),
+                    _ => Some(Pane::Split { vertical, panes }),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct Panels {
+    pub tree: bool,
+    pub git: bool,
+    pub terminal: bool,
+    pub agents: bool,
+    pub sidebar_width: Option<u16>,
+    pub terminal_height: Option<u16>,
+    pub agents_width: Option<u16>,
+}
+
+/// The workspace saved for `project`, or an empty one.
+pub fn load_workspace(project: &Path) -> Workspace {
     workspace_file(project)
         .and_then(|file| std::fs::read(file).ok())
         .and_then(|bytes| serde_json::from_slice::<Workspace>(&bytes).ok())
-        .map(|workspace| workspace.agents)
-        .unwrap_or_default()
+        .unwrap_or_else(|| Workspace {
+            project: project.to_path_buf(),
+            ..Default::default()
+        })
 }
 
-pub fn save(project: &Path, agents: &[AgentSession]) {
-    let Some(file) = workspace_file(project) else {
+pub fn save_workspace(workspace: &Workspace) {
+    let Some(file) = workspace_file(&workspace.project) else {
         return;
-    };
-    let workspace = Workspace {
-        project: project.to_path_buf(),
-        agents: agents.to_vec(),
     };
     let result = file
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|_| {
-            let json = serde_json::to_vec_pretty(&workspace).map_err(std::io::Error::other)?;
+            let json = serde_json::to_vec_pretty(workspace).map_err(std::io::Error::other)?;
             std::fs::write(&file, json)
         });
     if let Err(err) = result {
-        log::warn!("cannot save agent tabs to {}: {err}", file.display());
+        log::warn!("cannot save the workspace to {}: {err}", file.display());
     }
+}
+
+/// Every saved project that still exists, most recently opened first.
+pub fn recent_projects() -> Vec<Workspace> {
+    let Some(dir) =
+        workspace_file(Path::new("")).and_then(|file| file.parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
+    };
+    let mut projects: Vec<Workspace> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Workspace>(&bytes).ok())
+        .filter(|workspace| workspace.project.is_dir())
+        .collect();
+    projects.sort_by(|a, b| b.opened.cmp(&a.opened));
+    projects
+}
+
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// The agent tabs saved for `project`, oldest first.
+pub fn load(project: &Path) -> Vec<AgentSession> {
+    load_workspace(project).agents
+}
+
+/// Saves the agent tabs, keeping the rest of the workspace.
+pub fn save(project: &Path, agents: &[AgentSession]) {
+    let mut workspace = load_workspace(project);
+    workspace.agents = agents.to_vec();
+    save_workspace(&workspace);
 }
 
 /// A desktop notification, best effort: the shell's notification daemon shows it.

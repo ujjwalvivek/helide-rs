@@ -110,15 +110,19 @@ impl Session {
             })
             .unwrap_or_else(|| "shell".into());
 
+        let mut env: std::collections::HashMap<String, String> = [
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ]
+        .into();
+        if let Some(agent) = &agent {
+            env.extend(agent.env());
+        }
         let options = tty::Options {
             shell,
             working_directory: Some(helix_stdx::env::current_working_dir()),
             drain_on_exit: true,
-            env: [
-                ("TERM".to_string(), "xterm-256color".to_string()),
-                ("COLORTERM".to_string(), "truecolor".to_string()),
-            ]
-            .into(),
+            env,
             #[cfg(windows)]
             escape_args: false,
         };
@@ -383,6 +387,12 @@ impl TerminalPanel {
             .position(|(index, _)| *index == active)
             .unwrap_or(0);
         self.sessions = indexed.into_iter().map(|(_, session)| session).collect();
+    }
+
+    /// The index of the tab being shown.
+    pub fn shown_tab(&self) -> Option<usize> {
+        let group = self.sessions.get(self.active)?.group;
+        self.groups().iter().position(|g| *g == group)
     }
 
     /// Moves tab `from` to position `to`.

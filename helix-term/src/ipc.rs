@@ -494,6 +494,11 @@ otherwise the most recently started editor is used.";
     fn send(_request: &Value) -> anyhow::Result<Value> {
         anyhow::bail!("hx msg needs Unix sockets")
     }
+
+    /// Sends one request to the running editor and returns its response.
+    pub fn request(method: &str, params: Value) -> anyhow::Result<Value> {
+        send(&json!({ "id": 1, "method": method, "params": params }))
+    }
 }
 
 #[cfg(test)]
