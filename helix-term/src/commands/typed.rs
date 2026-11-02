@@ -3075,15 +3075,20 @@ fn explain(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "an unsaved buffer".into());
     let language = doc.language_name().unwrap_or("text").to_string();
+    let mut tools = vec!["otari_web_search"];
+    let mut prompt = crate::otari::EXPLAIN_PROMPT.to_string();
+    if language == "python" {
+        tools.push("otari_code_execution");
+        prompt.push_str(crate::otari::RUN_PROMPT);
+    }
     let messages = serde_json::json!([
-        { "role": "system", "content": crate::otari::EXPLAIN_PROMPT },
+        { "role": "system", "content": prompt },
         { "role": "user", "content": format!("{question}\n\nFrom {file} ({language}):\n\n```\n{code}\n```") },
     ]);
 
     cx.editor.set_status("Asking Otari…");
     let callback = async move {
-        let reply =
-            crate::otari::chat(crate::otari::LARGE_MODEL, messages, &["otari_web_search"]).await?;
+        let reply = crate::otari::chat(crate::otari::LARGE_MODEL, messages, &tools).await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, compositor: &mut Compositor| {
                 let status = format!("Answered by {} for ${:.6}", reply.by(), reply.cost_usd);

@@ -43,6 +43,13 @@ pub const EXPLAIN_PROMPT: &str = "Answer the user's question about the code from
      briefly, in Markdown. Search the web for the relevant official documentation before \
      answering, and link the pages you used.";
 
+/// Added to [`EXPLAIN_PROMPT`] for Python, the one language Otari's code sandbox runs.
+///
+/// Other languages get no sandbox: asked to run Rust, a model reported a made-up panic as the
+/// "real output" instead of the NaN the code returns.
+pub const RUN_PROMPT: &str = " When running the code would show what it does or confirm your \
+     answer, run it in the code sandbox and include the real output.";
+
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
 
