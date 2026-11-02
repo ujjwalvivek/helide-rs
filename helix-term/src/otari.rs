@@ -55,29 +55,44 @@ static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
 
 /// Requests on their way, for the status line's spinner.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
+/// When the first of the requests now on their way was sent, in milliseconds since the epoch.
+static SINCE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// While a request is on its way: a spinner frame and a phrase, both changing with time.
 pub fn waiting() -> Option<String> {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    const PHRASES: [&str; 8] = [
+    const PHRASES: [&str; 20] = [
         "Consulting the open weights",
         "Routing through Otari",
         "Warming up a few billion parameters",
         "Reading the docs so you don't have to",
         "Asking the guardrail first",
         "Counting tokens",
-        "Thinking in open weights",
         "Weighing the weights",
+        "Pondering",
+        "Noodling",
+        "Ruminating",
+        "Tokenizing",
+        "Mulling",
+        "Cogitating",
+        "Percolating",
+        "Hmming",
+        "Brewing",
+        "Untangling",
+        "Moseying",
+        "Scheming",
+        "Whirring",
     ];
     if PENDING.load(Ordering::Relaxed) == 0 {
         return None;
     }
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| time.as_millis() as usize);
-    let frame = FRAMES[ms / 80 % FRAMES.len()];
-    let phrase = PHRASES[ms / 2500 % PHRASES.len()];
-    Some(format!("{frame} {phrase}…"))
+        .map_or(0, |time| time.as_millis() as u64);
+    let frame = FRAMES[(ms / 80) as usize % FRAMES.len()];
+    let phrase = PHRASES[(ms / 2500) as usize % PHRASES.len()];
+    let waited = ms.saturating_sub(SINCE_MS.load(Ordering::Relaxed)) / 1000;
+    Some(format!("{frame} {phrase}… ({waited}s)"))
 }
 
 /// Counts a request as on its way until dropped, and keeps the status line redrawing meanwhile.
@@ -86,6 +101,10 @@ struct Pending;
 impl Pending {
     fn start() -> Self {
         if PENDING.fetch_add(1, Ordering::Relaxed) == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_millis() as u64);
+            SINCE_MS.store(now, Ordering::Relaxed);
             tokio::spawn(async {
                 while PENDING.load(Ordering::Relaxed) > 0 {
                     helix_event::request_redraw();
