@@ -69,6 +69,14 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
             append(&mut context.parts.left, span, base_style)
         });
     }
+    // At the end of the left side, where its changing width moves nothing else.
+    if let Some(waiting) = crate::otari::waiting() {
+        append(
+            &mut context.parts.left,
+            format!("  {waiting}").into(),
+            base_style,
+        );
+    }
 
     surface.set_spans(
         viewport.x,
@@ -602,9 +610,6 @@ fn render_otari_spend<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    if let Some(waiting) = crate::otari::waiting() {
-        write(context, format!(" {waiting} ").into())
-    }
     if let Some(spent) = crate::otari::spent() {
         write(context, format!(" ◦ ${spent:.4} ").into())
     }
