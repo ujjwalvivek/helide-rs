@@ -9,6 +9,7 @@ use helix_core::command_line::Token;
 use helix_core::diagnostic::DiagnosticProvider;
 use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
+use helix_core::secrets::{self, SecretFile};
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
@@ -151,6 +152,12 @@ pub struct Document {
     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
     /// Jump label overlays for each view.
     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
+    /// Whether the file holds secrets, judged by its name.
+    secret_file: Option<SecretFile>,
+    /// The secret values in the document, as sorted char ranges.
+    secret_ranges: Vec<std::ops::Range<usize>>,
+    /// One `•` per grapheme of `secret_ranges`, drawn over the text.
+    secret_masks: Vec<Overlay>,
     /// LSP document highlights for each view, stored as char ranges.
     pub(crate) document_highlights: HashMap<ViewId, DocumentHighlights>,
     /// LSP code action hints for each view.
@@ -768,6 +775,9 @@ impl Document {
             readonly: false,
             label: None,
             jump_labels: HashMap::new(),
+            secret_file: None,
+            secret_ranges: Vec::new(),
+            secret_masks: Vec::new(),
             document_highlights: HashMap::new(),
             code_action_hints: HashSet::new(),
             color_swatches: None,
@@ -1353,6 +1363,8 @@ impl Document {
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
         self.path = path;
+        self.secret_file = self.path.as_deref().and_then(secrets::classify);
+        self.update_secrets();
 
         self.detect_readonly();
         self.pickup_last_saved_time();
@@ -1621,6 +1633,8 @@ impl Document {
             }
             highlights.ranges = updated;
         }
+
+        self.update_secrets();
 
         helix_event::dispatch(DocumentDidChange {
             doc: self,
@@ -2433,6 +2447,63 @@ impl Document {
         self.jump_labels.remove(&view_id);
     }
 
+    /// Finds the secret values again. Only files that hold secrets (`.env`, keys) are scanned.
+    fn update_secrets(&mut self) {
+        use helix_core::unicode::segmentation::UnicodeSegmentation;
+
+        /// Larger files are not scanned: they are not hand-written `.env` files.
+        const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+        self.secret_ranges.clear();
+        self.secret_masks.clear();
+        let Some(kind) = self.secret_file else {
+            return;
+        };
+        if self.text.len_bytes() > MAX_BYTES {
+            return;
+        }
+        for (line_idx, line) in self.text.lines().enumerate() {
+            let line: Cow<str> = line.into();
+            let content = line.trim_end_matches(['\n', '\r']);
+            let Some(range) = secrets::line_secret(kind, content) else {
+                continue;
+            };
+            let line_start = self.text.line_to_char(line_idx);
+            let start = line_start + content[..range.start].chars().count();
+            let value = &content[range];
+            self.secret_ranges
+                .push(start..start + value.chars().count());
+            let mut char_idx = start;
+            for grapheme in value.graphemes(true) {
+                self.secret_masks.push(Overlay::new(char_idx, "•"));
+                char_idx += grapheme.chars().count();
+            }
+        }
+    }
+
+    /// The secret values drawn masked, sorted by position.
+    pub fn secret_masks(&self) -> &[Overlay] {
+        &self.secret_masks
+    }
+
+    /// The text of `range` (char indices), with secret values and well-known tokens replaced by
+    /// [`secrets::REDACTED`]. Use it for any text that leaves the editor.
+    pub fn redacted(&self, range: std::ops::Range<usize>) -> String {
+        let text = self.text.slice(..);
+        let mut out = String::new();
+        let mut pos = range.start;
+        for secret in &self.secret_ranges {
+            if secret.end <= range.start || secret.start >= range.end {
+                continue;
+            }
+            out.extend(text.slice(pos..secret.start.max(pos)).chunks());
+            out.push_str(secrets::REDACTED);
+            pos = secret.end.min(range.end);
+        }
+        out.extend(text.slice(pos..range.end).chunks());
+        secrets::redact_tokens(&out).into_owned()
+    }
+
     pub fn set_document_highlights(
         &mut self,
         view_id: ViewId,
@@ -2545,6 +2616,33 @@ mod test {
     use arc_swap::ArcSwap;
 
     use super::*;
+
+    #[test]
+    fn masks_and_redacts_secret_values() {
+        let mut doc = Document::from(
+            Rope::from("PORT=8080\nAPI_KEY=abcdé1\n"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        assert!(doc.secret_masks().is_empty());
+        doc.set_path(Some(Path::new("/tmp/app/.env")));
+        let masked: Vec<usize> = doc.secret_masks().iter().map(|m| m.char_idx).collect();
+        assert_eq!(masked, (18..24).collect::<Vec<_>>());
+        assert_eq!(
+            doc.redacted(0..doc.text().len_chars()),
+            "PORT=8080\nAPI_KEY=[REDACTED]\n"
+        );
+        assert_eq!(doc.redacted(20..22), "[REDACTED]");
+        assert_eq!(doc.redacted(0..9), "PORT=8080");
+
+        let view = ViewId::default();
+        doc.set_selection(view, Selection::single(0, 0));
+        let edit = Transaction::change(doc.text(), [(0, 0, Some("TOKEN=x1\n".into()))].into_iter());
+        doc.apply(&edit, view);
+        assert_eq!(doc.secret_masks()[0].char_idx, 6);
+        assert_eq!(doc.secret_masks().len(), 2 + 6);
+    }
 
     #[test]
     fn changeset_to_changes_ignore_line_endings() {
