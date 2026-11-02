@@ -18,7 +18,7 @@ address `jane.doe@example.com` are made up.
 | Command | What it does | Policy |
 |---|---|---|
 | `:rewrite <instruction>` | Rewrites every selection as instructed, in parallel, in place, as one undo step. Selections holding a secret are not sent. | `helide-fast` |
-| `:ask [question]` (or `:explain`) | Answers a question about the selection, or the cursor's line, in a popup. Searches the web for documentation, and for Python runs the code in Otari's sandbox. | `helide-deep` |
+| `:ask [question]` (or `:explain`) | Answers a question about the selection, or the cursor's line, in a popup, streaming it in as it is written. Searches the web for documentation, and for Python runs the code in Otari's sandbox. | `helide-deep` |
 | `m` in the git panel | Writes a one-line commit message for the staged changes, in the style of the recent subjects, and opens the commit prompt with it. | `helide-fast` |
 
 The status line shows what the session has spent, and every answer names the model that gave it.
