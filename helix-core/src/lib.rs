@@ -23,6 +23,7 @@ pub mod movement;
 pub mod object;
 mod position;
 pub mod search;
+pub mod secrets;
 pub mod selection;
 pub mod snippets;
 pub mod surround;
