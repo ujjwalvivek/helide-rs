@@ -22,8 +22,8 @@ const BASE_URL: &str = "https://eu.api.otari.ai/api/v1";
 /// Fast and cheap, for rewrites and commit messages: `deepseek/deepseek-v4.1-flash`, falling
 /// back to `mistralai/ministral-3-8b`.
 pub const SMALL_MODEL: &str = "helide-fast";
-/// For explanations, with web search: `openai/gpt-oss-120b`, falling back to
-/// `deepseek/deepseek-v4-pro`.
+/// For explanations, with web search: `alibaba/qwen-3.5-397b-a17b`, falling back to
+/// `z-ai/glm-5.2`.
 pub const LARGE_MODEL: &str = "helide-deep";
 
 /// The system prompt for rewriting a selection.
