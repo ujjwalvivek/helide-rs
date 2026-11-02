@@ -393,7 +393,7 @@ fn current_selection(editor: &Editor) -> Option<Value> {
     let selected: String = if is_empty {
         String::new()
     } else {
-        text.slice(from..to).to_string()
+        doc.redacted(from..to)
     };
     Some(json!({
         "success": true,

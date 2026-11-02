@@ -260,11 +260,8 @@ fn status(editor: &Editor) -> Value {
     let selection = doc.selection(view.id);
     let primary = selection.primary();
     let cursor = coords_at_pos(text, primary.cursor(text));
-    let selected: String = primary
-        .fragment(text)
-        .chars()
-        .take(MAX_SELECTION_CHARS)
-        .collect();
+    let to = primary.to().min(primary.from() + MAX_SELECTION_CHARS);
+    let selected = doc.redacted(primary.from()..to);
 
     let buffers: Vec<Value> = editor
         .documents()
