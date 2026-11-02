@@ -703,7 +703,6 @@ impl Default for StatusLineConfig {
                 E::Register,
                 E::Position,
                 E::FileEncoding,
-                E::OtariSpend,
             ],
             separator: String::from("│"),
             mode: ModeConfig::default(),
@@ -805,9 +804,6 @@ pub enum StatusLineElement {
 
     /// Indicator for when code actions are available
     CodeActionHint,
-
-    /// What this session spent on Otari, once anything was spent
-    OtariSpend,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs

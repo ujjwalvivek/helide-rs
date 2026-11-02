@@ -85,6 +85,10 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
             append(&mut context.parts.right, span, base_style)
         })
     }
+    // Not a configurable element, so a config that lists it still loads in other Helix builds.
+    render_otari_spend(context, |context, span| {
+        append(&mut context.parts.right, span, base_style)
+    });
 
     surface.set_spans(
         viewport.x
@@ -158,7 +162,6 @@ where
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
         helix_view::editor::StatusLineElement::CodeActionHint => render_code_action_hint,
-        helix_view::editor::StatusLineElement::OtariSpend => render_otari_spend,
     }
 }
 
