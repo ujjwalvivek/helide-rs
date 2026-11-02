@@ -15,10 +15,16 @@ use tokio::io::AsyncWriteExt;
 
 const BASE_URL: &str = "https://eu.api.otari.ai/api/v1";
 
-/// Fast and cheap, for short answers: commit messages, quick questions.
-pub const SMALL_MODEL: &str = "mistralai/ministral-3-8b";
-/// For rewrites and longer reasoning.
-pub const LARGE_MODEL: &str = "openai/gpt-oss-120b";
+// Both are Otari routing policies, set up in the workspace's Routing page: each tries its main
+// model and falls back to the next when that fails. Otari names the model that answered in the
+// response, so the status line can say which one it was.
+
+/// Fast and cheap, for rewrites and commit messages: `mistralai/ministral-3-8b`, falling back to
+/// `alibaba/qwen3-coder-30b-a3b-instruct`.
+pub const SMALL_MODEL: &str = "helide-fast";
+/// For explanations, with web search: `openai/gpt-oss-120b`, falling back to
+/// `deepseek/deepseek-v3.2`.
+pub const LARGE_MODEL: &str = "helide-deep";
 
 /// The system prompt for rewriting a selection.
 ///
@@ -50,6 +56,21 @@ pub fn spent() -> Option<f64> {
 pub struct Reply {
     pub text: String,
     pub cost_usd: f64,
+    /// The model that answered, without its vendor.
+    pub model: String,
+    /// Whether a routing policy's main model failed and a backup answered.
+    pub fell_back: bool,
+}
+
+impl Reply {
+    /// Who answered, for the status line: `ministral-3-8b`, or `deepseek-v3.2 (fallback)`.
+    pub fn by(&self) -> String {
+        if self.fell_back {
+            format!("{} (fallback)", self.model)
+        } else {
+            self.model.clone()
+        }
+    }
 }
 
 /// Sends one chat request and returns the answer's text. `tools` are Otari's hosted tools, such
@@ -81,7 +102,7 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
          header = \"Content-Type: application/json\"\n\
          data-binary = \"{}\"\n\
          max-time = 120\n\
-         write-out = \"\\n%{{http_code}}\"\n",
+         write-out = \"\\n%{{http_code}}\\t%header{{otari-model}}\\t%header{{otari-fallback}}\"\n",
         quote(&key),
         quote(&body),
     );
@@ -94,7 +115,12 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
         bail!("curl: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let (response, status) = stdout.rsplit_once('\n').unwrap_or(("", &stdout));
+    let (response, trailer) = stdout.rsplit_once('\n').unwrap_or(("", &stdout));
+    let mut trailer = trailer.split('\t');
+    let status = trailer.next().unwrap_or_default();
+    let model = trailer.next().unwrap_or_default();
+    let model = model.rsplit('/').next().unwrap_or(model).to_string();
+    let fell_back = trailer.next() == Some("true");
     let response: Value = serde_json::from_str(response)
         .with_context(|| format!("Otari answered {status} with no JSON"))?;
     if status != "200" {
@@ -108,7 +134,12 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
         .trim_end()
         .trim_start_matches(['\n', '\r'])
         .to_string();
-    Ok(Reply { text, cost_usd })
+    Ok(Reply {
+        text,
+        cost_usd,
+        model,
+        fell_back,
+    })
 }
 
 /// Adds a response's `usage.cost_usd` to the session's spend, and returns it.

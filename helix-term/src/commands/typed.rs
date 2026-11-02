@@ -2994,11 +2994,15 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
             let view = editor.tree.get_mut(view_id);
             let selection = doc.selection(view_id).clone();
             let mut cost = 0.0;
+            let mut by: Vec<String> = Vec::new();
             let mut ranges: Vec<Option<Range>> = vec![None; selection.len()];
             let mut changes = Vec::with_capacity(replies.len());
             let mut offset = 0isize;
             for (index, original, reply) in replies {
                 cost += reply.cost_usd;
+                if !by.contains(&reply.by()) {
+                    by.push(reply.by());
+                }
                 let range = selection.ranges()[index];
                 let mut output = crate::otari::strip_fences(&reply.text).to_string();
                 // Models tend to drop the first line's indent and the final line end.
@@ -3035,7 +3039,8 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
             } else {
                 String::new()
             };
-            editor.set_status(format!("Rewritten for ${cost:.6}{note} (u undoes)"));
+            let by = by.join(", ");
+            editor.set_status(format!("Rewritten by {by} for ${cost:.6}{note} (u undoes)"));
         }));
         Ok(call)
     };
@@ -3081,12 +3086,13 @@ fn explain(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
             crate::otari::chat(crate::otari::LARGE_MODEL, messages, &["otari_web_search"]).await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, compositor: &mut Compositor| {
+                let status = format!("Answered by {} for ${:.6}", reply.by(), reply.cost_usd);
                 let contents = ui::Markdown::new(reply.text, editor.syn_loader.clone());
                 let popup = Popup::new("explain", contents).position(Some(
                     helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
                 ));
                 compositor.replace_or_push("explain", popup);
-                editor.set_status(format!("Answered for ${:.6}", reply.cost_usd));
+                editor.set_status(status);
             },
         ));
         Ok(call)

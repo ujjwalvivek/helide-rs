@@ -1005,11 +1005,13 @@ impl GitPanel {
                     editor_view.git.busy = None;
                 }
                 match message {
-                    Ok((message, cost)) => {
+                    Ok((message, reply)) => {
                         let prompt = commit_prompt(false).with_line(message, editor);
                         compositor.push(Box::new(prompt));
                         editor.set_status(format!(
-                            "Written for ${cost:.6}: edit it, or Enter to commit"
+                            "Written by {} for ${:.6}: edit it, or Enter to commit",
+                            reply.by(),
+                            reply.cost_usd
                         ));
                     }
                     Err(err) => editor.set_error(err.to_string()),
@@ -1221,7 +1223,7 @@ fn commit_prompt(amend: bool) -> Prompt {
 /// Asks the small model for a one-line commit message for what is staged, in the style of the
 /// recent subjects. Files that hold secrets are named but not shown, and tokens in the rest are
 /// redacted. Returns the message and what it cost.
-async fn write_commit_message(repo: &Path) -> anyhow::Result<(String, f64)> {
+async fn write_commit_message(repo: &Path) -> anyhow::Result<(String, crate::otari::Reply)> {
     use helix_core::secrets;
 
     /// Enough diff for a message; the rest is cut.
@@ -1273,7 +1275,7 @@ async fn write_commit_message(repo: &Path) -> anyhow::Result<(String, f64)> {
         .unwrap_or_default()
         .to_string();
     anyhow::ensure!(!message.is_empty(), "Otari answered with no message");
-    Ok((message, reply.cost_usd))
+    Ok((message, reply))
 }
 
 fn args(list: &[&str]) -> Vec<String> {
