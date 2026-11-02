@@ -28,6 +28,10 @@ pub const REWRITE_PROMPT: &str = "Edit the code fragment as asked. It is part of
      file, so it may be incomplete; keep it that way and do not add or complete code. Reply with \
      the edited fragment only.";
 
+/// The system prompt for a commit message.
+pub const COMMIT_PROMPT: &str = "Write a one-line git commit message for the staged changes, \
+     under 72 characters, in the style of the recent subjects. Reply with the message only.";
+
 /// The system prompt for explaining code or answering a question about it.
 pub const EXPLAIN_PROMPT: &str = "Answer the user's question about the code from their editor, \
      briefly, in Markdown. Search the web for documentation when it helps, and name the pages \

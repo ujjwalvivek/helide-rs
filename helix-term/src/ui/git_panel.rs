@@ -662,6 +662,7 @@ impl GitPanel {
             KeyCode::Char('x') => return self.discard_prompt(),
             KeyCode::Char('c') => return self.commit_prompt(false, editor),
             KeyCode::Char('A') => return self.commit_prompt(true, editor),
+            KeyCode::Char('m') => self.suggest_commit_message(editor),
             KeyCode::Char('b') => self.branch_picker(),
             KeyCode::Char('B') => return self.new_branch_prompt(),
             KeyCode::Char('z') => return self.stash_prompt(),
@@ -685,7 +686,7 @@ impl GitPanel {
             KeyCode::Char('?') => editor.set_status(
                 "files: spc stage  l/h hunks  ⏎ diff  v/C-s split  o open  x discard  a all  \
                  hunks: spc stage  x discard  ⏎ jump  stashes: spc pop  ⏎ show  x drop  \
-                 c commit  A amend  b branch  B new branch  z stash  Z pop  P push  p pull  \
+                 c commit  m write message  A amend  b branch  B new branch  z stash  Z pop  P push  p pull  \
                  f fetch  R refresh  q hide",
             ),
             KeyCode::Char('q') => return GitAction::Hide,
@@ -966,23 +967,7 @@ impl GitPanel {
         if self.snapshot.repo.is_none() {
             return GitAction::None;
         }
-        let label = if amend { "amend: " } else { "commit: " };
-        let mut prompt = Prompt::new(
-            label.into(),
-            None,
-            completers::none,
-            move |cx, input, event| {
-                if event != PromptEvent::Validate || input.trim().is_empty() {
-                    return;
-                }
-                let mut list = vec!["commit"];
-                if amend {
-                    list.push("--amend");
-                }
-                list.extend(["--message", input]);
-                run_from_prompt(cx, args(&list), None, "committing", "Committed.", false);
-            },
-        );
+        let mut prompt = commit_prompt(amend);
         if amend {
             if let Some(last) = self
                 .snapshot
@@ -995,6 +980,43 @@ impl GitPanel {
             }
         }
         GitAction::Layer(Box::new(prompt))
+    }
+
+    /// `m`: has the small model write a commit message for the staged changes, then opens the
+    /// commit prompt with it, to edit or accept.
+    fn suggest_commit_message(&mut self, editor: &mut Editor) {
+        let Some(repo) = self.snapshot.repo.clone() else {
+            return;
+        };
+        if !self
+            .snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.section == Section::Staged)
+        {
+            editor.set_error("Nothing is staged");
+            return;
+        }
+        self.busy = Some("writing a commit message".to_string());
+        tokio::spawn(async move {
+            let message = write_commit_message(&repo).await;
+            crate::job::dispatch(move |editor, compositor| {
+                if let Some(editor_view) = compositor.find::<EditorView>() {
+                    editor_view.git.busy = None;
+                }
+                match message {
+                    Ok((message, cost)) => {
+                        let prompt = commit_prompt(false).with_line(message, editor);
+                        compositor.push(Box::new(prompt));
+                        editor.set_status(format!(
+                            "Written for ${cost:.6}: edit it, or Enter to commit"
+                        ));
+                    }
+                    Err(err) => editor.set_error(err.to_string()),
+                }
+            })
+            .await;
+        });
     }
 
     fn new_branch_prompt(&mut self) -> GitAction {
@@ -1173,6 +1195,85 @@ fn branch_picker(branches: Vec<Branch>) -> Picker<Branch, ()> {
             true,
         );
     })
+}
+
+/// The one-line prompt that commits (or amends) with what is typed.
+fn commit_prompt(amend: bool) -> Prompt {
+    let label = if amend { "amend: " } else { "commit: " };
+    Prompt::new(
+        label.into(),
+        None,
+        completers::none,
+        move |cx, input, event| {
+            if event != PromptEvent::Validate || input.trim().is_empty() {
+                return;
+            }
+            let mut list = vec!["commit"];
+            if amend {
+                list.push("--amend");
+            }
+            list.extend(["--message", input]);
+            run_from_prompt(cx, args(&list), None, "committing", "Committed.", false);
+        },
+    )
+}
+
+/// Asks the small model for a one-line commit message for what is staged, in the style of the
+/// recent subjects. Files that hold secrets are named but not shown, and tokens in the rest are
+/// redacted. Returns the message and what it cost.
+async fn write_commit_message(repo: &Path) -> anyhow::Result<(String, f64)> {
+    use helix_core::secrets;
+
+    /// Enough diff for a message; the rest is cut.
+    const MAX_DIFF: usize = 24_000;
+
+    let names = git(repo, &args(&["diff", "--cached", "--name-only"]), None).await?;
+    let (secret, shown): (Vec<&str>, Vec<&str>) = names
+        .stdout
+        .lines()
+        .partition(|name| secrets::classify(Path::new(name)).is_some());
+    let mut diff = String::new();
+    if !shown.is_empty() {
+        let mut list = args(&["diff", "--cached", "--no-color", "--"]);
+        list.extend(shown.iter().map(|name| name.to_string()));
+        diff = git(repo, &list, None).await?.stdout;
+    }
+    if diff.len() > MAX_DIFF {
+        let mut end = MAX_DIFF;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
+        diff.push_str("\n[diff cut]\n");
+    }
+    let diff = secrets::redact_tokens(&diff);
+    let recent = git(repo, &args(&["log", "-8", "--format=%s"]), None)
+        .await
+        .map(|out| out.stdout)
+        .unwrap_or_default();
+
+    let mut request =
+        format!("Recent commit subjects:\n{recent}\nStaged changes:\n```diff\n{diff}\n```");
+    if !secret.is_empty() {
+        request.push_str(&format!(
+            "\nAlso staged, contents not shown: {}\n",
+            secret.join(", ")
+        ));
+    }
+    let messages = serde_json::json!([
+        { "role": "system", "content": crate::otari::COMMIT_PROMPT },
+        { "role": "user", "content": request },
+    ]);
+    let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages, &[]).await?;
+    let message = reply
+        .text
+        .lines()
+        .map(|line| line.trim().trim_matches(['`', '"']).trim())
+        .find(|line| !line.is_empty() && !line.starts_with("```"))
+        .unwrap_or_default()
+        .to_string();
+    anyhow::ensure!(!message.is_empty(), "Otari answered with no message");
+    Ok((message, reply.cost_usd))
 }
 
 fn args(list: &[&str]) -> Vec<String> {
