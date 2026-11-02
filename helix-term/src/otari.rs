@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const BASE_URL: &str = "https://eu.api.otari.ai/api/v1";
 
@@ -153,6 +153,26 @@ impl Reply {
 /// Sends one chat request and returns the answer's text. `tools` are Otari's hosted tools, such
 /// as `otari_web_search`, which run on Otari's side within the request.
 pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Result<Reply> {
+    chat_with(model, messages, tools, None).await
+}
+
+/// Like [`chat`], but the answer streams in: `on_text` gets the text so far as it arrives, at most
+/// every 100 milliseconds, and once more when it is complete.
+pub async fn chat_streaming(
+    model: &str,
+    messages: Value,
+    tools: &[&str],
+    on_text: impl Fn(&str) + Send + Sync,
+) -> anyhow::Result<Reply> {
+    chat_with(model, messages, tools, Some(&on_text)).await
+}
+
+async fn chat_with(
+    model: &str,
+    messages: Value,
+    tools: &[&str],
+    on_text: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> anyhow::Result<Reply> {
     let model_asked = model;
     let _pending = Pending::start();
     let key = std::env::var("OTARI_API_KEY")
@@ -163,6 +183,10 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
     if !tools.is_empty() {
         let tools: Vec<Value> = tools.iter().map(|tool| json!({ "type": tool })).collect();
         body["tools"] = tools.into();
+    }
+    if on_text.is_some() {
+        body["stream"] = true.into();
+        body["stream_options"] = json!({ "include_usage": true });
     }
     let body = body.to_string();
     let base = std::env::var("OTARI_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string());
@@ -181,6 +205,7 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
          header = \"Content-Type: application/json\"\n\
          data-binary = \"{}\"\n\
          max-time = 120\n\
+         no-buffer\n\
          write-out = \"\\n%{{http_code}}\\t%header{{otari-model}}\\t%header{{otari-fallback}}\\t%header{{otari-request-id}}\"\n",
         quote(&key),
         quote(&body),
@@ -189,20 +214,57 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
     stdin.write_all(config.as_bytes()).await?;
     drop(stdin);
 
+    // A streamed answer comes as `data: {chunk}` lines. Everything else, a whole answer, an error,
+    // and the trailer curl writes last, is kept for after.
+    let mut lines =
+        tokio::io::BufReader::new(child.stdout.take().context("curl has no output")?).lines();
+    let (mut answer, mut usage, mut rest) = (String::new(), Value::Null, String::new());
+    let mut shown = std::time::Instant::now();
+    while let Some(line) = lines.next_line().await? {
+        match (line.strip_prefix("data: "), on_text) {
+            (Some("[DONE]"), Some(_)) => {}
+            (Some(data), Some(on_text)) => {
+                let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
+                    answer.push_str(text);
+                }
+                if chunk["usage"].is_object() {
+                    usage = chunk["usage"].clone();
+                }
+                let text = answer.trim_start_matches(['\n', '\r']);
+                if !text.is_empty() && shown.elapsed() >= std::time::Duration::from_millis(100) {
+                    on_text(text);
+                    shown = std::time::Instant::now();
+                }
+            }
+            _ => {
+                rest.push_str(&line);
+                rest.push('\n');
+            }
+        }
+    }
     let output = child.wait_with_output().await?;
     if !output.status.success() {
         bail!("curl: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (response, trailer) = stdout.rsplit_once('\n').unwrap_or(("", &stdout));
+    let stdout = rest.trim_end_matches('\n');
+    let (response, trailer) = stdout.rsplit_once('\n').unwrap_or(("", stdout));
     let mut trailer = trailer.split('\t');
     let status = trailer.next().unwrap_or_default();
     let model = trailer.next().unwrap_or_default();
     let model = model.rsplit('/').next().unwrap_or(model).to_string();
     let fell_back = trailer.next() == Some("true");
     let request_id = trailer.next().unwrap_or_default();
-    let response: Value = serde_json::from_str(response)
-        .with_context(|| format!("Otari answered {status} with no JSON"))?;
+    let response: Value = match on_text {
+        Some(on_text) if status == "200" => {
+            on_text(answer.trim_start_matches(['\n', '\r']));
+            json!({ "choices": [{ "message": { "content": answer } }], "usage": usage })
+        }
+        _ => serde_json::from_str(response)
+            .with_context(|| format!("Otari answered {status} with no JSON"))?,
+    };
     log(json!({
         "time": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -3086,16 +3086,36 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
         { "role": "user", "content": format!("{question}\n\nFrom {file} ({language}):\n\n```\n{code}\n```") },
     ]);
 
+    // The answer streams into the popup as it is written. `opened` tells a popup the user closed
+    // from one not yet opened, so a closed one stays closed.
+    let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn({
+        let opened = opened.clone();
+        async move {
+            while let Some(text) = rx.recv().await {
+                let opened = opened.clone();
+                job::dispatch(move |editor, compositor| {
+                    show_answer(editor, compositor, text, &opened)
+                })
+                .await;
+            }
+        }
+    });
     let callback = async move {
-        let reply = crate::otari::chat(crate::otari::LARGE_MODEL, messages, &tools).await?;
+        let reply = crate::otari::chat_streaming(
+            crate::otari::LARGE_MODEL,
+            messages,
+            &tools,
+            move |text| {
+                let _ = tx.send(text.to_string());
+            },
+        )
+        .await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, compositor: &mut Compositor| {
                 let status = format!("Answered by {} for ${:.6}", reply.by(), reply.cost_usd);
-                let contents = ui::Markdown::new(reply.text, editor.syn_loader.clone());
-                let popup = Popup::new("explain", contents).position(Some(
-                    helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
-                ));
-                compositor.replace_or_push("explain", popup);
+                show_answer(editor, compositor, reply.text, &opened);
                 editor.set_status(status);
             },
         ));
@@ -3104,6 +3124,29 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
     cx.jobs.callback(callback);
 
     Ok(())
+}
+
+/// Shows `:ask`'s answer so far: in its popup if that is open, in a new one if none was opened yet,
+/// and nowhere if the user closed it.
+fn show_answer(
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    text: String,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    if let Some(popup) = compositor.find_id::<Popup<ui::Markdown>>("explain") {
+        popup.contents_mut().set_contents(text);
+        return;
+    }
+    if opened.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let contents = ui::Markdown::new(text, editor.syn_loader.clone());
+    let popup = Popup::new("explain", contents).position(Some(helix_core::Position::new(
+        editor.cursor().0.unwrap_or_default().row,
+        2,
+    )));
+    compositor.replace_or_push("explain", popup);
 }
 
 fn reset_diff_change(
