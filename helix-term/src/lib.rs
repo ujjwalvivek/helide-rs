@@ -14,6 +14,7 @@ pub mod job;
 pub mod keymap;
 pub mod logging;
 pub mod mcp;
+pub mod otari;
 pub mod ui;
 pub mod watch;
 

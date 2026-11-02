@@ -2927,6 +2927,33 @@ fn run_shell_command(
     Ok(())
 }
 
+fn otari(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let question = args.join(" ");
+    let messages = serde_json::json!([{ "role": "user", "content": question }]);
+    cx.editor.set_status("Asking Otari…");
+    let callback = async move {
+        let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages).await?;
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                let contents = ui::Markdown::new(reply.text, editor.syn_loader.clone());
+                let popup = Popup::new("otari", contents).position(Some(
+                    helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
+                ));
+                compositor.replace_or_push("otari", popup);
+                editor.set_status(format!("Otari answered for ${:.6}", reply.cost_usd));
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -4350,6 +4377,18 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "otari",
+        aliases: &[],
+        doc: "Ask a question of a small open-weight model through Otari.",
+        fun: otari,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, None),
+            raw_after: Some(0),
             ..Signature::DEFAULT
         },
     },
