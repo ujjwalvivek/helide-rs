@@ -24,8 +24,9 @@ pub const LARGE_MODEL: &str = "openai/gpt-oss-120b";
 ///
 /// Kept short and plain: longer prompts full of "follow the instruction" read as prompt injection
 /// to guardrails such as Lakera's, which then block the request.
-pub const REWRITE_PROMPT: &str =
-    "Rewrite the code the user gives, as they ask. Reply with the rewritten code only.";
+pub const REWRITE_PROMPT: &str = "Edit the code fragment as asked. It is part of a larger \
+     file, so it may be incomplete; keep it that way and do not add or complete code. Reply with \
+     the edited fragment only.";
 
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
@@ -115,8 +116,17 @@ pub fn strip_fences(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("```") else {
         return text;
     };
-    let Some((_, body)) = rest.split_once('\n') else {
+    let Some((tag, body)) = rest.split_once('\n') else {
         return text;
+    };
+    // A language tag after the fence, or code that started on the fence's own line.
+    let body = if tag
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "+-_#.".contains(c))
+    {
+        body
+    } else {
+        rest
     };
     body.trim_end()
         .strip_suffix("```")
