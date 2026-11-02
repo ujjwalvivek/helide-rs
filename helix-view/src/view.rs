@@ -467,6 +467,28 @@ impl View {
             text_annotations.add_overlay(labels, style);
         }
 
+        // Secret values are drawn as `•`, except on the cursor's line, so a value can be read or
+        // edited by moving onto it.
+        let masks = doc.secret_masks();
+        if !masks.is_empty() {
+            let text = doc.text().slice(..);
+            let (start, end) = match doc.selections().get(&self.id) {
+                Some(selection) => {
+                    let line = text.char_to_line(selection.primary().cursor(text));
+                    (text.line_to_char(line), text.line_to_char(line + 1))
+                }
+                None => (0, 0),
+            };
+            let before = masks.partition_point(|mask| mask.char_idx < start);
+            let after = masks.partition_point(|mask| mask.char_idx < end);
+            let style = theme.and_then(|t| {
+                t.find_highlight("ui.virtual.secret")
+                    .or_else(|| t.find_highlight("comment"))
+            });
+            text_annotations.add_overlay(&masks[..before], style);
+            text_annotations.add_overlay(&masks[after..], style);
+        }
+
         if let Some(DocumentInlayHints {
             id: _,
             type_inlay_hints,
