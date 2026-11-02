@@ -19,11 +19,11 @@ const BASE_URL: &str = "https://eu.api.otari.ai/api/v1";
 // model and falls back to the next when that fails. Otari names the model that answered in the
 // response, so the status line can say which one it was.
 
-/// Fast and cheap, for rewrites and commit messages: `mistralai/ministral-3-8b`, falling back to
-/// `alibaba/qwen3-coder-30b-a3b-instruct`.
+/// Fast and cheap, for rewrites and commit messages: `deepseek/deepseek-v4.1-flash`, falling
+/// back to `mistralai/ministral-3-8b`.
 pub const SMALL_MODEL: &str = "helide-fast";
 /// For explanations, with web search: `openai/gpt-oss-120b`, falling back to
-/// `deepseek/deepseek-v3.2`.
+/// `deepseek/deepseek-v4-pro`.
 pub const LARGE_MODEL: &str = "helide-deep";
 
 /// The system prompt for rewriting a selection.
@@ -40,8 +40,8 @@ pub const COMMIT_PROMPT: &str = "Write a one-line git commit message for the sta
 
 /// The system prompt for explaining code or answering a question about it.
 pub const EXPLAIN_PROMPT: &str = "Answer the user's question about the code from their editor, \
-     briefly, in Markdown. Search the web for documentation when it helps, and name the pages \
-     you used.";
+     briefly, in Markdown. Search the web for the relevant official documentation before \
+     answering, and link the pages you used.";
 
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
