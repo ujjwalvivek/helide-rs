@@ -2964,18 +2964,17 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
         if count == 1 { "" } else { "s" }
     ));
     let callback = async move {
-        let replies =
-            futures_util::future::try_join_all(asks.into_iter().map(|(index, text)| {
-                let messages = serde_json::json!([
-                    { "role": "system", "content": crate::otari::REWRITE_PROMPT },
-                    { "role": "user", "content": format!("Instruction: {instruction}\n\nText:\n{text}") },
-                ]);
-                async move {
-                    let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages).await?;
-                    anyhow::Ok((index, text, reply))
-                }
-            }))
-            .await?;
+        let replies = futures_util::future::try_join_all(asks.into_iter().map(|(index, text)| {
+            let messages = serde_json::json!([
+                { "role": "system", "content": crate::otari::REWRITE_PROMPT },
+                { "role": "user", "content": format!("{instruction}\n\n```\n{text}\n```") },
+            ]);
+            async move {
+                let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages).await?;
+                anyhow::Ok((index, text, reply))
+            }
+        }))
+        .await?;
         let call: job::Callback = Callback::Editor(Box::new(move |editor: &mut Editor| {
             let Some(doc) = editor.documents.get_mut(&doc_id) else {
                 return;

@@ -21,9 +21,11 @@ pub const SMALL_MODEL: &str = "mistralai/ministral-3-8b";
 pub const LARGE_MODEL: &str = "openai/gpt-oss-120b";
 
 /// The system prompt for rewriting a selection.
-pub const REWRITE_PROMPT: &str = "You rewrite text inside a code editor. Follow the instruction \
-     and reply with the rewritten text only: no explanation, no code fences, nothing before or \
-     after it. Keep the original indentation and style unless the instruction says otherwise.";
+///
+/// Kept short and plain: longer prompts full of "follow the instruction" read as prompt injection
+/// to guardrails such as Lakera's, which then block the request.
+pub const REWRITE_PROMPT: &str =
+    "Rewrite the code the user gives, as they ask. Reply with the rewritten code only.";
 
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
@@ -80,11 +82,7 @@ pub async fn chat(model: &str, messages: Value) -> anyhow::Result<Reply> {
     let response: Value = serde_json::from_str(response)
         .with_context(|| format!("Otari answered {status} with no JSON"))?;
     if status != "200" {
-        let detail = response["detail"]
-            .as_str()
-            .or(response["error"]["message"].as_str())
-            .unwrap_or("request failed");
-        bail!("Otari {status}: {detail}");
+        bail!("{}", refusal(status, &response));
     }
 
     let cost_usd = add_cost(&response);
@@ -124,4 +122,26 @@ pub fn strip_fences(text: &str) -> &str {
         .strip_suffix("```")
         .unwrap_or(body)
         .trim_end_matches('\n')
+}
+
+/// Why Otari refused a request, in words: a guardrail, the budget, or its own message.
+fn refusal(status: &str, response: &Value) -> String {
+    let detail = &response["detail"];
+    match detail["code"].as_str() {
+        Some("guardrail_violation") => {
+            let guardrail = detail["guardrails"][0]["profile"]
+                .as_str()
+                .unwrap_or("a guardrail");
+            format!("Blocked by Otari's {guardrail} guardrail, so nothing was sent to the model")
+        }
+        Some("budget_exceeded") => "Otari budget used up until it resets".to_string(),
+        _ => {
+            let message = detail
+                .as_str()
+                .or(detail["message"].as_str())
+                .or(response["error"]["message"].as_str())
+                .unwrap_or("request failed");
+            format!("Otari {status}: {message}")
+        }
+    }
 }
