@@ -83,11 +83,12 @@ impl Reply {
 /// Sends one chat request and returns the answer's text. `tools` are Otari's hosted tools, such
 /// as `otari_web_search`, which run on Otari's side within the request.
 pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Result<Reply> {
+    let model_asked = model;
     let key = std::env::var("OTARI_API_KEY")
         .ok()
         .filter(|key| !key.is_empty())
         .context("OTARI_API_KEY is not set")?;
-    let mut body = json!({ "model": model, "messages": messages });
+    let mut body = json!({ "model": model, "messages": &messages });
     if !tools.is_empty() {
         let tools: Vec<Value> = tools.iter().map(|tool| json!({ "type": tool })).collect();
         body["tools"] = tools.into();
@@ -109,7 +110,7 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
          header = \"Content-Type: application/json\"\n\
          data-binary = \"{}\"\n\
          max-time = 120\n\
-         write-out = \"\\n%{{http_code}}\\t%header{{otari-model}}\\t%header{{otari-fallback}}\"\n",
+         write-out = \"\\n%{{http_code}}\\t%header{{otari-model}}\\t%header{{otari-fallback}}\\t%header{{otari-request-id}}\"\n",
         quote(&key),
         quote(&body),
     );
@@ -128,8 +129,24 @@ pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Resul
     let model = trailer.next().unwrap_or_default();
     let model = model.rsplit('/').next().unwrap_or(model).to_string();
     let fell_back = trailer.next() == Some("true");
+    let request_id = trailer.next().unwrap_or_default();
     let response: Value = serde_json::from_str(response)
         .with_context(|| format!("Otari answered {status} with no JSON"))?;
+    log(json!({
+        "time": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.as_secs()),
+        "policy": model_asked,
+        "tools": tools,
+        "status": status,
+        "request_id": request_id,
+        "answered_by": &model,
+        "fell_back": fell_back,
+        "cost_usd": response["usage"]["cost_usd"],
+        "messages": messages,
+        "reply": response["choices"][0]["message"]["content"],
+        "refusal": response["detail"],
+    }));
     if status != "200" {
         bail!("{}", refusal(status, &response));
     }
@@ -206,5 +223,22 @@ fn refusal(status: &str, response: &Value) -> String {
                 .unwrap_or("request failed");
             format!("Otari {status}: {message}")
         }
+    }
+}
+
+/// Appends one exchange, as a line of JSON, to the file `$HELIDE_OTARI_LOG` names, if it is set.
+/// The messages are what was sent, so secrets in them were already redacted.
+fn log(entry: Value) {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("HELIDE_OTARI_LOG") else {
+        return;
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+    if let Ok(mut file) = file {
+        let _ = writeln!(file, "{entry}");
     }
 }
