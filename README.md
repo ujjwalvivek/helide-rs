@@ -30,6 +30,11 @@ All shortcuts/keymaps can be found [in the documentation on the website](https:/
 
 [Troubleshooting](https://github.com/helix-editor/helix/wiki/Troubleshooting)
 
+> **helide-rs × Otari:** this branch adds `:ask`, `:explain` and commit messages written by
+> open-weight models through [Otari](https://otari.ai), with secrets masked and redacted before
+> anything leaves the editor. See [docs/otari](./docs/otari/README.md) for how it works and the
+> results of real calls.
+
 # Features
 
 - Vim-like modal editing
