@@ -2927,26 +2927,110 @@ fn run_shell_command(
     Ok(())
 }
 
-fn otari(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
-    let question = args.join(" ");
-    let messages = serde_json::json!([{ "role": "user", "content": question }]);
-    cx.editor.set_status("Asking Otari…");
+    let instruction = args.join(" ");
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id).clone();
+    if selection.ranges().iter().all(|range| range.len() <= 1) {
+        bail!("Select the text to rewrite first, e.g. x for the line");
+    }
+
+    // Selections holding a secret are left alone: their redacted text could only come back
+    // with the secret lost.
+    let mut asks = Vec::new();
+    let mut skipped = 0;
+    for (index, range) in selection.ranges().iter().enumerate() {
+        let original = range.fragment(text);
+        let redacted = doc.redacted(range.from()..range.to());
+        if redacted == original {
+            asks.push((index, redacted));
+        } else {
+            skipped += 1;
+        }
+    }
+    if asks.is_empty() {
+        bail!("Every selection holds a secret, so nothing was sent");
+    }
+
+    let (doc_id, view_id, version) = (doc.id(), view.id, doc.version());
+    let count = asks.len();
+    cx.editor.set_status(format!(
+        "Asking Otari to rewrite {count} selection{}…",
+        if count == 1 { "" } else { "s" }
+    ));
     let callback = async move {
-        let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages).await?;
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                let contents = ui::Markdown::new(reply.text, editor.syn_loader.clone());
-                let popup = Popup::new("otari", contents).position(Some(
-                    helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
-                ));
-                compositor.replace_or_push("otari", popup);
-                editor.set_status(format!("Otari answered for ${:.6}", reply.cost_usd));
-            },
-        ));
+        let replies =
+            futures_util::future::try_join_all(asks.into_iter().map(|(index, text)| {
+                let messages = serde_json::json!([
+                    { "role": "system", "content": crate::otari::REWRITE_PROMPT },
+                    { "role": "user", "content": format!("Instruction: {instruction}\n\nText:\n{text}") },
+                ]);
+                async move {
+                    let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages).await?;
+                    anyhow::Ok((index, text, reply))
+                }
+            }))
+            .await?;
+        let call: job::Callback = Callback::Editor(Box::new(move |editor: &mut Editor| {
+            let Some(doc) = editor.documents.get_mut(&doc_id) else {
+                return;
+            };
+            if doc.version() != version || !editor.tree.contains(view_id) {
+                editor
+                    .set_error("The file changed while Otari was answering; nothing was replaced");
+                return;
+            }
+            let view = editor.tree.get_mut(view_id);
+            let selection = doc.selection(view_id).clone();
+            let mut cost = 0.0;
+            let mut ranges: Vec<Option<Range>> = vec![None; selection.len()];
+            let mut changes = Vec::with_capacity(replies.len());
+            let mut offset = 0isize;
+            for (index, original, reply) in replies {
+                cost += reply.cost_usd;
+                let range = selection.ranges()[index];
+                let mut output = crate::otari::strip_fences(&reply.text).to_string();
+                // Models tend to drop the first line's indent and the final line end.
+                let indent = &original[..original.len() - original.trim_start().len()];
+                if !output.starts_with(char::is_whitespace) && !indent.contains('\n') {
+                    output.insert_str(0, indent);
+                }
+                if original.ends_with('\n') && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                let len = output.chars().count();
+                let from = range
+                    .from()
+                    .checked_add_signed(offset)
+                    .unwrap_or(range.from());
+                ranges[index] =
+                    Some(Range::new(from, from + len).with_direction(range.direction()));
+                offset += len as isize - range.len() as isize;
+                changes.push((range.from(), range.to(), Some(output.into())));
+            }
+            // Ranges not sent keep their place, shifted by the replacements before them.
+            let transaction = Transaction::change(doc.text(), changes.into_iter());
+            let ranges: Vec<Range> = ranges
+                .into_iter()
+                .zip(selection.ranges())
+                .map(|(new, old)| new.unwrap_or_else(|| old.map(transaction.changes())))
+                .collect();
+            let transaction = transaction
+                .with_selection(Selection::new(ranges.into(), selection.primary_index()));
+            doc.apply(&transaction, view_id);
+            doc.append_changes_to_history(view);
+            let note = if skipped > 0 {
+                format!(", {skipped} holding secrets left alone")
+            } else {
+                String::new()
+            };
+            editor.set_status(format!("Rewritten for ${cost:.6}{note} (u undoes)"));
+        }));
         Ok(call)
     };
     cx.jobs.callback(callback);
@@ -4381,10 +4465,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "otari",
+        name: "ask",
         aliases: &[],
-        doc: "Ask a question of a small open-weight model through Otari.",
-        fun: otari,
+        doc: "Rewrite each selection as instructed, with a small open-weight model through Otari.",
+        fun: ask,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, None),

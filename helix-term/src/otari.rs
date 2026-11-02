@@ -20,6 +20,11 @@ pub const SMALL_MODEL: &str = "mistralai/ministral-3-8b";
 /// For rewrites and longer reasoning.
 pub const LARGE_MODEL: &str = "openai/gpt-oss-120b";
 
+/// The system prompt for rewriting a selection.
+pub const REWRITE_PROMPT: &str = "You rewrite text inside a code editor. Follow the instruction \
+     and reply with the rewritten text only: no explanation, no code fences, nothing before or \
+     after it. Keep the original indentation and style unless the instruction says otherwise.";
+
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
 
@@ -86,7 +91,8 @@ pub async fn chat(model: &str, messages: Value) -> anyhow::Result<Reply> {
     let text = response["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
-        .trim()
+        .trim_end()
+        .trim_start_matches(['\n', '\r'])
         .to_string();
     Ok(Reply { text, cost_usd })
 }
@@ -104,4 +110,18 @@ fn add_cost(response: &Value) -> f64 {
 /// Escapes a value for a double-quoted string in a curl config file.
 fn quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The text inside a reply wrapped in one code fence, which models add despite being asked not to.
+pub fn strip_fences(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some((_, body)) = rest.split_once('\n') else {
+        return text;
+    };
+    body.trim_end()
+        .strip_suffix("```")
+        .unwrap_or(body)
+        .trim_end_matches('\n')
 }
