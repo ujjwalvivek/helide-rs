@@ -2957,6 +2957,13 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
         bail!("Every selection holds a secret, so nothing was sent");
     }
 
+    // Without the language the model guesses, and a lone comment line turns into Python.
+    let file = doc
+        .path()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "an unsaved buffer".into());
+    let language = doc.language_name().unwrap_or("text").to_string();
     let (doc_id, view_id, version) = (doc.id(), view.id, doc.version());
     let count = asks.len();
     cx.editor.set_status(format!(
@@ -2967,7 +2974,7 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
         let replies = futures_util::future::try_join_all(asks.into_iter().map(|(index, text)| {
             let messages = serde_json::json!([
                 { "role": "system", "content": crate::otari::REWRITE_PROMPT },
-                { "role": "user", "content": format!("{instruction}\n\n```\n{text}\n```") },
+                { "role": "user", "content": format!("{instruction}\n\nFrom {file} ({language}):\n\n```{language}\n{text}\n```") },
             ]);
             async move {
                 let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages, &[]).await?;
