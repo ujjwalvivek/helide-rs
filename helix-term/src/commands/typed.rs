@@ -2927,7 +2927,7 @@ fn run_shell_command(
     Ok(())
 }
 
-fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+fn rewrite(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -3049,7 +3049,7 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
     Ok(())
 }
 
-fn explain(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
@@ -3086,7 +3086,6 @@ fn explain(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
         { "role": "user", "content": format!("{question}\n\nFrom {file} ({language}):\n\n```\n{code}\n```") },
     ]);
 
-    cx.editor.set_status("Asking Otari…");
     let callback = async move {
         let reply = crate::otari::chat(crate::otari::LARGE_MODEL, messages, &tools).await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
@@ -4534,10 +4533,10 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "ask",
+        name: "rewrite",
         aliases: &[],
         doc: "Rewrite each selection as instructed, with a small open-weight model through Otari.",
-        fun: ask,
+        fun: rewrite,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, None),
@@ -4546,11 +4545,11 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
-        name: "explain",
-        aliases: &[],
-        doc: "Answer a question about the selection (or the cursor's line) with a larger \
-              open-weight model that can search the web, through Otari.",
-        fun: explain,
+        name: "ask",
+        aliases: &["explain"],
+        doc: "Answer a question about the selection (or the cursor's line) in a popup, without \
+              editing, with a larger open-weight model that can search the web, through Otari.",
+        fun: ask,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),

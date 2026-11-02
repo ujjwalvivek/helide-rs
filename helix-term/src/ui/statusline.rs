@@ -602,6 +602,9 @@ fn render_otari_spend<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
+    if let Some(waiting) = crate::otari::waiting() {
+        write(context, format!(" {waiting} ").into())
+    }
     if let Some(spent) = crate::otari::spent() {
         write(context, format!(" ◦ ${spent:.4} ").into())
     }

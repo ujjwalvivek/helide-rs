@@ -967,7 +967,7 @@ impl GitPanel {
         if self.snapshot.repo.is_none() {
             return GitAction::None;
         }
-        let mut prompt = commit_prompt(amend);
+        let mut prompt = commit_prompt(amend, None);
         if amend {
             if let Some(last) = self
                 .snapshot
@@ -1006,13 +1006,10 @@ impl GitPanel {
                 }
                 match message {
                     Ok((message, reply)) => {
-                        let prompt = commit_prompt(false).with_line(message, editor);
+                        // The prompt hides the status line, so who wrote it goes in its label.
+                        let label = format!("commit ({}, ${:.6}): ", reply.by(), reply.cost_usd);
+                        let prompt = commit_prompt(false, Some(label)).with_line(message, editor);
                         compositor.push(Box::new(prompt));
-                        editor.set_status(format!(
-                            "Written by {} for ${:.6}: edit it, or Enter to commit",
-                            reply.by(),
-                            reply.cost_usd
-                        ));
                     }
                     Err(err) => editor.set_error(err.to_string()),
                 }
@@ -1199,9 +1196,9 @@ fn branch_picker(branches: Vec<Branch>) -> Picker<Branch, ()> {
     })
 }
 
-/// The one-line prompt that commits (or amends) with what is typed.
-fn commit_prompt(amend: bool) -> Prompt {
-    let label = if amend { "amend: " } else { "commit: " };
+/// The one-line prompt that commits (or amends) with what is typed, labelled `label` if given.
+fn commit_prompt(amend: bool, label: Option<String>) -> Prompt {
+    let label = label.unwrap_or_else(|| if amend { "amend: " } else { "commit: " }.to_string());
     Prompt::new(
         label.into(),
         None,

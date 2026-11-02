@@ -6,7 +6,7 @@
 
 use std::{
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use anyhow::{bail, Context};
@@ -53,6 +53,57 @@ pub const RUN_PROMPT: &str = " When running the code would show what it does or 
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
 
+/// Requests on their way, for the status line's spinner.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// While a request is on its way: a spinner frame and a phrase, both changing with time.
+pub fn waiting() -> Option<String> {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const PHRASES: [&str; 8] = [
+        "Consulting the open weights",
+        "Routing through Otari",
+        "Warming up a few billion parameters",
+        "Reading the docs so you don't have to",
+        "Asking the guardrail first",
+        "Counting tokens",
+        "Thinking in open weights",
+        "Weighing the weights",
+    ];
+    if PENDING.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis() as usize);
+    let frame = FRAMES[ms / 80 % FRAMES.len()];
+    let phrase = PHRASES[ms / 2500 % PHRASES.len()];
+    Some(format!("{frame} {phrase}…"))
+}
+
+/// Counts a request as on its way until dropped, and keeps the status line redrawing meanwhile.
+struct Pending;
+
+impl Pending {
+    fn start() -> Self {
+        if PENDING.fetch_add(1, Ordering::Relaxed) == 0 {
+            tokio::spawn(async {
+                while PENDING.load(Ordering::Relaxed) > 0 {
+                    helix_event::request_redraw();
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                }
+                helix_event::request_redraw();
+            });
+        }
+        Pending
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// What this session spent so far, in dollars, once anything was spent.
 pub fn spent() -> Option<f64> {
     let micro = SPENT_MICRO_USD.load(Ordering::Relaxed);
@@ -84,6 +135,7 @@ impl Reply {
 /// as `otari_web_search`, which run on Otari's side within the request.
 pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Result<Reply> {
     let model_asked = model;
+    let _pending = Pending::start();
     let key = std::env::var("OTARI_API_KEY")
         .ok()
         .filter(|key| !key.is_empty())
