@@ -749,6 +749,7 @@ impl Application {
             "'{}' written, {lines}L {size}",
             get_relative_path(&doc_save_event.path).to_string_lossy(),
         ));
+        warn_of_secrets(doc_save_event.path, doc_save_event.text);
     }
 
     #[inline(always)]
@@ -1465,4 +1466,37 @@ impl ui::menu::Item for lsp::MessageActionItem {
     fn format(&self, _data: &Self::Data) -> tui::widgets::Row<'_> {
         self.title.as_str().into()
     }
+}
+
+/// After a save, warns when a file that is not masked as a secret file holds what looks like a
+/// token or private key, unless Git ignores the file, since then it won't be committed.
+fn warn_of_secrets(path: std::path::PathBuf, text: helix_core::Rope) {
+    use helix_core::secrets;
+
+    if secrets::classify(&path).is_some() || text.len_bytes() > 4 * 1024 * 1024 {
+        return;
+    }
+    tokio::spawn(async move {
+        let Some((kind, line)) = secrets::find_token(&text.to_string()) else {
+            return;
+        };
+        let ignored = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(path.parent().unwrap_or(&path))
+            .args(["check-ignore", "-q", "--"])
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        if ignored {
+            return;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let message =
+            format!("Possible {kind} on line {line}. Keep secrets in .env, not in {name}.");
+        crate::job::dispatch(move |editor, _| editor.set_warning(message)).await;
+    });
 }
