@@ -2970,7 +2970,7 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
                 { "role": "user", "content": format!("{instruction}\n\n```\n{text}\n```") },
             ]);
             async move {
-                let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages).await?;
+                let reply = crate::otari::chat(crate::otari::SMALL_MODEL, messages, &[]).await?;
                 anyhow::Ok((index, text, reply))
             }
         }))
@@ -3030,6 +3030,58 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
             };
             editor.set_status(format!("Rewritten for ${cost:.6}{note} (u undoes)"));
         }));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn explain(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current_ref!(cx.editor);
+    let range = doc.selection(view.id).primary();
+    let text = doc.text().slice(..);
+    // A bare cursor asks about its line.
+    let (from, to) = if range.len() <= 1 {
+        let line = text.char_to_line(range.cursor(text));
+        (text.line_to_char(line), text.line_to_char(line + 1))
+    } else {
+        (range.from(), range.to())
+    };
+    let code = doc.redacted(from..to);
+    let question = match args.join(" ") {
+        question if question.trim().is_empty() => "What does this code do?".to_string(),
+        question => question,
+    };
+    let file = doc
+        .path()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "an unsaved buffer".into());
+    let language = doc.language_name().unwrap_or("text").to_string();
+    let messages = serde_json::json!([
+        { "role": "system", "content": crate::otari::EXPLAIN_PROMPT },
+        { "role": "user", "content": format!("{question}\n\nFrom {file} ({language}):\n\n```\n{code}\n```") },
+    ]);
+
+    cx.editor.set_status("Asking Otari…");
+    let callback = async move {
+        let reply =
+            crate::otari::chat(crate::otari::LARGE_MODEL, messages, &["otari_web_search"]).await?;
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                let contents = ui::Markdown::new(reply.text, editor.syn_loader.clone());
+                let popup = Popup::new("explain", contents).position(Some(
+                    helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
+                ));
+                compositor.replace_or_push("explain", popup);
+                editor.set_status(format!("Answered for ${:.6}", reply.cost_usd));
+            },
+        ));
         Ok(call)
     };
     cx.jobs.callback(callback);
@@ -4471,6 +4523,19 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (1, None),
+            raw_after: Some(0),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "explain",
+        aliases: &[],
+        doc: "Answer a question about the selection (or the cursor's line) with a larger \
+              open-weight model that can search the web, through Otari.",
+        fun: explain,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, None),
             raw_after: Some(0),
             ..Signature::DEFAULT
         },

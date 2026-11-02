@@ -28,6 +28,11 @@ pub const REWRITE_PROMPT: &str = "Edit the code fragment as asked. It is part of
      file, so it may be incomplete; keep it that way and do not add or complete code. Reply with \
      the edited fragment only.";
 
+/// The system prompt for explaining code or answering a question about it.
+pub const EXPLAIN_PROMPT: &str = "Answer the user's question about the code from their editor, \
+     briefly, in Markdown. Search the web for documentation when it helps, and name the pages \
+     you used.";
+
 /// What this session spent, in millionths of a dollar (Otari reports six decimals).
 static SPENT_MICRO_USD: AtomicU64 = AtomicU64::new(0);
 
@@ -43,13 +48,19 @@ pub struct Reply {
     pub cost_usd: f64,
 }
 
-/// Sends one chat request and returns the answer's text.
-pub async fn chat(model: &str, messages: Value) -> anyhow::Result<Reply> {
+/// Sends one chat request and returns the answer's text. `tools` are Otari's hosted tools, such
+/// as `otari_web_search`, which run on Otari's side within the request.
+pub async fn chat(model: &str, messages: Value, tools: &[&str]) -> anyhow::Result<Reply> {
     let key = std::env::var("OTARI_API_KEY")
         .ok()
         .filter(|key| !key.is_empty())
         .context("OTARI_API_KEY is not set")?;
-    let body = json!({ "model": model, "messages": messages }).to_string();
+    let mut body = json!({ "model": model, "messages": messages });
+    if !tools.is_empty() {
+        let tools: Vec<Value> = tools.iter().map(|tool| json!({ "type": tool })).collect();
+        body["tools"] = tools.into();
+    }
+    let body = body.to_string();
     let base = std::env::var("OTARI_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string());
 
     let mut child = tokio::process::Command::new("curl")
