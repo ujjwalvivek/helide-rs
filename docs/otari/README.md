@@ -99,3 +99,5 @@ export HELIDE_OTARI_LOG=otari.jsonl     # optional: record every call
 The workspace needs the two routing policies above, web search and code execution allowed under
 Tools, and optionally a guardrail and a spend ceiling. `OTARI_BASE_URL` overrides the EU endpoint,
 `https://eu.api.otari.ai/api/v1`. Requests go through `curl`, with the key passed on its standard input.
+
+Feedback on building this with Otari, including what worked and what didn't: [FEEDBACK.md](./FEEDBACK.md).
