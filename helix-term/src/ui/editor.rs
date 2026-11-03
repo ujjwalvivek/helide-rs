@@ -2038,7 +2038,7 @@ impl EditorView {
     /// fenced block, and focuses the agent.
     pub fn send_output_to_agent(&mut self, editor: &mut Editor) {
         if self.agents.active_agent().is_none() {
-            editor.set_error("No agent is open. Press Ctrl+4 to start one.");
+            editor.set_error("No agent is open. Press Ctrl+5 to start one.");
             return;
         }
         let Some(output) = self.terminal.last_output() else {
@@ -2058,7 +2058,7 @@ impl EditorView {
         self.agents.focused = panel == Panel::Agents;
     }
 
-    /// Ctrl+4. Focused: hide. Hidden or unfocused with tabs: show and focus. Empty: reopen the
+    /// Ctrl+5. Focused: hide. Hidden or unfocused with tabs: show and focus. Empty: reopen the
     /// project's saved agent tabs, or start an agent, asking which when both are installed.
     pub fn toggle_agents(&mut self, editor: &mut Editor) -> Option<Box<dyn Component>> {
         self.zen = None;
@@ -2130,7 +2130,7 @@ impl EditorView {
     /// being shown, then focuses it.
     pub fn mention_in_agent(&mut self, editor: &mut Editor) {
         let Some(agent) = self.agents.active_agent().cloned() else {
-            editor.set_error("No agent is open. Press Ctrl+4 to start one.");
+            editor.set_error("No agent is open. Press Ctrl+5 to start one.");
             return;
         };
         let (view, doc) = current_ref!(editor);
@@ -2916,17 +2916,18 @@ impl EditorView {
                 cx.editor.reset_idle_timer();
                 let ctrl = key.modifiers == KeyModifiers::CONTROL;
                 match key.code {
-                    KeyCode::Char('1') if ctrl => self.toggle_git(),
-                    KeyCode::Char('2') if ctrl => self.focus_editor(),
-                    KeyCode::Char('3') if ctrl => self.toggle_terminal(cx.editor),
-                    KeyCode::Char('4') if ctrl => {
+                    // Ctrl+1 files, 2 git, 3 editor, 4 terminal, 5 agents.
+                    KeyCode::Char('1') if ctrl => self.toggle_file_tree(cx.editor),
+                    KeyCode::Char('2') if ctrl => self.toggle_git(),
+                    KeyCode::Char('3') if ctrl => self.focus_editor(),
+                    KeyCode::Char('4') if ctrl => self.toggle_terminal(cx.editor),
+                    KeyCode::Char('5') if ctrl => {
                         if let Some(picker) = self.toggle_agents(cx.editor) {
                             return Some(EventResult::Consumed(Some(Box::new(
                                 move |compositor, _| compositor.push(picker),
                             ))));
                         }
                     }
-                    KeyCode::Char('5') if ctrl => self.toggle_file_tree(cx.editor),
                     _ if self.file_tree.focused => {
                         let action = self.file_tree.key(*key, cx.editor);
                         return Some(self.tree_action(action, cx.editor));

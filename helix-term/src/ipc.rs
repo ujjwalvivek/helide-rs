@@ -12,7 +12,7 @@
 //! - `status`: mode, focused file and cursor, selection text and open buffers.
 //! - `lsp`: every running language server with its state and in-flight progress.
 //! - `diagnostics {path?}`: diagnostics for one file, or every file when `path` is omitted.
-//! - `keys {keys}`: types a key sequence such as `<C-1>j<space>` as if it was pressed.
+//! - `keys {keys}`: types a key sequence such as `<C-2>j<space>` as if it was pressed.
 
 use std::path::{Path, PathBuf};
 
@@ -153,7 +153,7 @@ fn error(id: Value, message: impl ToString) -> Value {
     json!({ "id": id, "ok": false, "error": message.to_string() })
 }
 
-/// Types `params.keys` (macro syntax, e.g. `<C-1>jj<ret>`) into the editor, as if pressed.
+/// Types `params.keys` (macro syntax, e.g. `<C-2>jj<ret>`) into the editor, as if pressed.
 pub fn send_keys(
     compositor: &mut compositor::Compositor,
     editor: &mut Editor,
@@ -368,7 +368,7 @@ methods:
     status                       mode, focused file, cursor, selection and open buffers
     lsp                          language servers with their state and progress
     diagnostics [file]           diagnostics for one file, or all files
-    keys <keys>                  type keys as if pressed, e.g. `hx msg keys '<C-1>j<space>'`
+    keys <keys>                  type keys as if pressed, e.g. `hx msg keys '<C-2>j<space>'`
 
 The editor is found through $HELIDE_SOCKET, which is set for processes started by the editor;
 otherwise the most recently started editor is used.";
