@@ -390,6 +390,10 @@ impl EditorView {
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
+        if doc.line_labels.is_some() {
+            decorations.add_decoration(Self::diff_tint(doc, view, theme));
+        }
+
         if is_focused && config.cursorline {
             decorations.add_decoration(Self::cursorline(doc, view, theme));
         }
@@ -1139,6 +1143,38 @@ impl EditorView {
     }
 
     /// Apply the highlighting on the lines where a cursor is active
+    /// helide's diffs: a faint tint behind added and removed lines, the theme's diff colours mixed
+    /// a little into the surface colour. Without RGB colours in the theme there's no tint.
+    pub fn diff_tint(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
+        let text = doc.text().clone();
+        let base = ["ui.background", "ui.popup", "ui.cursorline.primary", "ui.menu"]
+            .iter()
+            .find_map(|key| match theme.get(key).bg {
+                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+                _ => None,
+            });
+        let tint = |key: &str| -> Option<Style> {
+            let (Some(Color::Rgb(r, g, b)), Some((br, bg, bb))) = (theme.get(key).fg, base) else {
+                return None;
+            };
+            let mix = |c: u8, base: u8| (base as f32 + (c as f32 - base as f32) * 0.18) as u8;
+            Some(Style::default().bg(Color::Rgb(mix(r, br), mix(g, bg), mix(b, bb))))
+        };
+        let (plus, minus) = (tint("diff.plus"), tint("diff.minus"));
+        let viewport = view.area;
+
+        move |renderer: &mut TextRenderer, pos: LinePos| {
+            let style = match text.get_line(pos.doc_line).and_then(|line| line.get_char(0)) {
+                Some('+') => plus,
+                Some('-') => minus,
+                _ => None,
+            };
+            if let Some(style) = style {
+                renderer.set_style(Rect::new(viewport.x, pos.visual_line, viewport.width, 1), style);
+            }
+        }
+    }
+
     pub fn cursorline(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
         let text = doc.text().slice(..);
         // TODO only highlight the visual line that contains the cursor instead of the full visual line

@@ -180,7 +180,8 @@ pub fn line_numbers<'doc>(
                     && is_focused
                     && current_line != line;
 
-                let display_num = if relative {
+                let label = doc.line_labels.as_ref().map(|labels| labels.get(line).copied().flatten());
+                let display_num = if relative && label.is_none() {
                     current_line.abs_diff(line)
                 } else {
                     line + 1
@@ -193,7 +194,11 @@ pub fn line_numbers<'doc>(
                 };
 
                 if first_visual_line {
-                    write!(out, "{:>1$}", display_num, width).unwrap();
+                    match label {
+                        Some(Some(n)) => write!(out, "{:>1$}", n, width).unwrap(),
+                        Some(None) => write!(out, "{:>1$}", " ", width).unwrap(),
+                        None => write!(out, "{:>1$}", display_num, width).unwrap(),
+                    }
                 } else {
                     write!(out, "{:>1$}", " ", width).unwrap();
                 }

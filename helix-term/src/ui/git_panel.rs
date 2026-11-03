@@ -76,6 +76,8 @@ struct Hunk {
     header: String,
     /// Added and removed lines, for the preview under the hunk.
     changes: Vec<String>,
+    /// The line in the new version where each change sits.
+    change_lines: Vec<usize>,
     /// First line of the hunk in the new version of the file, 1-based.
     new_start: usize,
     /// The file header plus this hunk: a patch `git apply` takes on its own.
@@ -556,8 +558,14 @@ impl GitPanel {
                         .get(&(entry.section, entry.path.clone()))
                         .and_then(|hunks| hunks.get(*h))
                     {
+                        // "line 14  # Heading" instead of git's "@@ -14,11 +14,13 @@ # Heading".
+                        let context = hunk.header.splitn(3, "@@").nth(2).unwrap_or("").trim();
+                        let label = format!("line {}", hunk.new_start);
                         let width = inner_width.saturating_sub(5);
-                        surface.set_stringn(line.x + 5, y, &hunk.header, width, roles.muted);
+                        surface.set_stringn(line.x + 5, y, &label, width, roles.label());
+                        let x = line.x + 5 + label.width() as u16 + 2;
+                        let room = (line.right() as usize).saturating_sub(x as usize + 1);
+                        surface.set_stringn(x, y, context, room, roles.muted);
                     }
                 }
                 Row::HunkLine(file, h, l) => {
@@ -566,20 +574,28 @@ impl GitPanel {
                         .hunks
                         .get(&(entry.section, entry.path.clone()))
                         .and_then(|hunks| hunks.get(*h))
-                        .and_then(|hunk| hunk.changes.get(*l))
+                        .and_then(|hunk| Some((hunk.changes.get(*l)?, hunk.change_lines.get(*l)?)))
                     {
+                        let (change, at) = change;
                         let style = if change.starts_with('+') {
                             roles.plus
                         } else {
                             roles.minus
                         };
-                        let width = inner_width.saturating_sub(6);
-                        surface.set_stringn(line.x + 7, y, change, width, style);
+                        // The line number, then the change; an empty line says so.
+                        surface.set_stringn(line.x + 5, y, &format!("{at:>4}"), 4, roles.faint);
+                        let shown = if change.len() <= 2 {
+                            format!("{} (blank line)", &change[..1])
+                        } else {
+                            change.clone()
+                        };
+                        let width = inner_width.saturating_sub(11);
+                        surface.set_stringn(line.x + 10, y, &shown, width, style);
                     }
                 }
                 Row::HunkMore(count) => {
                     let label = format!("{count} more lines");
-                    surface.set_stringn(line.x + 7, y, &label, inner_width, roles.muted);
+                    surface.set_stringn(line.x + 10, y, &label, inner_width, roles.muted);
                 }
                 Row::Stash(index) => {
                     let stash = &snapshot.stashes[*index];
@@ -858,11 +874,24 @@ impl GitPanel {
         let Some(repo) = self.snapshot.repo.clone() else {
             return;
         };
+        let mut wrap = None;
+        let file = self.selected_entry().is_some();
         let (args, label): (Vec<&str>, String) = if let Some(entry) = self.selected_entry() {
+            // Markdown diffs keep each line whole, like the markdown files themselves.
+            let path = std::path::Path::new(&entry.path);
+            if path
+                .extension()
+                .is_some_and(|ext| ext == "md" || ext == "markdown")
+            {
+                wrap = Some(false);
+            }
+            // The whole file as context, so the diff reads as the file with its changes marked.
             let args = match entry.section {
-                Section::Staged => vec!["diff", "--cached", "--", &entry.path],
-                Section::Untracked => vec!["diff", "--no-index", "--", "/dev/null", &entry.path],
-                _ => vec!["diff", "--", &entry.path],
+                Section::Staged => vec!["diff", WHOLE_FILE, "--cached", "--", &entry.path],
+                Section::Untracked => {
+                    vec!["diff", WHOLE_FILE, "--no-index", "--", "/dev/null", &entry.path]
+                }
+                _ => vec!["diff", WHOLE_FILE, "--", &entry.path],
             };
             (args, format!("diff {}", entry.path))
         } else if let Some(stash) = self.selected_stash() {
@@ -891,7 +920,12 @@ impl GitPanel {
             let output = git(&repo, &args, None).await;
             crate::job::dispatch(move |editor, _| match output {
                 Ok(out) if !out.stdout.is_empty() => {
-                    open_scratch(editor, &label, &out.stdout, "diff", action);
+                    let (text, labels) = if file {
+                        marked_file(&out.stdout)
+                    } else {
+                        (out.stdout, None)
+                    };
+                    open_scratch(editor, &label, &text, "diff", action, wrap, labels);
                 }
                 Ok(out) if !out.success && !out.stderr.is_empty() => {
                     editor.set_error(last_line(&out.stderr))
@@ -1643,6 +1677,9 @@ fn parse_hunks(diff: &str) -> Vec<Hunk> {
         }
         let mut body = String::new();
         let mut changes = Vec::new();
+        let mut change_lines = Vec::new();
+        let new_start = hunk_new_start(header);
+        let mut at = new_start;
         while let Some(line) = lines.peek() {
             if line.starts_with("@@") || line.starts_with("diff --git") {
                 break;
@@ -1654,20 +1691,18 @@ fn parse_hunks(diff: &str) -> Vec<Hunk> {
                 // The sign, then the code without its indentation: the panel is narrow.
                 let (sign, code) = line.split_at(1);
                 changes.push(format!("{sign} {}", code.trim()));
+                change_lines.push(at);
+            }
+            if !line.starts_with('-') && !line.starts_with('\\') {
+                at += 1;
             }
             body.push_str(line);
             lines.next();
         }
-        // "@@ -a,b +c,d @@": c is where the hunk starts in the new version.
-        let new_start = header
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix('+'))
-            .and_then(|range| range.split(',').next())
-            .and_then(|start| start.parse().ok())
-            .unwrap_or(1);
         hunks.push(Hunk {
             header: header.trim_end().to_string(),
             changes,
+            change_lines,
             new_start,
             patch: format!("{file_header}{header}{body}"),
         });
@@ -1703,8 +1738,63 @@ fn last_line(text: &str) -> String {
         .to_string()
 }
 
+/// Context lines enough to cover any file, so a diff holds the whole file.
+const WHOLE_FILE: &str = "-U1000000";
+
+/// A file's diff as the file with its changes marked: git's headers and `@@` lines go, and each
+/// line gets the file's line number for the gutter (removed lines get none). A diff with no hunks
+/// (a binary file) stays as git wrote it.
+fn marked_file(diff: &str) -> (String, Option<Vec<Option<usize>>>) {
+    let mut out = String::new();
+    let mut labels = Vec::new();
+    let mut line = None;
+    for text in diff.lines() {
+        if text.starts_with("@@") {
+            if line.is_some() {
+                out.push('\n');
+                labels.push(None);
+            }
+            line = Some(hunk_new_start(text));
+        } else if let Some(n) = &mut line {
+            if text.starts_with('\\') {
+                continue;
+            }
+            out.push_str(text);
+            out.push('\n');
+            if text.starts_with('-') {
+                labels.push(None);
+            } else {
+                labels.push(Some(*n));
+                *n += 1;
+            }
+        }
+    }
+    if line.is_none() {
+        return (diff.to_string(), None);
+    }
+    (out, Some(labels))
+}
+
+/// Where a hunk starts in the new version: c in "@@ -a,b +c,d @@".
+fn hunk_new_start(header: &str) -> usize {
+    header
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix('+'))
+        .and_then(|range| range.split(',').next())
+        .and_then(|start| start.parse().ok())
+        .unwrap_or(1)
+}
+
 /// Opens `text` as a read-only, unnamed buffer labelled `label`.
-fn open_scratch(editor: &mut Editor, label: &str, text: &str, language: &str, action: Action) {
+fn open_scratch(
+    editor: &mut Editor,
+    label: &str,
+    text: &str,
+    language: &str,
+    action: Action,
+    wrap: Option<bool>,
+    labels: Option<Vec<Option<usize>>>,
+) {
     let mut doc = Document::from(
         Rope::from(text),
         None,
@@ -1714,6 +1804,8 @@ fn open_scratch(editor: &mut Editor, label: &str, text: &str, language: &str, ac
     let loader = editor.syn_loader.load();
     let _ = doc.set_language_by_language_id(language, &loader);
     doc.readonly = true;
+    doc.soft_wrap = wrap;
+    doc.line_labels = labels;
     doc.label = Some(label.to_string());
     editor.new_file_from_document(action, doc);
 }
@@ -1888,5 +1980,18 @@ index 111..222 100644
         assert_eq!(short_age("3 hours ago"), "3h");
         assert_eq!(short_age("1 day ago"), "1d");
         assert_eq!(short_age("2 months ago"), "2mo");
+    }
+}
+
+#[cfg(test)]
+mod marked_file_tests {
+    use super::marked_file;
+
+    #[test]
+    fn numbers_follow_the_new_file_and_skip_removed_lines() {
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let (text, labels) = marked_file(diff);
+        assert_eq!(text, " one\n-two\n+TWO\n three\n");
+        assert_eq!(labels.unwrap(), vec![Some(1), None, Some(2), Some(3)]);
     }
 }
