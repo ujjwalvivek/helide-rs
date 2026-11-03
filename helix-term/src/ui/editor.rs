@@ -24,6 +24,7 @@ use helix_core::{
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
+    view::ViewPosition,
     document::{Mode, SCRATCH_BUFFER_NAME},
     editor::{Action, CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
@@ -160,7 +161,7 @@ pub struct EditorView {
     /// Views drawn as a rendered markdown preview: the file they preview, how far down they
     /// are scrolled, and the file the pane showed before, when the preview reused a pane. A
     /// view that has since been closed or switched to another file is dropped.
-    previews: HashMap<ViewId, (DocumentId, u16, Option<DocumentId>)>,
+    previews: HashMap<ViewId, Preview>,
     /// Columns of the PREVIEW button on the editor box's top border last frame.
     preview_hit: Option<(u16, u16)>,
 }
@@ -240,7 +241,7 @@ impl EditorView {
             let next = views[(here + 1) % views.len()];
             // A pane already previewing another file goes back to what it showed first.
             let previous = match self.previews.remove(&next) {
-                Some((_, _, previous)) => previous,
+                Some(preview) => preview.previous,
                 None => editor.tree.try_get(next).map(|view| view.doc),
             };
             editor.focus(next);
@@ -249,13 +250,22 @@ impl EditorView {
         };
         // Editing goes on in the source; the preview follows it.
         editor.focus(focus);
-        self.previews.insert(target, (doc_id, 0, previous));
+        self.previews.insert(
+            target,
+            Preview {
+                doc: doc_id,
+                scroll: 0,
+                previous,
+                sources: Vec::new(),
+                synced: None,
+            },
+        );
     }
 
     /// Closes the preview in `view`: a pane it split off closes, a pane it reused gets its file
     /// back.
     fn close_preview(&mut self, view: ViewId, editor: &mut Editor) {
-        let Some((_, _, previous)) = self.previews.remove(&view) else {
+        let Some(Preview { previous, .. }) = self.previews.remove(&view) else {
             return;
         };
         match previous.filter(|doc| editor.document(*doc).is_some()) {
@@ -277,12 +287,12 @@ impl EditorView {
             .tree
             .views()
             .map(|(view, _)| view.id)
-            .find(|id| self.previews.get(id).is_some_and(|(d, ..)| *d == doc))
+            .find(|id| self.previews.get(id).is_some_and(|p| p.doc == doc))
     }
 
     /// Forgets previews whose view is gone or now shows another file.
     fn prune_previews(&mut self, editor: &Editor) {
-        self.previews.retain(|id, (doc, ..)| {
+        self.previews.retain(|id, Preview { doc, .. }| {
             editor
                 .tree
                 .try_get(*id)
@@ -290,15 +300,31 @@ impl EditorView {
         });
     }
 
-    /// Scrolls the preview `view` by `lines` (negative is up).
-    fn scroll_preview(&mut self, view: ViewId, lines: i32) -> bool {
-        match self.previews.get_mut(&view) {
-            Some((_, scroll, _)) => {
-                *scroll = (*scroll as i32 + lines).clamp(0, u16::MAX as i32) as u16;
-                true
-            }
-            None => false,
+    /// Scrolls the preview `view` by `lines` (negative is up), and the source with it.
+    fn scroll_preview(&mut self, view: ViewId, lines: i32, editor: &mut Editor) -> bool {
+        let Some(preview) = self.previews.get_mut(&view) else {
+            return false;
+        };
+        let last = preview.sources.len().saturating_sub(1) as i32;
+        preview.scroll = (preview.scroll as i32 + lines).clamp(0, last.max(0)) as u16;
+        let Some(&line) = preview.sources.get(preview.scroll as usize) else {
+            return true;
+        };
+        if let Some(source) = source_view(editor, view, preview.doc) {
+            let doc = doc_mut!(editor, &preview.doc);
+            let line = line.min(doc.text().len_lines().saturating_sub(1));
+            let anchor = doc.text().line_to_char(line);
+            doc.set_view_offset(
+                source,
+                ViewPosition {
+                    anchor,
+                    horizontal_offset: 0,
+                    vertical_offset: 0,
+                },
+            );
+            preview.synced = Some(line);
         }
+        true
     }
 
     /// Keys on a focused preview: scrolling and closing. Keys that leave the pane (Space,
@@ -316,14 +342,14 @@ impl EditorView {
         let half = (view!(editor).area.height / 2).max(1) as i32;
         let ctrl = key.modifiers == KeyModifiers::CONTROL;
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down if !ctrl => self.scroll_preview(focus, 1),
-            KeyCode::Char('k') | KeyCode::Up if !ctrl => self.scroll_preview(focus, -1),
-            KeyCode::Char('d') if ctrl => self.scroll_preview(focus, half),
-            KeyCode::Char('u') if ctrl => self.scroll_preview(focus, -half),
-            KeyCode::PageDown => self.scroll_preview(focus, 2 * half),
-            KeyCode::PageUp => self.scroll_preview(focus, -2 * half),
-            KeyCode::Char('g') | KeyCode::Home => self.scroll_preview(focus, -(u16::MAX as i32)),
-            KeyCode::Char('G') | KeyCode::End => self.scroll_preview(focus, u16::MAX as i32),
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => self.scroll_preview(focus, 1, editor),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => self.scroll_preview(focus, -1, editor),
+            KeyCode::Char('d') if ctrl => self.scroll_preview(focus, half, editor),
+            KeyCode::Char('u') if ctrl => self.scroll_preview(focus, -half, editor),
+            KeyCode::PageDown => self.scroll_preview(focus, 2 * half, editor),
+            KeyCode::PageUp => self.scroll_preview(focus, -2 * half, editor),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll_preview(focus, -(u16::MAX as i32), editor),
+            KeyCode::Char('G') | KeyCode::End => self.scroll_preview(focus, u16::MAX as i32, editor),
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.toggle_preview(editor);
                 true
@@ -2320,7 +2346,7 @@ impl EditorView {
         };
         // PREVIEW, for a markdown file: lit while its preview is open.
         let focus = editor.tree.focus;
-        let markdown = self.previews.get(&focus).map(|(doc, ..)| *doc).or_else(|| {
+        let markdown = self.previews.get(&focus).map(|p| p.doc).or_else(|| {
             let doc = doc!(editor);
             super::preview::is_markdown(doc).then(|| doc.id())
         });
@@ -2511,7 +2537,7 @@ impl EditorView {
                 } else {
                     lines
                 };
-                self.scroll_preview(view, lines)
+                self.scroll_preview(view, lines, editor)
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some((grab, label)) = self.grab_at(mouse.column, mouse.row, editor) else {
@@ -3080,6 +3106,21 @@ impl Component for EditorView {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        // A preview goes with its source: closing the file's pane closes its preview too. When
+        // that was the last pane, nothing is left to draw and helide quits.
+        self.prune_previews(cx.editor);
+        let orphans: Vec<ViewId> = self
+            .previews
+            .iter()
+            .filter(|(id, p)| source_view(cx.editor, **id, p.doc).is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in orphans {
+            self.close_preview(id, cx.editor);
+        }
+        if cx.editor.tree.is_empty() {
+            return;
+        }
         // clear with background color
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();
@@ -3128,16 +3169,30 @@ impl Component for EditorView {
         self.prune_previews(cx.editor);
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            if let Some((_, scroll, _)) = self.previews.get_mut(&view.id) {
-                super::preview::render(
+            if let Some(preview) = self.previews.get_mut(&view.id) {
+                // When the source has scrolled since the last sync, the preview follows it.
+                if let Some(source) = source_view(cx.editor, view.id, preview.doc) {
+                    let top = doc.text().char_to_line(
+                        doc.view_offset(source).anchor.min(doc.text().len_chars()),
+                    );
+                    if preview.synced != Some(top) {
+                        preview.synced = Some(top);
+                        if !preview.sources.is_empty() {
+                            preview.scroll =
+                                preview.sources.partition_point(|&src| src < top) as u16;
+                        }
+                    }
+                }
+                let sources = super::preview::render(
                     view.area,
                     surface,
                     doc,
-                    scroll,
+                    &mut preview.scroll,
                     &cx.editor.theme,
                     cx.editor.syn_loader.clone(),
                     is_focused && editor_focused,
                 );
+                preview.sources = sources;
                 continue;
             }
             self.render_view(
@@ -3292,6 +3347,10 @@ impl Component for EditorView {
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        // Closing a preview with its source can leave no pane at all, just before helide quits.
+        if editor.tree.is_empty() {
+            return (None, CursorKind::Hidden);
+        }
         if self.terminal.visible && self.terminal.focused {
             return self.terminal.cursor();
         }
@@ -3434,4 +3493,28 @@ impl super::menu::Item for AgentKind {
     fn format(&self, _data: &Self::Data) -> tui::widgets::Row<'_> {
         tui::widgets::Row::new([self.command()])
     }
+}
+
+/// A view drawn as a rendered markdown preview.
+struct Preview {
+    /// The file it previews.
+    doc: DocumentId,
+    /// How far down it is scrolled, in rendered lines.
+    scroll: u16,
+    /// The file the pane showed before, when the preview reused a pane.
+    previous: Option<DocumentId>,
+    /// The source line of each rendered line, from the last frame.
+    sources: Vec<usize>,
+    /// The source's top line when the two were last lined up.
+    synced: Option<usize>,
+}
+
+/// The pane editing the file that the preview `preview` shows.
+fn source_view(editor: &Editor, preview: ViewId, doc: DocumentId) -> Option<ViewId> {
+    editor
+        .tree
+        .views()
+        .map(|(view, _)| view)
+        .find(|view| view.id != preview && view.doc == doc)
+        .map(|view| view.id)
 }
