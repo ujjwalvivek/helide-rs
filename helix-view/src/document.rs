@@ -154,6 +154,12 @@ pub struct Document {
     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
     /// Whether the file holds secrets, judged by its name.
     secret_file: Option<SecretFile>,
+    /// Soft wrap for this buffer alone, over the language and editor settings: helide turns it off
+    /// for diffs of markdown files, whose long table rows wrap badly.
+    pub soft_wrap: Option<bool>,
+    /// The number the gutter shows for each line, in place of its own: helide's diffs show the
+    /// file's line numbers, and none on removed lines.
+    pub line_labels: Option<Vec<Option<usize>>>,
     /// The secret values in the document, as sorted char ranges.
     secret_ranges: Vec<std::ops::Range<usize>>,
     /// One `•` per grapheme of `secret_ranges`, drawn over the text.
@@ -776,6 +782,8 @@ impl Document {
             label: None,
             jump_labels: HashMap::new(),
             secret_file: None,
+            soft_wrap: None,
+            line_labels: None,
             secret_ranges: Vec::new(),
             secret_masks: Vec::new(),
             document_highlights: HashMap::new(),
@@ -2402,8 +2410,9 @@ impl Document {
             .language
             .as_ref()
             .and_then(|config| config.soft_wrap.as_ref());
-        let enable_soft_wrap = language_soft_wrap
-            .and_then(|soft_wrap| soft_wrap.enable)
+        let enable_soft_wrap = self
+            .soft_wrap
+            .or(language_soft_wrap.and_then(|soft_wrap| soft_wrap.enable))
             .or(editor_soft_wrap.enable)
             .unwrap_or(false);
         let max_wrap = language_soft_wrap
