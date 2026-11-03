@@ -19,7 +19,8 @@ use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, WindowSize},
     event_loop::{EventLoop, EventLoopSender, Msg},
     grid::{Dimensions, Scroll},
-    index::{Column, Line, Point},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     sync::FairMutex,
     term::{
         cell::{Cell as TermCell, Flags},
@@ -262,6 +263,8 @@ pub struct TerminalPanel {
     next_group: u32,
     /// The panes of the shown tab as drawn last frame: (session index, area).
     panes: Vec<(usize, Rect)>,
+    /// Text selected with the mouse and not yet handed to the clipboard.
+    copied: Option<String>,
 }
 
 impl TerminalPanel {
@@ -274,6 +277,11 @@ impl TerminalPanel {
 
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
+    }
+
+    /// Text the mouse just selected, for the clipboard. Taken once.
+    pub fn take_copied(&mut self) -> Option<String> {
+        self.copied.take()
     }
 
     /// Opens a new tab running `command`, or the user's shell when it is empty. `name` labels the
@@ -657,8 +665,11 @@ impl TerminalPanel {
         };
         let mode = session.mode();
         if let Some(bytes) = encode_key(key, mode) {
-            // Typing jumps back to the live screen.
-            session.term.lock().scroll_display(Scroll::Bottom);
+            // Typing jumps back to the live screen and drops a mouse selection.
+            let mut term = session.term.lock();
+            term.selection = None;
+            term.scroll_display(Scroll::Bottom);
+            drop(term);
             session.write(bytes);
         }
     }
@@ -779,8 +790,42 @@ impl TerminalPanel {
         let col = event.column.saturating_sub(grid.x);
         let row = event.row.saturating_sub(grid.y);
         let mode = session.mode();
+        let reporting = mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE);
 
-        if mode.intersects(TermMode::MOUSE_MODE) && mode.contains(TermMode::SGR_MOUSE) {
+        // Dragging selects text, and letting go copies it. Programs that take the mouse
+        // themselves (lazygit, OpenCode) still get it; Shift+drag selects over them.
+        if !reporting || event.modifiers.contains(KeyModifiers::SHIFT) {
+            let mut term = session.term.lock();
+            let point = Point::new(
+                Line(
+                    (row.min(grid.height.saturating_sub(1)) as i32)
+                        - term.grid().display_offset() as i32,
+                ),
+                Column((col as usize).min(term.columns().saturating_sub(1))),
+            );
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+                    return;
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(selection) = term.selection.as_mut() {
+                        selection.update(point, Side::Right);
+                    }
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    match term.selection_to_string().filter(|text| !text.is_empty()) {
+                        Some(text) => self.copied = Some(text),
+                        None => term.selection = None,
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if reporting {
             if let Some(report) = sgr_mouse(event, col, row, mode) {
                 session.write(report.into_bytes());
             }
@@ -829,6 +874,7 @@ fn draw_session(session: &mut Session, pane: Rect, surface: &mut Surface, base: 
     let term = session.term.lock();
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
+    let selection = content.selection;
     for indexed in content.display_iter {
         let line = indexed.point.line.0 + offset;
         let col = indexed.point.column.0 as u16;
@@ -854,7 +900,11 @@ fn draw_session(session: &mut Session, pane: Rect, surface: &mut Surface, base: 
             symbol = " ".into();
         }
         cell.set_symbol(&symbol);
-        cell.set_style(base.patch(cell_style(term_cell)));
+        let mut style = base.patch(cell_style(term_cell));
+        if selection.is_some_and(|range| range.contains(indexed.point)) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        cell.set_style(style);
     }
 }
 

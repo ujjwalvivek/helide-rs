@@ -2890,6 +2890,9 @@ impl EditorView {
                 if let Some(location) = self.terminal.mouse(mouse) {
                     self.open_location(&location, cx.editor);
                 }
+                if let Some(text) = self.terminal.take_copied() {
+                    copy_to_clipboard(cx.editor, text);
+                }
                 Some(EventResult::Consumed(None))
             }
             Event::Mouse(mouse) if self.agents.contains(mouse.column, mouse.row) => {
@@ -2898,6 +2901,9 @@ impl EditorView {
                 }
                 if let Some(location) = self.agents.mouse(mouse) {
                     self.open_location(&location, cx.editor);
+                }
+                if let Some(text) = self.agents.take_copied() {
+                    copy_to_clipboard(cx.editor, text);
                 }
                 Some(EventResult::Consumed(None))
             }
@@ -3554,4 +3560,16 @@ fn source_view(editor: &Editor, preview: ViewId, doc: DocumentId) -> Option<View
         .map(|(view, _)| view)
         .find(|view| view.id != preview && view.doc == doc)
         .map(|view| view.id)
+}
+
+/// Puts text selected in a terminal or agent pane on the system clipboard.
+fn copy_to_clipboard(editor: &mut Editor, text: String) {
+    let lines = text.lines().count().max(1);
+    match editor.registers.write('+', vec![text]) {
+        Ok(()) => editor.set_status(format!(
+            "Copied {lines} line{}",
+            if lines == 1 { "" } else { "s" }
+        )),
+        Err(err) => editor.set_error(format!("Couldn't copy: {err}")),
+    }
 }
