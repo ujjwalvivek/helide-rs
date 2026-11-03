@@ -13,15 +13,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use helix_core::{pos_at_coords, unicode::width::UnicodeWidthStr, Position, Range, Rope};
+use helix_core::{
+    pos_at_coords, unicode::width::UnicodeWidthStr, Position, Range, Rope, Selection, Transaction,
+};
 use helix_view::{
     align_view,
     document::Document,
+    DocumentId,
     editor::Action,
     graphics::{Modifier, Rect},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Align, Editor, Theme,
+    Align, Editor, Theme, View,
 };
 use tokio::io::AsyncWriteExt;
 use tui::buffer::Buffer as Surface;
@@ -155,9 +158,19 @@ pub enum GitAction {
     Layer(Box<dyn Component>),
 }
 
+/// A file's diff open in a tab, re-read whenever the repository is.
+#[derive(Clone)]
+struct OpenDiff {
+    doc: DocumentId,
+    repo: PathBuf,
+    args: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct GitPanel {
     snapshot: Snapshot,
+    /// File diffs open in tabs, kept up to date with the files.
+    diffs: Vec<OpenDiff>,
     rows: Vec<Row>,
     /// Files whose hunks are listed under them.
     expanded: HashSet<FileKey>,
@@ -206,6 +219,40 @@ impl GitPanel {
         });
     }
 
+    /// Re-reads every open file diff, so a tab follows the file after it changes on disk.
+    fn refresh_diffs(&self) {
+        for diff in self.diffs.clone() {
+            tokio::spawn(async move {
+                let output = git(&diff.repo, &diff.args, None).await;
+                crate::job::dispatch(move |editor, compositor| {
+                    let Some(doc) = editor.documents.get_mut(&diff.doc) else {
+                        // The tab was closed: stop following it.
+                        if let Some(editor_view) = compositor.find::<EditorView>() {
+                            editor_view.git.diffs.retain(|d| d.doc != diff.doc);
+                        }
+                        return;
+                    };
+                    let Ok(out) = output else { return };
+                    let Some(view) = doc
+                        .selections()
+                        .keys()
+                        .copied()
+                        .find(|&id| editor.tree.contains(id))
+                    else {
+                        return;
+                    };
+                    let (text, labels) = if out.stdout.is_empty() {
+                        ("No changes left.\n".to_string(), None)
+                    } else {
+                        marked_file(&out.stdout)
+                    };
+                    replace_text(doc, editor.tree.get_mut(view), &text, labels);
+                })
+                .await;
+            });
+        }
+    }
+
     /// Refreshes now, even if a refresh is already on its way (its result may be stale).
     fn force_refresh(&mut self) {
         self.refreshing = false;
@@ -216,6 +263,7 @@ impl GitPanel {
         let selected = self.selected_key();
         self.snapshot = snapshot;
         self.refreshing = false;
+        self.refresh_diffs();
         let present: HashSet<FileKey> = self
             .snapshot
             .entries
@@ -918,14 +966,19 @@ impl GitPanel {
         tokio::spawn(async move {
             // `diff --no-index` exits with 1 when there are differences.
             let output = git(&repo, &args, None).await;
-            crate::job::dispatch(move |editor, _| match output {
+            crate::job::dispatch(move |editor, compositor| match output {
                 Ok(out) if !out.stdout.is_empty() => {
                     let (text, labels) = if file {
                         marked_file(&out.stdout)
                     } else {
                         (out.stdout, None)
                     };
-                    open_scratch(editor, &label, &text, "diff", action, wrap, labels);
+                    let doc = open_scratch(editor, &label, &text, "diff", action, wrap, labels);
+                    if file {
+                        if let Some(editor_view) = compositor.find::<EditorView>() {
+                            editor_view.git.diffs.push(OpenDiff { doc, repo, args });
+                        }
+                    }
                 }
                 Ok(out) if !out.success && !out.stderr.is_empty() => {
                     editor.set_error(last_line(&out.stderr))
@@ -1794,7 +1847,7 @@ fn open_scratch(
     action: Action,
     wrap: Option<bool>,
     labels: Option<Vec<Option<usize>>>,
-) {
+) -> DocumentId {
     let mut doc = Document::from(
         Rope::from(text),
         None,
@@ -1807,7 +1860,39 @@ fn open_scratch(
     doc.soft_wrap = wrap;
     doc.line_labels = labels;
     doc.label = Some(label.to_string());
-    editor.new_file_from_document(action, doc);
+    editor.new_file_from_document(action, doc)
+}
+
+/// Swaps a diff tab's text for a fresh one, keeping the cursor on the same line and the tab
+/// unmodified.
+fn replace_text(
+    doc: &mut Document,
+    view: &mut View,
+    text: &str,
+    labels: Option<Vec<Option<usize>>>,
+) {
+    if doc.text() == text {
+        return;
+    }
+    let view_ref = &mut *view;
+    let view = view_ref.id;
+    let old = doc.text().clone();
+    let line = old.char_to_line(doc.selection(view).primary().cursor(old.slice(..)));
+    let offset = doc.view_offset(view);
+    let top = old.char_to_line(offset.anchor.min(old.len_chars()));
+    let tx = Transaction::change(&old, std::iter::once((0, old.len_chars(), Some(text.into()))));
+    doc.apply(&tx, view);
+    // Into the history and marked saved, so the tab never asks to be saved.
+    doc.append_changes_to_history(view_ref);
+    doc.reset_modified();
+    doc.line_labels = labels;
+    let new = doc.text().clone();
+    let last = new.len_lines().saturating_sub(1);
+    let at = new.line_to_char(line.min(last));
+    doc.set_selection(view, Selection::point(at));
+    let mut offset = offset;
+    offset.anchor = new.line_to_char(top.min(last));
+    doc.set_view_offset(view, offset);
 }
 
 /// Re-reads open buffers that have no unsaved changes, after git changed files on disk.
