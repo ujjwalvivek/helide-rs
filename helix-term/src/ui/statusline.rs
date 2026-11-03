@@ -70,6 +70,14 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         });
     }
 
+    // At the end of the left side, where its changing width moves nothing else.
+    if let Some(waiting) = crate::model::waiting() {
+        append(
+            &mut context.parts.left,
+            format!("  {waiting}").into(),
+            base_style,
+        );
+    }
     surface.set_spans(
         viewport.x,
         viewport.y,

@@ -2927,6 +2927,217 @@ fn run_shell_command(
     Ok(())
 }
 
+fn rewrite(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let instruction = args.join(" ");
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id).clone();
+    if selection.ranges().iter().all(|range| range.len() <= 1) {
+        bail!("Select the text to rewrite first, e.g. x for the line");
+    }
+
+    // Selections holding a secret are left alone: their redacted text could only come back
+    // with the secret lost.
+    let mut asks = Vec::new();
+    let mut skipped = 0;
+    for (index, range) in selection.ranges().iter().enumerate() {
+        let original = range.fragment(text);
+        let redacted = doc.redacted(range.from()..range.to());
+        if redacted == original {
+            asks.push((index, redacted));
+        } else {
+            skipped += 1;
+        }
+    }
+    if asks.is_empty() {
+        bail!("Every selection holds a secret, so nothing was sent");
+    }
+
+    // Without the language the model guesses, and a lone comment line turns into Python.
+    let file = doc
+        .path()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "an unsaved buffer".into());
+    let language = doc.language_name().unwrap_or("text").to_string();
+    let (doc_id, view_id, version) = (doc.id(), view.id, doc.version());
+    let count = asks.len();
+    cx.editor.set_status(format!(
+        "Asking the local model to rewrite {count} selection{}…",
+        if count == 1 { "" } else { "s" }
+    ));
+    let callback = async move {
+        let replies = futures_util::future::try_join_all(asks.into_iter().map(|(index, text)| {
+            let messages = serde_json::json!([
+                { "role": "system", "content": crate::model::REWRITE_PROMPT },
+                { "role": "user", "content": format!("{instruction}\n\nFrom {file} ({language}):\n\n```{language}\n{text}\n```") },
+            ]);
+            async move {
+                let reply = crate::model::chat(messages, false).await?;
+                anyhow::Ok((index, text, reply))
+            }
+        }))
+        .await?;
+        let call: job::Callback = Callback::Editor(Box::new(move |editor: &mut Editor| {
+            let Some(doc) = editor.documents.get_mut(&doc_id) else {
+                return;
+            };
+            if doc.version() != version || !editor.tree.contains(view_id) {
+                editor
+                    .set_error("The file changed while the model was answering; nothing was replaced");
+                return;
+            }
+            let view = editor.tree.get_mut(view_id);
+            let selection = doc.selection(view_id).clone();
+            let mut by: Vec<String> = Vec::new();
+            let mut ranges: Vec<Option<Range>> = vec![None; selection.len()];
+            let mut changes = Vec::with_capacity(replies.len());
+            let mut offset = 0isize;
+            for (index, original, reply) in replies {
+                if !by.contains(&reply.by()) {
+                    by.push(reply.by());
+                }
+                let range = selection.ranges()[index];
+                let mut output = crate::model::strip_fences(&reply.text).to_string();
+                // Models tend to drop the first line's indent and the final line end.
+                let indent = &original[..original.len() - original.trim_start().len()];
+                if !output.starts_with(char::is_whitespace) && !indent.contains('\n') {
+                    output.insert_str(0, indent);
+                }
+                if original.ends_with('\n') && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                let len = output.chars().count();
+                let from = range
+                    .from()
+                    .checked_add_signed(offset)
+                    .unwrap_or(range.from());
+                ranges[index] =
+                    Some(Range::new(from, from + len).with_direction(range.direction()));
+                offset += len as isize - range.len() as isize;
+                changes.push((range.from(), range.to(), Some(output.into())));
+            }
+            // Ranges not sent keep their place, shifted by the replacements before them.
+            let transaction = Transaction::change(doc.text(), changes.into_iter());
+            let ranges: Vec<Range> = ranges
+                .into_iter()
+                .zip(selection.ranges())
+                .map(|(new, old)| new.unwrap_or_else(|| old.map(transaction.changes())))
+                .collect();
+            let transaction = transaction
+                .with_selection(Selection::new(ranges.into(), selection.primary_index()));
+            doc.apply(&transaction, view_id);
+            doc.append_changes_to_history(view);
+            let note = if skipped > 0 {
+                format!(", {skipped} holding secrets left alone")
+            } else {
+                String::new()
+            };
+            let by = by.join(", ");
+            editor.set_status(format!("Rewritten by {by}{note} (u undoes)"));
+        }));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current_ref!(cx.editor);
+    let range = doc.selection(view.id).primary();
+    let text = doc.text().slice(..);
+    // A bare cursor asks about its line.
+    let (from, to) = if range.len() <= 1 {
+        let line = text.char_to_line(range.cursor(text));
+        (text.line_to_char(line), text.line_to_char(line + 1))
+    } else {
+        (range.from(), range.to())
+    };
+    let code = doc.redacted(from..to);
+    let question = match args.join(" ") {
+        question if question.trim().is_empty() => "What does this code do?".to_string(),
+        question => question,
+    };
+    let file = doc
+        .path()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "an unsaved buffer".into());
+    let language = doc.language_name().unwrap_or("text").to_string();
+    let prompt = crate::model::EXPLAIN_PROMPT;
+    let messages = serde_json::json!([
+        { "role": "system", "content": prompt },
+        { "role": "user", "content": format!("{question}\n\nFrom {file} ({language}):\n\n```\n{code}\n```") },
+    ]);
+
+    // The answer streams into the popup as it is written. `opened` tells a popup the user closed
+    // from one not yet opened, so a closed one stays closed.
+    let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn({
+        let opened = opened.clone();
+        async move {
+            while let Some(text) = rx.recv().await {
+                let opened = opened.clone();
+                job::dispatch(move |editor, compositor| {
+                    show_answer(editor, compositor, text, &opened)
+                })
+                .await;
+            }
+        }
+    });
+    let callback = async move {
+        // Questions get the model's reasoning first: slower, and better answers.
+        let reply = crate::model::chat_streaming(messages, true, move |text| {
+            let _ = tx.send(text.to_string());
+        })
+        .await?;
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                let status = format!("Answered by {}", reply.by());
+                show_answer(editor, compositor, reply.text, &opened);
+                editor.set_status(status);
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+/// Shows `:ask`'s answer so far: in its popup if that is open, in a new one if none was opened yet,
+/// and nowhere if the user closed it.
+fn show_answer(
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    text: String,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    if let Some(popup) = compositor.find_id::<Popup<ui::Markdown>>("explain") {
+        popup.contents_mut().set_contents(text);
+        return;
+    }
+    if opened.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let contents = ui::Markdown::new(text, editor.syn_loader.clone());
+    let popup = Popup::new("explain", contents).position(Some(helix_core::Position::new(
+        editor.cursor().0.unwrap_or_default().row,
+        2,
+    )));
+    compositor.replace_or_push("explain", popup);
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -4350,6 +4561,31 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "rewrite",
+        aliases: &[],
+        doc: "Rewrite each selection as instructed, with the local model from OpenCode's config.",
+        fun: rewrite,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (1, None),
+            raw_after: Some(0),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "ask",
+        aliases: &["explain"],
+        doc: "Answer a question about the selection (or the cursor's line) in a popup, without \
+              editing, with the local model from OpenCode's config.",
+        fun: ask,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, None),
+            raw_after: Some(0),
             ..Signature::DEFAULT
         },
     },

@@ -14,6 +14,7 @@ pub mod job;
 pub mod keymap;
 pub mod logging;
 pub mod mcp;
+pub mod model;
 pub mod ui;
 pub mod watch;
 

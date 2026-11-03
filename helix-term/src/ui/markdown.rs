@@ -162,6 +162,11 @@ impl Markdown {
     ];
     const INDENT: &'static str = "  ";
 
+    /// Replaces the text, as when an answer streams in.
+    pub fn set_contents(&mut self, contents: String) {
+        self.contents = contents;
+    }
+
     pub fn new(contents: String, config_loader: Arc<ArcSwap<syntax::Loader>>) -> Self {
         Self {
             contents,
