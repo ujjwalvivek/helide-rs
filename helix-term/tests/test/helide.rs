@@ -34,7 +34,7 @@ async fn file_tree_opens_creates_renames_and_deletes() -> anyhow::Result<()> {
         vec![
             // The tree opens on a.rs; `j` moves to b.rs, enter opens it and returns to the editor.
             (
-                Some("<C-5>j<ret>ihi<esc>"),
+                Some("<C-1>j<ret>ihi<esc>"),
                 Some(&|app| {
                     assert_eq!(current_path(app), at("b.rs"));
                     let (_, doc) = current_ref!(app.editor);
@@ -43,7 +43,7 @@ async fn file_tree_opens_creates_renames_and_deletes() -> anyhow::Result<()> {
             ),
             // `a` creates a file next to the selected one and opens it.
             (
-                Some("<C-5>ac.rs<ret>"),
+                Some("<C-1>ac.rs<ret>"),
                 Some(&|app| {
                     assert!(at("c.rs").is_file());
                     assert_eq!(current_path(app), at("c.rs"));
@@ -51,7 +51,7 @@ async fn file_tree_opens_creates_renames_and_deletes() -> anyhow::Result<()> {
             ),
             // `r` renames the selected file, and the open buffer follows it.
             (
-                Some("<C-5>r<C-u>d.rs<ret>"),
+                Some("<C-1>r<C-u>d.rs<ret>"),
                 Some(&|app| {
                     assert!(!at("c.rs").exists());
                     assert!(at("d.rs").is_file());
@@ -60,7 +60,7 @@ async fn file_tree_opens_creates_renames_and_deletes() -> anyhow::Result<()> {
             ),
             // `d` deletes after confirmation; anything but `y` keeps the file.
             (
-                Some("<esc><C-5>dn<ret>"),
+                Some("<esc><C-1>dn<ret>"),
                 Some(&|_| assert!(at("d.rs").is_file())),
             ),
             (Some("dy<ret>"), Some(&|_| assert!(!at("d.rs").exists()))),
@@ -88,18 +88,18 @@ async fn file_tree_keys_toggle_focus() -> anyhow::Result<()> {
     test_key_sequences(
         &mut app,
         vec![
-            // C-2 hands focus back with the tree still open, so typing edits the buffer.
+            // C-3 hands focus back with the tree still open, so typing edits the buffer.
             (
-                Some("<C-5>j<C-2>ix<esc>"),
+                Some("<C-1>j<C-3>ix<esc>"),
                 Some(&|app| {
                     assert_eq!(current_path(app), dir_path.join("a.rs"));
                     let (_, doc) = current_ref!(app.editor);
                     assert_eq!(doc.text().to_string(), "x");
                 }),
             ),
-            // C-5 twice shows then hides the tree; keys after it reach the editor.
+            // C-1 twice shows then hides the tree; keys after it reach the editor.
             (
-                Some("<C-5><C-5>iy<esc>"),
+                Some("<C-1><C-1>iy<esc>"),
                 Some(&|app| {
                     let (_, doc) = current_ref!(app.editor);
                     assert_eq!(doc.text().to_string(), "xy");
@@ -193,7 +193,7 @@ async fn file_tree_opens_in_new_tab() -> anyhow::Result<()> {
         &mut app,
         vec![
             (
-                Some("<C-5>jt"),
+                Some("<C-1>jt"),
                 Some(&|app| {
                     assert_eq!(2, app.editor.tree.tab_count());
                     assert_eq!(current_path(app), dir_path.join("b.rs"));
