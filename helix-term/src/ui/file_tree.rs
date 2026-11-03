@@ -53,7 +53,7 @@ pub struct FileTree {
     expanded: HashSet<PathBuf>,
     selected: usize,
     scroll: usize,
-    /// Shows hidden files regardless of the file picker setting.
+    /// Shows hidden and ignored files regardless of the file picker settings.
     show_hidden: bool,
     pub visible: bool,
     pub focused: bool,
@@ -363,17 +363,20 @@ impl FileTree {
 fn read_dir(editor: &Editor, dir: &Path, show_hidden: bool) -> Vec<(PathBuf, bool)> {
     let config = editor.config();
     let picker = &config.file_picker;
-    let mut entries: Vec<(PathBuf, bool)> = ignore::WalkBuilder::new(dir)
-        .max_depth(Some(1))
+    let mut walk = ignore::WalkBuilder::new(dir);
+    walk.max_depth(Some(1))
         .hidden(picker.hidden && !show_hidden)
-        .parents(picker.parents)
-        .ignore(picker.ignore)
+        .parents(picker.parents && !show_hidden)
+        .ignore(picker.ignore && !show_hidden)
         .follow_links(picker.follow_symlinks)
-        .git_ignore(picker.git_ignore)
-        .git_global(picker.git_global)
-        .git_exclude(picker.git_exclude)
-        .add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
-        .add_custom_ignore_filename(".helix/ignore")
+        .git_ignore(picker.git_ignore && !show_hidden)
+        .git_global(picker.git_global && !show_hidden)
+        .git_exclude(picker.git_exclude && !show_hidden);
+    if !show_hidden {
+        walk.add_custom_ignore_filename(helix_loader::config_dir().join("ignore"))
+            .add_custom_ignore_filename(".helix/ignore");
+    }
+    let mut entries: Vec<(PathBuf, bool)> = walk
         .filter_entry(|entry| entry.file_name() != ".git")
         .build()
         .filter_map(|entry| {
