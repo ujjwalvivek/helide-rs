@@ -30,6 +30,10 @@ pub const COMMIT_PROMPT: &str = "Write a one-line git commit message for the sta
 pub const EXPLAIN_PROMPT: &str = "Answer the user's question about the code from their editor, \
      briefly, in Markdown.";
 
+/// Added to [`EXPLAIN_PROMPT`] when web search is available.
+pub const SEARCH_PROMPT: &str = " When the answer depends on documentation, versions or facts \
+     that may have changed, search the web with web_search first, and link the pages you used.";
+
 /// Requests on their way, for the status line's spinner.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 /// When the first of the requests now on their way was sent, in milliseconds since the epoch.
@@ -246,6 +250,8 @@ pub struct Reply {
     pub text: String,
     pub label: String,
     pub seconds: f64,
+    /// Tool calls the model made instead of (or before) answering, in the API's shape.
+    tool_calls: Vec<Value>,
 }
 
 impl Reply {
@@ -258,7 +264,7 @@ impl Reply {
 /// Sends one chat request and returns the answer. `think` lets a reasoning model reason first,
 /// which is slower and better for questions than for quick edits.
 pub async fn chat(messages: Value, think: bool) -> anyhow::Result<Reply> {
-    chat_with(messages, think, None).await
+    chat_with(messages, think, None, None).await
 }
 
 /// Like [`chat`], but the answer streams in: `on_text` gets the text so far as it arrives, at most
@@ -268,13 +274,118 @@ pub async fn chat_streaming(
     think: bool,
     on_text: impl Fn(&str) + Send + Sync,
 ) -> anyhow::Result<Reply> {
-    chat_with(messages, think, Some(&on_text)).await
+    chat_with(messages, think, Some(&on_text), None).await
+}
+
+/// The SearXNG instance to search, from `$SEARXNG_URL`, if one is set.
+pub fn search_url() -> Option<String> {
+    std::env::var("SEARXNG_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .map(|url| url.trim_end_matches('/').to_string())
+}
+
+/// Like [`chat_streaming`] with reasoning on, but the model may search the web first, through
+/// the SearXNG at `$SEARXNG_URL`. While it searches, `on_text` shows what it is looking for.
+pub async fn ask_streaming(
+    messages: Value,
+    on_text: impl Fn(&str) + Send + Sync,
+) -> anyhow::Result<Reply> {
+    /// Searches allowed before the model has to answer with what it has.
+    const ROUNDS: usize = 3;
+
+    let Some(search) = search_url() else {
+        return chat_with(messages, true, Some(&on_text), None).await;
+    };
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web. Returns titles, URLs and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": { "query": { "type": "string", "description": "What to search for" } },
+                "required": ["query"],
+            },
+        },
+    }]);
+    let started = Instant::now();
+    let mut messages = messages;
+    for round in 0..=ROUNDS {
+        let tools = (round < ROUNDS).then_some(&tools);
+        let mut reply = chat_with(messages.clone(), true, Some(&on_text), tools).await?;
+        if reply.tool_calls.is_empty() {
+            reply.seconds = started.elapsed().as_secs_f64();
+            return Ok(reply);
+        }
+        let list = messages.as_array_mut().context("messages should be a list")?;
+        list.push(json!({ "role": "assistant", "content": reply.text, "tool_calls": reply.tool_calls }));
+        for call in &reply.tool_calls {
+            let arguments: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}"))
+                    .unwrap_or_default();
+            let query = arguments["query"].as_str().unwrap_or_default().to_string();
+            on_text(&format!("*Searching the web for “{query}”…*"));
+            let result = match web_search(&search, &query).await {
+                Ok(result) => result,
+                Err(err) => format!("Search failed: {err}"),
+            };
+            list.push(json!({ "role": "tool", "tool_call_id": call["id"], "content": result }));
+        }
+    }
+    bail!("the model kept searching without answering")
+}
+
+/// One SearXNG search, as numbered results with title, URL and snippet.
+async fn web_search(base: &str, query: &str) -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("curl")
+        .args(["--silent", "--show-error", "--fail", "--max-time", "20", "--get"])
+        .args(["--data-urlencode", &format!("q={query}"), "--data", "format=json"])
+        .arg(format!("{base}/search"))
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("could not run curl")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let data: Value = serde_json::from_slice(&output.stdout).context("search gave no JSON")?;
+    let results: Vec<String> = data["results"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(i, result)| {
+            let snippet: String = result["content"]
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(300)
+                .collect();
+            format!(
+                "{}. {}\n   {}\n   {snippet}",
+                i + 1,
+                result["title"].as_str().unwrap_or_default(),
+                result["url"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    if results.is_empty() {
+        return Ok(format!("No results for \"{query}\"."));
+    }
+    Ok(results.join("\n\n"))
 }
 
 async fn chat_with(
     messages: Value,
     think: bool,
     on_text: Option<&(dyn Fn(&str) + Send + Sync)>,
+    tools: Option<&Value>,
 ) -> anyhow::Result<Reply> {
     let endpoint = endpoint()?;
     let _pending = Pending::start();
@@ -287,6 +398,9 @@ async fn chat_with(
     });
     if on_text.is_some() {
         body["stream"] = true.into();
+    }
+    if let Some(tools) = tools {
+        body["tools"] = tools.clone();
     }
     let mut config = format!(
         "url = \"{}/chat/completions\"\n\
@@ -320,6 +434,8 @@ async fn chat_with(
     let mut lines =
         tokio::io::BufReader::new(child.stdout.take().context("curl has no output")?).lines();
     let (mut answer, mut rest) = (String::new(), String::new());
+    // Streamed tool calls arrive in pieces, each piece naming the call's index.
+    let mut calls: Vec<Value> = Vec::new();
     let mut shown = Instant::now();
     while let Some(line) = lines.next_line().await? {
         match (line.strip_prefix("data: "), on_text) {
@@ -328,8 +444,25 @@ async fn chat_with(
                 let Ok(chunk) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
-                if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
+                let delta = &chunk["choices"][0]["delta"];
+                if let Some(text) = delta["content"].as_str() {
                     answer.push_str(text);
+                }
+                for piece in delta["tool_calls"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                    let index = piece["index"].as_u64().unwrap_or(0) as usize;
+                    while calls.len() <= index {
+                        calls.push(json!({ "id": "", "type": "function", "function": { "name": "", "arguments": "" } }));
+                    }
+                    let call = &mut calls[index];
+                    if let Some(id) = piece["id"].as_str() {
+                        call["id"] = id.into();
+                    }
+                    for field in ["name", "arguments"] {
+                        if let Some(part) = piece["function"][field].as_str() {
+                            let joined = format!("{}{part}", call["function"][field].as_str().unwrap_or_default());
+                            call["function"][field] = joined.into();
+                        }
+                    }
                 }
                 let text = answer.trim_start_matches(['\n', '\r']);
                 if !text.is_empty() && shown.elapsed() >= std::time::Duration::from_millis(100) {
@@ -356,7 +489,9 @@ async fn chat_with(
     let (response, status) = stdout.rsplit_once('\n').unwrap_or(("", stdout));
     let text = match on_text {
         Some(on_text) if status == "200" => {
-            on_text(answer.trim_start_matches(['\n', '\r']));
+            if calls.is_empty() {
+                on_text(answer.trim_start_matches(['\n', '\r']));
+            }
             answer
         }
         _ => {
@@ -367,6 +502,9 @@ async fn chat_with(
                     .as_str()
                     .unwrap_or("request failed");
                 bail!("{} {status}: {message}", endpoint.label);
+            }
+            if let Some(list) = response["choices"][0]["message"]["tool_calls"].as_array() {
+                calls = list.clone();
             }
             response["choices"][0]["message"]["content"]
                 .as_str()
@@ -381,6 +519,7 @@ async fn chat_with(
             .to_string(),
         label: endpoint.label,
         seconds: started.elapsed().as_secs_f64(),
+        tool_calls: calls,
     })
 }
 

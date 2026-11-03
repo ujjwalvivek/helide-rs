@@ -3073,7 +3073,10 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "an unsaved buffer".into());
     let language = doc.language_name().unwrap_or("text").to_string();
-    let prompt = crate::model::EXPLAIN_PROMPT;
+    let mut prompt = crate::model::EXPLAIN_PROMPT.to_string();
+    if crate::model::search_url().is_some() {
+        prompt.push_str(crate::model::SEARCH_PROMPT);
+    }
     let messages = serde_json::json!([
         { "role": "system", "content": prompt },
         { "role": "user", "content": format!("{question}\n\nFrom {file} ({language}):\n\n```\n{code}\n```") },
@@ -3097,7 +3100,7 @@ fn ask(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::
     });
     let callback = async move {
         // Questions get the model's reasoning first: slower, and better answers.
-        let reply = crate::model::chat_streaming(messages, true, move |text| {
+        let reply = crate::model::ask_streaming(messages, move |text| {
             let _ = tx.send(text.to_string());
         })
         .await?;
@@ -4580,7 +4583,8 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         name: "ask",
         aliases: &["explain"],
         doc: "Answer a question about the selection (or the cursor's line) in a popup, without \
-              editing, with the local model from OpenCode's config.",
+              editing, with the local model from OpenCode's config, searching the web when \
+              $SEARXNG_URL is set.",
         fun: ask,
         completer: CommandCompleter::none(),
         signature: Signature {
