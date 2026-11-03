@@ -328,3 +328,11 @@
   left: (identifier) @type.definition
   type: (type (identifier) @_ann))
  (#eq? @_ann "TypeAlias"))
+
+; -------
+; Docstrings (last, so they win over the plain string rule)
+; -------
+
+(module . (expression_statement (string) @comment.docstring))
+(class_definition body: (block . (expression_statement (string) @comment.docstring)))
+(function_definition body: (block . (expression_statement (string) @comment.docstring)))
