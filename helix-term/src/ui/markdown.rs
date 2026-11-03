@@ -206,6 +206,9 @@ impl Markdown {
         let numbered_list_style = get_theme(Self::NUMBERED_LIST_STYLE);
         let unnumbered_list_style = get_theme(Self::UNNUMBERED_LIST_STYLE);
         let rule_style = get_theme(Self::RULE_STYLE);
+        let link_style = get_theme("markup.link.url");
+        // The text of the link being read, to leave out an address it already shows.
+        let mut link_text = String::new();
         let heading_styles: Vec<Style> = Self::HEADING_STYLES
             .iter()
             .map(|key| get_theme(key))
@@ -279,7 +282,15 @@ impl Markdown {
                     }
                 }
                 Event::End(tag) => {
-                    tags.pop();
+                    let start = tags.pop();
+                    // A link's address follows its text, so it can be read and clicked (Ghostty
+                    // opens addresses on screen; hold Shift past the editor's mouse handling).
+                    if let Some(Tag::Link { dest_url, .. }) = start {
+                        let text = std::mem::take(&mut link_text);
+                        if !dest_url.is_empty() && text.trim() != dest_url.as_ref() {
+                            spans.push(Span::styled(format!(" ({dest_url})"), link_style));
+                        }
+                    }
                     match tag {
                         TagEnd::Heading(_)
                         | TagEnd::Paragraph
@@ -326,6 +337,10 @@ impl Markdown {
                             Some(Tag::Strong) => text_style.add_modifier(Modifier::BOLD),
                             Some(Tag::Strikethrough) => {
                                 text_style.add_modifier(Modifier::CROSSED_OUT)
+                            }
+                            Some(Tag::Link { .. }) => {
+                                link_text.push_str(&text);
+                                text_style.underline_style(helix_view::graphics::UnderlineStyle::Line)
                             }
                             _ => text_style,
                         };
