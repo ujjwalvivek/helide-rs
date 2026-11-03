@@ -372,6 +372,16 @@ fn build_theme_values(
         highlights.push(style);
     }
 
+    // Docstrings read like comments, upright so they stand apart from ordinary ones.
+    if !styles.contains_key("comment.docstring") {
+        if let Some(comment) = styles.get("comment").copied() {
+            let style = comment.remove_modifier(Modifier::ITALIC);
+            styles.insert("comment.docstring".into(), style);
+            scopes.push("comment.docstring".into());
+            highlights.push(style);
+        }
+    }
+
     (styles, scopes, highlights, rainbow_length, warnings)
 }
 
