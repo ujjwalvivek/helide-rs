@@ -153,6 +153,8 @@ pub struct EditorView {
     buffer_strips: HashMap<ViewId, frame::TabStrip>,
     /// Each split's tab row last frame: its top view, the columns it spans, and its files.
     tab_columns: Vec<TabColumn>,
+    /// The row each file's tab stays in while no split shows it, by the row's top view.
+    tab_home: HashMap<DocumentId, ViewId>,
     /// When the agent tabs were last checked for a conversation Claude moved to.
     agents_followed: Option<std::time::Instant>,
     /// Time travel: the version of each open file last kept, and when the edits were last
@@ -227,6 +229,7 @@ impl EditorView {
             buffer_hits: Vec::new(),
             buffer_strips: HashMap::new(),
             tab_columns: Vec::new(),
+            tab_home: HashMap::new(),
             agents_followed: None,
             history_seen: HashMap::new(),
             history_at: None,
@@ -2692,36 +2695,37 @@ impl EditorView {
                 .unwrap_or(0)
         };
         let focus = editor.tree.focus;
-        // A file shown in splits has a tab in each of their rows; one shown nowhere sits in the
-        // row of the split that showed it last, else the focused split's.
-        let owner = |doc: DocumentId| -> Vec<usize> {
+        // A file shown in splits has a tab in each of their rows. Each file also keeps a home
+        // row, where its tab stays while no split shows it: the row it was last shown in, or
+        // for a file never shown, the focused split's.
+        let focused_column = views
+            .iter()
+            .find(|view| view.id == focus)
+            .map_or(0, |view| column_of(view));
+        let mut owners: Vec<Vec<usize>> = Vec::with_capacity(ordered.len());
+        for &doc in &ordered {
             let mut showing: Vec<usize> = views
                 .iter()
                 .filter(|view| view.doc == doc)
                 .map(|view| column_of(view))
                 .collect();
-            if !showing.is_empty() {
-                showing.sort_unstable();
-                showing.dedup();
-                return showing;
+            showing.sort_unstable();
+            showing.dedup();
+            let home = self
+                .tab_home
+                .get(&doc)
+                .and_then(|id| tops.iter().position(|view| view.id == *id));
+            let home = match home {
+                Some(home) if showing.is_empty() || showing.contains(&home) => home,
+                _ => showing.first().copied().unwrap_or(focused_column),
+            };
+            self.tab_home.insert(doc, tops[home].id);
+            if !showing.contains(&home) {
+                showing.push(home);
             }
-            let seen = views
-                .iter()
-                .filter_map(|view| {
-                    let history = &view.docs_access_history;
-                    let at = history.iter().position(|&d| d == doc)?;
-                    Some((history.len() - at, *view))
-                })
-                .min_by_key(|&(distance, _)| distance);
-            vec![match seen {
-                Some((_, view)) => column_of(view),
-                None => views
-                    .iter()
-                    .find(|view| view.id == focus)
-                    .map_or(0, |view| column_of(view)),
-            }]
-        };
-        let owners: Vec<Vec<usize>> = ordered.iter().map(|&doc| owner(doc)).collect();
+            owners.push(showing);
+        }
+        self.tab_home.retain(|doc, _| ordered.contains(doc));
         self.buffer_strips
             .retain(|id, _| tops.iter().any(|view| view.id == *id));
         self.buffer_hits.clear();
