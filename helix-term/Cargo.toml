@@ -82,6 +82,8 @@ open = "5.3.5"
 toml.workspace = true
 
 serde_json = "1.0"
+# Reading OpenCode's session database, to know when an agent's turn ends.
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 
 dashmap = "6.2"
