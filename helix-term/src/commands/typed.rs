@@ -3467,6 +3467,108 @@ const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
     ..Flag::DEFAULT
 };
 
+/// :history (:time-travel): the current file's kept versions, newest first, with each old text
+/// in the preview. Enter puts that version back as one change, which u undoes. `:history git`
+/// steps through the commits that changed the file instead.
+fn history(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let doc = doc!(cx.editor);
+    let path = doc
+        .path()
+        .context("This buffer has no file, so it has no history.")?
+        .to_path_buf();
+    let doc_id = doc.id();
+    let current = doc.text().to_string();
+    let git = match args.first() {
+        None => false,
+        Some("git") => true,
+        Some(other) => bail!("Unknown history mode '{other}': use :history or :history git."),
+    };
+    let versions = if git {
+        crate::history::git_versions(&path, 50)
+    } else {
+        crate::history::versions(&path)
+    };
+    if versions.is_empty() {
+        if git {
+            bail!("No commits have changed this file.");
+        }
+        bail!("No history for this file yet: it starts when the file is opened or saved.");
+    }
+    let items: Vec<(crate::history::Version, String)> = versions
+        .into_iter()
+        .map(|version| {
+            let changes = std::fs::read_to_string(&version.copy)
+                .map(|old| {
+                    let (adds, dels) = crate::history::line_changes(&current, &old);
+                    if adds + dels == 0 {
+                        "same as now".to_string()
+                    } else {
+                        format!("+{adds} −{dels}")
+                    }
+                })
+                .unwrap_or_default();
+            (version, changes)
+        })
+        .collect();
+    let callback = async move {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |_editor: &mut Editor, compositor: &mut Compositor| {
+                type Item = (crate::history::Version, String);
+                let columns = [
+                    ui::PickerColumn::new("age", |(version, _): &Item, _| version.age().into()),
+                    ui::PickerColumn::new("kind", |(version, _): &Item, _| {
+                        version
+                            .subject
+                            .clone()
+                            .unwrap_or_else(|| version.kind.label().to_string())
+                            .into()
+                    }),
+                    ui::PickerColumn::new("against now", |(_, changes): &Item, _| {
+                        changes.as_str().into()
+                    }),
+                ];
+                let picker = ui::Picker::new(
+                    columns,
+                    0,
+                    items,
+                    (),
+                    move |cx, (version, _): &Item, _action| {
+                        let old = match std::fs::read_to_string(&version.copy) {
+                            Ok(old) => Rope::from_str(&old),
+                            Err(err) => {
+                                cx.editor.set_error(format!("cannot read that version: {err}"));
+                                return;
+                            }
+                        };
+                        let Some(doc) = cx.editor.documents.get_mut(&doc_id) else {
+                            return;
+                        };
+                        let view = view_mut!(cx.editor);
+                        let transaction = helix_core::diff::compare_ropes(doc.text(), &old);
+                        doc.apply(&transaction, view.id);
+                        doc.append_changes_to_history(view);
+                        let age = version.age();
+                        cx.editor.set_status(format!(
+                            "Put back the version from {} (u undoes).",
+                            if age == "now" { "just now".to_string() } else { format!("{age} ago") }
+                        ));
+                    },
+                )
+                .with_preview(|_editor, (version, _): &Item| {
+                    Some((version.copy.as_path().into(), None))
+                });
+                compositor.push(Box::new(overlaid(picker)))
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+    Ok(())
+}
+
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "exit",
@@ -4572,6 +4674,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "history",
+        aliases: &["time-travel"],
+        doc: "Time travel: the current file's kept versions (or with `git`, the commits that changed it), with a preview; Enter puts one back.",
+        fun: history,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(1)),
             ..Signature::DEFAULT
         },
     },
