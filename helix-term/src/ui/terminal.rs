@@ -834,6 +834,7 @@ impl TerminalPanel {
                 Label::new(format!("{} {}{mark} ×", i + 1, names.join(" · ")), style)
             })
             .collect();
+        let keys: Vec<u64> = self.groups().into_iter().map(u64::from).collect();
         let hits = self.strip.draw(
             surface,
             area.y,
@@ -841,6 +842,7 @@ impl TerminalPanel {
             area.right() - 1,
             &title,
             &labels,
+            &keys,
             active,
             roles.label(),
             Some(roles.label()),
