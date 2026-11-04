@@ -1,69 +1,110 @@
-<div align="center">
+# Helide
 
-<h1>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="logo_dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="logo_light.svg">
-  <img alt="Helix" height="128" src="logo_light.svg">
-</picture>
-</h1>
+Helix, with the rest of the workspace built in: a file tree, a git panel, terminals and AI
+agents around the editor, in one terminal window.
 
-[![Build status](https://github.com/helix-editor/helix/actions/workflows/build.yml/badge.svg)](https://github.com/helix-editor/helix/actions)
-[![GitHub Release](https://img.shields.io/github/v/release/helix-editor/helix)](https://github.com/helix-editor/helix/releases/latest)
-[![Documentation](https://shields.io/badge/-documentation-452859)](https://docs.helix-editor.com/)
-[![GitHub contributors](https://img.shields.io/github/contributors/helix-editor/helix)](https://github.com/helix-editor/helix/graphs/contributors)
-[![Matrix Space](https://img.shields.io/matrix/helix-community:matrix.org)](https://matrix.to/#/#helix-community:matrix.org)
+![Helide with the file tree, a Rust file, a terminal and OpenCode](docs/helide/hero.webp)
 
-</div>
+Helide is a fork of [Helix](https://github.com/helix-editor/helix) 25.07. Everything Helix does
+still works the same way; Helide adds panels and keeps out of the editing model. I wanted to stop
+switching between an editor, a git client, a terminal multiplexer and an agent window, without
+moving to a GUI editor.
 
-![Screenshot](./screenshot.png)
+> **This branch is helide × Otari**, built for the Mozilla Otari hackathon: the model commands
+> route through Otari. The `helide` branch is the same editor with a local model instead.
 
-A [Kakoune](https://github.com/mawww/kakoune) / [Neovim](https://github.com/neovim/neovim) inspired editor, written in Rust.
+## What it adds
 
-The editing model is very heavily based on Kakoune; during development I found
-myself agreeing with most of Kakoune's design decisions.
+**Panels**, each toggled with one key and resized by dragging its edge:
 
-For more information, see the [website](https://helix-editor.com) or
-[documentation](https://docs.helix-editor.com/).
+| Key | Panel |
+|---|---|
+| Ctrl+1 | File tree, with code stats for the folder you are in |
+| Ctrl+2 | Git panel: stage, commit, branches, stashes, commit history |
+| Ctrl+4 | Terminal, with tabs and side-by-side panes |
+| Ctrl+5 | Agents: Claude Code or OpenCode in tabs |
+| F11 or Space z | Zen: hide every panel |
 
-All shortcuts/keymaps can be found [in the documentation on the website](https://docs.helix-editor.com/keymap.html).
+**Git.** Changes, staged files and untracked files with their hunks, and a commit graph with a
+summary of the selected commit underneath. A click opens a file's diff as a tab, tinted green
+and red; a double click lists its hunks; a right click opens the file. Space stages, x
+discards, c commits, m writes a commit message with a model.
 
-[Troubleshooting](https://github.com/helix-editor/helix/wiki/Troubleshooting)
+![The git panel with a staged file, hunks, the commit list and a tinted diff](docs/helide/git.webp)
 
-> **helide-rs × Otari:** this branch adds `:rewrite`, `:ask` and commit messages written by
-> open-weight models through [Otari](https://otari.ai), with secrets masked and redacted before
-> anything leaves the editor. See [docs/otari](./docs/otari/README.md) for how it works and the
-> results of real calls.
+**Tabs per split.** Each side-by-side split has its own row of file tabs. Drag a tab along the
+row to reorder it, onto another split's row to move it there, or onto the terminal or an agent
+to type its path. Double-click a tab to rename or move the file.
 
-# Features
+![Two splits, each with its own row of tabs](docs/helide/splits.webp)
 
-- Vim-like modal editing
-- Multiple selections
-- Built-in language server support
-- Smart, incremental syntax highlighting and code editing via tree-sitter
+**Agents.** Claude Code and OpenCode run in the agent panel and come back on the same
+conversation when you reopen the project. Claude Code connects through the same protocol its
+VS Code extension uses, so it sees your selection and proposes edits as diffs. Space @ mentions
+the current file and selection in the agent. A tab shows ● while the agent works and ✓ when it
+finished while you were elsewhere.
 
-Although it's primarily a terminal-based editor, I am interested in exploring
-a custom renderer (similar to Emacs) using wgpu.
+**Time travel.** Helide keeps a private copy of every file you open and save. `:history` lists
+the versions with a preview tinted against the file as it is now, and Enter puts one back (u
+undoes it). `:history git` does the same through the commits that changed the file.
 
-Note: Only certain languages have indentation definitions at the moment. Check
-`runtime/queries/<lang>/` for `indents.scm`.
+![The history picker with a tinted preview of an older version](docs/helide/history.webp)
 
-# Installation
+**Markdown preview.** Space m, or PREVIEW on the border, renders the Markdown file beside it,
+with tables, code blocks and quotes.
 
-[Installation documentation](https://docs.helix-editor.com/install.html).
+![A README rendered beside its source](docs/helide/preview.webp)
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/helix-editor.svg?exclude_unsupported=1)](https://repology.org/project/helix-editor/versions)
+**Smaller things**
 
-# Contributing
+- Sticky headers: the classes and functions you are scrolled into stay pinned at the top.
+  Markdown headings too.
+- The workspace (tabs, splits, panels, terminal and agent tabs) is saved per project and
+  restored by `hx`, `hx .` or `hx folder/`. `hx file` opens just the file, for a quick edit.
+- Open files reload when they change on disk; the tree and git panel update as files change.
+- `:rewrite`, `:ask` and the git panel's commit messages go through [Otari](https://otari.ai) to
+  open-weight models, with secrets masked before anything leaves the editor. See
+  [docs/otari](./docs/otari/README.md) for how it works and the results of real calls.
+- `hx msg` talks to a running editor over a socket: open files, run commands, type keys.
 
-Contributing guidelines can be found [here](./docs/CONTRIBUTING.md).
+## Install
 
-# Getting help
+**From a release.** Download the tarball from
+[Releases](https://github.com/ujjwalvivek/helide-rs/releases), unpack it anywhere and run the
+`hx` inside. It finds the `runtime` folder next to it. Linux x86_64 only for now.
 
-Your question might already be answered on the [FAQ](https://github.com/helix-editor/helix/wiki/FAQ).
+```sh
+tar xf helide-v0.1.0-x86_64-linux.tar.xz
+./helide-v0.1.0-x86_64-linux/hx .
+```
 
-Discuss the project on the community [Matrix Space](https://matrix.to/#/#helix-community:matrix.org) (make sure to join `#helix-editor:matrix.org` if you're on a client that doesn't support Matrix Spaces yet).
+**From source**, with Rust installed:
 
-# Credits
+```sh
+git clone https://github.com/ujjwalvivek/helide-rs
+cd helide-rs
+cargo install --path helix-term --locked
+ln -Ts "$PWD/runtime" ~/.config/helix/runtime
+hx --grammar fetch && hx --grammar build
+```
 
-Thanks to [@jakenvac](https://github.com/jakenvac) for designing the logo!
+Helide reads your Helix config in `~/.config/helix`. A Nerd Font makes the file icons show.
+
+The agent panel needs `claude` or `opencode` on your PATH. The code stats need
+[scc](https://github.com/boyter/scc).
+
+## Branches and versions
+
+- `helide` is the main branch. Every change is tagged: v0.1.0, v0.1.1 and so on.
+- `helide-rs-mozilla` is the same editor with [Otari](https://otari.ai) routing for the model
+  commands, built for the Mozilla Otari hackathon. Its tags end in `-otari`.
+- `master` mirrors upstream Helix, to merge from.
+
+## How it was built
+
+Built with Claude Code from late October 2026: I decided what each part should do and tested
+every change on screen, Claude wrote most of the code. If you try it, I would like to know what
+breaks first.
+
+Helide is licensed under the MPL 2.0, like Helix. For Helix itself, its documentation and its
+community, see [helix-editor.com](https://helix-editor.com).
