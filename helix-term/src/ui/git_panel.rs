@@ -19,12 +19,11 @@ use helix_core::{
 use helix_view::{
     align_view,
     document::Document,
-    DocumentId,
     editor::Action,
     graphics::{Modifier, Rect},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Align, Editor, Theme, View,
+    Align, DocumentId, Editor, Theme, View,
 };
 use tokio::io::AsyncWriteExt;
 use tui::buffer::Buffer as Surface;
@@ -184,7 +183,23 @@ pub struct GitPanel {
     last_refresh: Option<Instant>,
     rows_area: Rect,
     area: Rect,
+    /// The commit summarised at the bottom of the panel, and the hash being read for it.
+    detail: Option<CommitDetail>,
+    detail_wanted: Option<String>,
 }
+
+/// What the summary at the bottom of the panel shows for one commit.
+struct CommitDetail {
+    hash: String,
+    subject: String,
+    author: String,
+    when: String,
+    /// Changed files with lines added and removed (`None` for binary files).
+    files: Vec<(String, Option<(u32, u32)>)>,
+}
+
+/// Rows the commit summary takes at the bottom of the panel, when the panel is tall enough.
+const SUMMARY_HEIGHT: u16 = 9;
 
 impl GitPanel {
     /// Hidden: show and focus. Shown but unfocused: focus. Focused: hide.
@@ -508,7 +523,123 @@ impl GitPanel {
             && row < self.area.bottom()
     }
 
+    /// Draws the panel: its rows, and under them, when there is room, a summary of the selected
+    /// commit (HEAD's when no commit is selected).
     pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
+        let summary = if area.height >= SUMMARY_HEIGHT * 2 && self.snapshot.repo.is_some() {
+            SUMMARY_HEIGHT
+        } else {
+            0
+        };
+        let rows = Rect {
+            height: area.height - summary,
+            ..area
+        };
+        self.render_rows(rows, surface, theme);
+        self.area = area;
+        if summary > 0 {
+            self.want_detail();
+            let bottom = Rect::new(area.x, area.bottom() - summary, area.width, summary);
+            self.render_summary(bottom, surface, &Roles::new(theme));
+        }
+    }
+
+    /// Reads the summarised commit's details in the background when it changed.
+    fn want_detail(&mut self) {
+        let Some(repo) = self.snapshot.repo.clone() else {
+            return;
+        };
+        let Some(hash) = self
+            .selected_commit()
+            .or(self.snapshot.commits.first())
+            .map(|commit| commit.hash.clone())
+        else {
+            return;
+        };
+        if self.detail.as_ref().is_some_and(|d| d.hash == hash)
+            || self.detail_wanted.as_deref() == Some(hash.as_str())
+        {
+            return;
+        }
+        self.detail_wanted = Some(hash.clone());
+        tokio::spawn(async move {
+            let detail = read_detail(&repo, &hash).await;
+            crate::job::dispatch(move |_, compositor| {
+                if let Some(editor_view) = compositor.find::<EditorView>() {
+                    let panel = &mut editor_view.git;
+                    if panel.detail_wanted.as_deref() == Some(hash.as_str()) {
+                        panel.detail_wanted = None;
+                        panel.detail = detail;
+                    }
+                }
+            })
+            .await;
+        });
+    }
+
+    fn render_summary(&self, area: Rect, surface: &mut Surface, roles: &Roles) {
+        let width = area.width.saturating_sub(2) as usize;
+        let x = area.x + 1;
+        let mut y = area.y;
+        // A rule with the short hash in it separates the summary from the rows.
+        let rule: String = "─".repeat(area.width as usize);
+        surface.set_stringn(area.x, y, &rule, area.width as usize, roles.faint);
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        let short = format!(" {} ", &detail.hash[..detail.hash.len().min(7)]);
+        surface.set_string(x, y, &short, roles.accent);
+        y += 1;
+        for line in wrap(&detail.subject, width).into_iter().take(2) {
+            surface.set_stringn(x, y, &line, width, roles.text.add_modifier(Modifier::BOLD));
+            y += 1;
+        }
+        let meta = format!("{} · {}", detail.author, detail.when);
+        surface.set_stringn(x, y, &meta, width, roles.muted);
+        y += 1;
+        let (adds, dels) = detail
+            .files
+            .iter()
+            .filter_map(|(_, n)| *n)
+            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
+        let count = detail.files.len();
+        let files = format!("{count} file{} ", if count == 1 { "" } else { "s" });
+        surface.set_stringn(x, y, &files, width, roles.muted);
+        let mut cx = x + files.width() as u16;
+        for (text, style) in [
+            (format!("+{adds} "), roles.plus),
+            (format!("−{dels}"), roles.minus),
+        ] {
+            surface.set_string(cx, y, &text, style);
+            cx += text.width() as u16;
+        }
+        y += 1;
+        let shown = (area.bottom() - y) as usize;
+        for (i, (path, numbers)) in detail.files.iter().enumerate().take(shown) {
+            if i + 1 == shown && detail.files.len() > shown {
+                let more = format!("and {} more", detail.files.len() - i);
+                surface.set_stringn(x, y, &more, width, roles.faint);
+                break;
+            }
+            let numbers = match numbers {
+                Some((a, d)) => format!(" +{a} −{d}"),
+                None => " binary".to_string(),
+            };
+            let room = width.saturating_sub(numbers.width());
+            let name = shorten_path(path, room);
+            surface.set_stringn(x, y, &name, room, roles.text);
+            let nx = x + name.width() as u16;
+            if let Some((plus, minus)) = numbers.trim_start().split_once(' ') {
+                surface.set_string(nx + 1, y, plus, roles.plus);
+                surface.set_string(nx + 2 + plus.width() as u16, y, minus, roles.minus);
+            } else {
+                surface.set_string(nx, y, &numbers, roles.faint);
+            }
+            y += 1;
+        }
+    }
+
+    fn render_rows(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
         self.area = area;
         if self
             .last_refresh
@@ -938,7 +1069,14 @@ impl GitPanel {
             let args = match entry.section {
                 Section::Staged => vec!["diff", WHOLE_FILE, "--cached", "--", &entry.path],
                 Section::Untracked => {
-                    vec!["diff", WHOLE_FILE, "--no-index", "--", "/dev/null", &entry.path]
+                    vec![
+                        "diff",
+                        WHOLE_FILE,
+                        "--no-index",
+                        "--",
+                        "/dev/null",
+                        &entry.path,
+                    ]
                 }
                 _ => vec!["diff", WHOLE_FILE, "--", &entry.path],
             };
@@ -1980,7 +2118,10 @@ fn replace_text(
     let line = old.char_to_line(doc.selection(view).primary().cursor(old.slice(..)));
     let offset = doc.view_offset(view);
     let top = old.char_to_line(offset.anchor.min(old.len_chars()));
-    let tx = Transaction::change(&old, std::iter::once((0, old.len_chars(), Some(text.into()))));
+    let tx = Transaction::change(
+        &old,
+        std::iter::once((0, old.len_chars(), Some(text.into()))),
+    );
     doc.apply(&tx, view);
     // Into the history and marked saved, so the tab never asks to be saved.
     doc.append_changes_to_history(view_ref);
@@ -2174,9 +2315,73 @@ mod marked_file_tests {
 
     #[test]
     fn numbers_follow_the_new_file_and_skip_removed_lines() {
-        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let diff =
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
         let (text, labels) = marked_file(diff);
         assert_eq!(text, " one\n-two\n+TWO\n three\n");
         assert_eq!(labels.unwrap(), vec![Some(1), None, Some(2), Some(3)]);
     }
+}
+
+/// The summary of one commit: subject, author, age and its changed files with line counts.
+async fn read_detail(repo: &Path, hash: &str) -> Option<CommitDetail> {
+    let args = |extra: &[&str]| -> Vec<String> { extra.iter().map(|s| s.to_string()).collect() };
+    let head_args = args(&["show", "--no-patch", "--format=%s%x1f%an%x1f%cr", hash]);
+    let stat_args = args(&["show", "--numstat", "--format=", hash]);
+    let (head, stat) = tokio::join!(git(repo, &head_args, None), git(repo, &stat_args, None),);
+    let head = head.ok().filter(|o| o.success)?;
+    let mut fields = head.stdout.trim_end().splitn(3, '\x1f');
+    let subject = fields.next()?.to_string();
+    let author = fields.next().unwrap_or_default().to_string();
+    let when = fields.next().unwrap_or_default().to_string();
+    let files = stat
+        .ok()
+        .filter(|o| o.success)
+        .map(|o| {
+            o.stdout
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(3, '\t');
+                    let (a, d, path) = (parts.next()?, parts.next()?, parts.next()?);
+                    let numbers = a.parse().ok().zip(d.parse().ok());
+                    Some((path.to_string(), numbers))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CommitDetail {
+        hash: hash.to_string(),
+        subject,
+        author,
+        when,
+        files,
+    })
+}
+
+/// Splits `text` into lines of at most `width` columns, at spaces where it can.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split(' ') {
+        let line = lines.last_mut().expect("never empty");
+        if !line.is_empty() && line.width() + 1 + word.width() > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
+}
+
+/// A path cut from the left to fit `width` columns, keeping the file name.
+fn shorten_path(path: &str, width: usize) -> String {
+    if path.width() <= width {
+        return path.to_string();
+    }
+    let chars: Vec<char> = path.chars().collect();
+    let keep = width.saturating_sub(1);
+    let tail: String = chars[chars.len().saturating_sub(keep)..].iter().collect();
+    format!("…{tail}")
 }
