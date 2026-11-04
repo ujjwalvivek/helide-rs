@@ -76,6 +76,8 @@ struct Session {
     events: Receiver<TermEvent>,
     /// What the tab strip shows: the program's name.
     name: String,
+    /// A name the tab was given by double-clicking it, shown instead of the program's.
+    title: Option<String>,
     /// The tab this session belongs to; sessions sharing a tab sit side by side as panes.
     group: u32,
     /// The agent session this tab runs, for agent tabs.
@@ -160,6 +162,7 @@ impl Session {
             events,
             name,
             group: 0,
+            title: agent.as_ref().and_then(|a| a.name.clone()),
             agent,
             pid,
             busy_since: None,
@@ -374,6 +377,39 @@ impl TerminalPanel {
             }
         }
         groups
+    }
+
+    /// The name tab `index` shows: its given name, or its programs' names.
+    pub fn tab_title(&self, index: usize) -> Option<String> {
+        let group = *self.groups().get(index)?;
+        let members: Vec<&Session> = self.sessions.iter().filter(|s| s.group == group).collect();
+        Some(
+            members
+                .iter()
+                .find_map(|s| s.title.clone())
+                .unwrap_or_else(|| {
+                    members
+                        .iter()
+                        .map(|s| s.label())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                }),
+        )
+    }
+
+    /// Gives tab `index` a name, or takes it away when `name` is empty. An agent tab keeps it
+    /// in its saved session, so it comes back with the tab.
+    pub fn rename_tab(&mut self, index: usize, name: &str) {
+        let Some(&group) = self.groups().get(index) else {
+            return;
+        };
+        let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
+        for session in self.sessions.iter_mut().filter(|s| s.group == group) {
+            session.title = name.clone();
+            if let Some(agent) = session.agent.as_mut() {
+                agent.name = name.clone();
+            }
+        }
     }
 
     /// Shows tab `index`, focusing its first pane.
@@ -637,7 +673,10 @@ impl TerminalPanel {
             .map(|(i, group)| {
                 let members: Vec<&Session> =
                     self.sessions.iter().filter(|s| s.group == group).collect();
-                let names: Vec<String> = members.iter().map(|s| short_label(s.label())).collect();
+                let names: Vec<String> = match members.iter().find_map(|s| s.title.as_deref()) {
+                    Some(title) => vec![short_label(title)],
+                    None => members.iter().map(|s| short_label(s.label())).collect(),
+                };
                 // The shown tab is a filled chip, like the editor's. Status is a glyph, never colour
                 // alone: ● working, ✓ finished while away.
                 let chip = roles
@@ -669,6 +708,7 @@ impl TerminalPanel {
             &labels,
             active,
             roles.label(),
+            Some(roles.label()),
         );
         self.tab_hits = hits;
     }

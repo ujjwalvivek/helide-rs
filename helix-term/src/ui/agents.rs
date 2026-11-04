@@ -56,6 +56,9 @@ impl AgentKind {
 pub struct AgentSession {
     pub kind: AgentKind,
     pub id: String,
+    /// A name the tab was given by double-clicking it; the agent's name otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl AgentSession {
@@ -64,7 +67,11 @@ impl AgentSession {
             AgentKind::Claude => uuid_v4(),
             AgentKind::OpenCode => opencode_id(),
         };
-        Self { kind, id }
+        Self {
+            kind,
+            id,
+            name: None,
+        }
     }
 
     /// The command line that starts this tab, new or resumed.
@@ -468,6 +475,7 @@ mod tests {
         let opencode = AgentSession {
             kind: AgentKind::OpenCode,
             id: "ses_x".into(),
+            name: None,
         };
         assert_eq!(opencode.command(), vec!["opencode", "--session", "ses_x"]);
         assert_eq!(
@@ -482,6 +490,7 @@ mod tests {
         let claude = AgentSession {
             kind: AgentKind::Claude,
             id: "00000000-0000-4000-8000-000000000000".into(),
+            name: None,
         };
         // No transcript for this id, so it starts a new conversation under it.
         assert_eq!(claude.command()[1..3], ["--ide", "--session-id"]);
