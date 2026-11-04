@@ -249,6 +249,7 @@ impl Application {
             let editor_view = compositor
                 .find::<ui::EditorView>()
                 .expect("the editor view was pushed above");
+            editor_view.persist = true;
             if !editor_view.restore_workspace(&mut editor) {
                 compositor.push(Box::new(ui::welcome::Welcome::new()));
             }
