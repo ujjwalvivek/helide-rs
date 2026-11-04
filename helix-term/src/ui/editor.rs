@@ -4439,6 +4439,12 @@ fn move_to_split(editor: &mut Editor, doc: DocumentId, target: ViewId) {
         if let Some(previous) = previous {
             editor.focus(id);
             editor.switch(previous, Action::Replace);
+            // Switching away put the file back in this split's history; forget it again.
+            editor
+                .tree
+                .get_mut(id)
+                .docs_access_history
+                .retain(|&d| d != doc);
         }
     }
     if editor.tree.contains(target) {
