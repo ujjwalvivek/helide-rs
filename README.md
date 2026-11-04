@@ -100,7 +100,7 @@ The agent panel needs `claude` or `opencode` on your PATH. The code stats need
 
 Built with Claude Code from late October 2026: I decided what each part should do and tested
 every change on screen, Claude wrote most of the code. If you try it, I would like to know what
-breaks first.
+breaks first: [open an issue](https://github.com/ujjwalvivek/helide-rs/issues).
 
 Helide is licensed under the MPL 2.0, like Helix. For Helix itself, its documentation and its
 community, see [helix-editor.com](https://helix-editor.com).
