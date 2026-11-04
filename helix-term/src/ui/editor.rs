@@ -157,6 +157,9 @@ pub struct EditorView {
     history_at: Option<std::time::Instant>,
     /// When the file tree last re-read the disk on its own.
     tree_refreshed: Option<std::time::Instant>,
+    /// Opened as a project (`hx`, `hx .`, `hx dir/`): the workspace is restored and kept.
+    /// Opened on files, it is a quick edit that leaves the saved workspace alone.
+    pub persist: bool,
     /// Columns of the + after FILES on the sidebar's title row, last frame.
     tree_plus: Option<(u16, u16)>,
     /// The last click on a tab and when, to tell a double click.
@@ -221,6 +224,7 @@ impl EditorView {
             history_seen: HashMap::new(),
             history_at: None,
             tree_refreshed: None,
+            persist: false,
             tree_plus: None,
             last_tab_click: None,
             sidebar_width: None,
@@ -2035,6 +2039,9 @@ impl EditorView {
     /// Saves the project's editor tabs and splits (with cursors) and its panels, keeping the
     /// saved agent tabs, so the project reopens as it is now.
     pub fn save_workspace(&mut self, editor: &Editor) {
+        if !self.persist {
+            return;
+        }
         let project = helix_stdx::env::current_working_dir();
         let mut workspace = agents::load_workspace(&project);
         let (layout, panels) = self.capture(editor);
@@ -2369,6 +2376,9 @@ impl EditorView {
     }
 
     fn save_agents(&mut self) {
+        if !self.persist {
+            return;
+        }
         let project = helix_stdx::env::current_working_dir();
         agents::save(&project, &self.agents.agent_sessions());
         self.agents_project = Some(project);
