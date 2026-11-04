@@ -711,6 +711,11 @@ impl Application {
         );
 
         doc.set_last_saved_revision(doc_save_event.revision, doc_save_event.save_time);
+        // Time travel keeps every save.
+        let (path, text) = (doc_save_event.path.clone(), doc_save_event.text.clone());
+        tokio::task::spawn_blocking(move || {
+            let _ = crate::history::record(&path, &text.to_string(), crate::history::Kind::Save);
+        });
 
         let lines = doc_save_event.text.len_lines();
         let size = doc_save_event.text.len_bytes();

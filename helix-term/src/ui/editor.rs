@@ -151,6 +151,10 @@ pub struct EditorView {
     buffer_strip: frame::TabStrip,
     /// When the agent tabs were last checked for a conversation Claude moved to.
     agents_followed: Option<std::time::Instant>,
+    /// Time travel: the version of each open file last kept, and when the edits were last
+    /// looked at.
+    history_seen: HashMap<DocumentId, i32>,
+    history_at: Option<std::time::Instant>,
     /// When the file tree last re-read the disk on its own.
     tree_refreshed: Option<std::time::Instant>,
     /// Columns of the + after FILES on the sidebar's title row, last frame.
@@ -214,6 +218,8 @@ impl EditorView {
             buffer_hits: Vec::new(),
             buffer_strip: frame::TabStrip::default(),
             agents_followed: None,
+            history_seen: HashMap::new(),
+            history_at: None,
             tree_refreshed: None,
             tree_plus: None,
             last_tab_click: None,
@@ -2627,6 +2633,48 @@ impl EditorView {
         }
     }
 
+    /// Time travel: keeps each file as it was opened, and its unsaved edits every 30 seconds.
+    /// Saves are kept as they happen (see Application::handle_document_write).
+    fn keep_history(&mut self, editor: &Editor) {
+        if cfg!(feature = "integration") {
+            return;
+        }
+        let due = self
+            .history_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(30));
+        let mut jobs = Vec::new();
+        for doc in editor.documents() {
+            let Some(path) = doc.path() else {
+                continue;
+            };
+            let version = doc.version();
+            let kind = match self.history_seen.get(&doc.id()) {
+                None => crate::history::Kind::Open,
+                Some(&seen) if due && seen != version && doc.is_modified() => {
+                    crate::history::Kind::Snapshot
+                }
+                _ => continue,
+            };
+            if doc.text().len_bytes() > 1 << 20 {
+                continue;
+            }
+            self.history_seen.insert(doc.id(), version);
+            jobs.push((path.to_path_buf(), doc.text().to_string(), kind));
+        }
+        if due {
+            self.history_at = Some(std::time::Instant::now());
+            self.history_seen
+                .retain(|id, _| editor.documents.contains_key(id));
+        }
+        if !jobs.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                for (path, text, kind) in jobs {
+                    let _ = crate::history::record(&path, &text, kind);
+                }
+            });
+        }
+    }
+
     /// A click on a + button: a new file in the editor, a new shell in the terminal, the agent
     /// menu in the agent panel, or a new file or folder from the tree. Returns whether it was one.
     fn plus_click(&mut self, mouse: &MouseEvent, editor: &mut Editor) -> bool {
@@ -3463,6 +3511,7 @@ impl Component for EditorView {
         // Keep the workspace saved while a project is open, so even a killed window loses
         // little. Integration tests leave the user's state alone.
         self.save_if_changed(cx.editor, false);
+        self.keep_history(cx.editor);
         // The tree re-reads the disk every couple of seconds while it is shown, so files made
         // or removed elsewhere (a terminal, an agent, git) appear without touching it.
         if self.file_tree.visible {
