@@ -874,9 +874,9 @@ impl GitPanel {
                 if let Some(action) = self.jump_to_hunk(editor) {
                     return action;
                 }
-                self.show(Action::NewTab);
+                self.show(Action::Replace);
             }
-            KeyCode::Char('d') => self.show(Action::NewTab),
+            KeyCode::Char('d') => self.show(Action::Replace),
             KeyCode::Char('v') => self.show(Action::VerticalSplit),
             KeyCode::Char('s') if ctrl => self.show(Action::HorizontalSplit),
             KeyCode::Char('o') => return self.open_file(editor),
@@ -963,7 +963,7 @@ impl GitPanel {
                 match (button, on_file, double) {
                     (MouseButton::Right, true, _) => return self.open_file(editor),
                     (MouseButton::Right, false, _) => {}
-                    (_, true, false) => self.show(Action::NewTab),
+                    (_, true, false) => self.show(Action::Replace),
                     (_, true, true) => {
                         if self
                             .selected_entry()
@@ -974,7 +974,7 @@ impl GitPanel {
                             self.expand(true);
                         }
                     }
-                    (_, false, true) => self.show(Action::NewTab),
+                    (_, false, true) => self.show(Action::Replace),
                     (_, false, false) => {}
                 }
             }
