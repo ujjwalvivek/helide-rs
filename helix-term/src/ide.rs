@@ -226,7 +226,7 @@ impl Ide {
         drop(loader);
         doc.set_diff_base(base);
         doc.label = Some(format!("◆ {}", file_name(&path)));
-        let doc_id = editor.new_file_from_document(Action::NewTab, doc);
+        let doc_id = editor.new_file_from_document(Action::Replace, doc);
         editor.set_status(format!(
             "Claude proposes changes to {}. :accept or :reject.",
             relative(&path)
