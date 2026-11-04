@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img">
+  <title id="title">Helide</title>
+    <rect width="512" height="512" rx="32" fill="#091610" />
+    <rect x="12" y="12" width="488" height="488" rx="20" fill="none" stroke="#67e4b0" stroke-width="24" />
+    <g transform="translate(256, 256) rotate(-45) scale(16)">
+        <path
+            fill="#67e4b0"
+            fill-rule="evenodd"
+            d="M16.75 11.482V1h2.5v3.75H23v2.5h-3.75v5.268l-.366.366l-6 6l-.366.366H8.5v-2.5h2.982l1.75-1.75L9 10.768l-1.75 1.75V23h-2.5v-3.75H1v-2.5h3.75v-5.268l.366-.366l6-6l.366-.366H15.5v2.5h-2.982L10.768 9L15 13.232z"
+            clip-rule="evenodd"
+            transform="translate(-12, -12)"
+        />
+    </g>
+</svg>

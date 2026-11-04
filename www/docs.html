@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+        <meta name="theme-color" content="#091610" />
+        <meta name="color-scheme" content="dark" />
+        <title>Helide | Docs</title>
+        <meta name="description" content="How to use Helide: install, the panels and their keys, tabs and splits, terminals, agents, time travel and scripting." />
+        <link rel="icon" type="image/svg+xml" href="helide.svg" />
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body class="docs-page">
+        <canvas id="bg-shader"></canvas>
+        <main class="docs-main">
+            <section class="window" id="window">
+                <div class="titlebar">
+                    <a href="./" class="tb-home"><img class="tb-logo" src="helide.svg" alt="Helide home" /></a>
+                    <span class="tb-seg tb-name">helide</span
+                    ><span class="tb-seg tb-path">docs</span
+                    ><span class="tb-seg tb-branch">helide</span>
+                    <span class="lights" aria-hidden="true">
+                        <i class="light light-min"></i>
+                        <i class="light light-max"></i>
+                        <i class="light light-close"></i>
+                    </span>
+                </div>
+
+                <div class="docs">
+                    <nav class="docs-nav" aria-label="Contents">
+                        <div class="nav-title">FILES</div>
+                        <a href="#install">install</a>
+                        <a href="#opening">opening a project</a>
+                        <a href="#keys">panels and keys</a>
+                        <a href="#tree">file tree</a>
+                        <a href="#git">git panel</a>
+                        <a href="#tabs">tabs and splits</a>
+                        <a href="#terminal">terminal</a>
+                        <a href="#agents">agents</a>
+                        <a href="#history">time travel</a>
+                        <a href="#preview">markdown preview</a>
+                        <a href="#models">model commands</a>
+                        <a href="#scripting">scripting</a>
+                        <a href="#files">where things live</a>
+                        <a href="./" class="nav-back">← home</a>
+                    </nav>
+
+                    <article class="docs-body">
+                        <h1>Helide</h1>
+                        <p class="lede">
+                            Helix, with the workspace built in. Everything Helix does works the same way, and its
+                            <a href="https://docs.helix-editor.com/">own documentation</a> still applies. This page covers what Helide adds.
+                        </p>
+
+                        <h2 id="install">install</h2>
+                        <p>
+                            <strong>From a release.</strong> Download the tarball from
+                            <a href="https://github.com/ujjwalvivek/helide-rs/releases/latest">the latest release</a>, unpack it anywhere and run the
+                            <code>hx</code> inside. It finds the <code>runtime</code> folder next to it. Linux x86_64 only for now.
+                        </p>
+                        <pre class="code">tar xf helide-v0.1.0-x86_64-linux.tar.xz
+./helide-v0.1.0-x86_64-linux/hx .</pre>
+                        <p><strong>From source</strong>, with Rust installed:</p>
+                        <pre class="code">git clone https://github.com/ujjwalvivek/helide-rs
+cd helide-rs
+cargo install --path helix-term --locked
+ln -Ts "$PWD/runtime" ~/.config/helix/runtime
+hx --grammar fetch &amp;&amp; hx --grammar build</pre>
+                        <p>
+                            Helide reads your Helix config in <code>~/.config/helix</code>. The agent panel needs <code>claude</code> or
+                            <code>opencode</code> on your PATH, the code stats need <a href="https://github.com/boyter/scc">scc</a>, and a Nerd Font
+                            makes the file icons show.
+                        </p>
+
+                        <h2 id="opening">opening a project</h2>
+                        <table>
+                            <tr><td><code>hx</code>, <code>hx .</code>, <code>hx folder/</code></td><td>Opens the project and restores its workspace: tabs, splits, cursors, panels and their sizes, terminal tabs and agent tabs.</td></tr>
+                            <tr><td><code>hx file</code></td><td>A quick edit: just the file, every panel closed, and nothing saved over the project's workspace.</td></tr>
+                        </table>
+                        <p>
+                            Without a saved workspace, Helide starts on a welcome screen: <kbd>o</kbd> open folder, <kbd>f</kbd> find file,
+                            <kbd>t</kbd> file tree, <kbd>n</kbd> new file, <kbd>c</kbd> config, <kbd>q</kbd> quit, and <kbd>1</kbd>–<kbd>6</kbd> for recent projects.
+                        </p>
+
+                        <h2 id="keys">panels and keys</h2>
+                        <table>
+                            <tr><td><kbd>Ctrl+1</kbd></td><td>File tree</td></tr>
+                            <tr><td><kbd>Ctrl+2</kbd></td><td>Git panel</td></tr>
+                            <tr><td><kbd>Ctrl+4</kbd></td><td>Terminal</td></tr>
+                            <tr><td><kbd>Ctrl+5</kbd></td><td>Agents</td></tr>
+                            <tr><td><kbd>F11</kbd> or <kbd>Space z</kbd></td><td>Zen: hide every panel and the frame, or bring them back</td></tr>
+                            <tr><td><kbd>Ctrl+,</kbd></td><td>Open the config</td></tr>
+                            <tr><td><kbd>Ctrl+PgUp</kbd> <kbd>Ctrl+PgDn</kbd></td><td>Previous and next file</td></tr>
+                            <tr><td><kbd>Alt+PgUp</kbd> <kbd>Alt+PgDn</kbd></td><td>Previous and next layout</td></tr>
+                            <tr><td><kbd>Alt+Shift+←→↑↓</kbd></td><td>Resize the sidebar and the terminal; with the agents focused, the agent panel</td></tr>
+                        </table>
+                        <p>
+                            A panel key shows and focuses its panel, focuses it if it is shown, and hides it if it is focused. Every panel edge
+                            can also be dragged.
+                        </p>
+
+                        <h2 id="tree">file tree</h2>
+                        <table>
+                            <tr><td><kbd>j</kbd> <kbd>k</kbd>, <kbd>Ctrl+d</kbd> <kbd>Ctrl+u</kbd>, <kbd>g</kbd> <kbd>G</kbd></td><td>Move, by a row, half a page, or to the ends</td></tr>
+                            <tr><td><kbd>Enter</kbd> or <kbd>o</kbd></td><td>Open the file, or open and close the folder</td></tr>
+                            <tr><td><kbd>l</kbd> <kbd>h</kbd></td><td>Open a folder; close it, or go to its parent</td></tr>
+                            <tr><td><kbd>v</kbd> <kbd>s</kbd> <kbd>t</kbd></td><td>Open in a split beside, a split below, or a new layout</td></tr>
+                            <tr><td><kbd>a</kbd></td><td>New file; end the name with <code>/</code> for a folder. The <kbd>+</kbd> on the FILES title does the same.</td></tr>
+                            <tr><td><kbd>r</kbd> <kbd>d</kbd></td><td>Rename; delete, after asking. Tabs of deleted files close unless they have unsaved edits.</td></tr>
+                            <tr><td><kbd>.</kbd> <kbd>R</kbd> <kbd>q</kbd></td><td>Show hidden files; re-read; hide the tree</td></tr>
+                        </table>
+                        <p>
+                            The tree follows the disk as files change. Under it, when it is tall enough, are code stats for the folder in view
+                            (the selected folder, or the selected file's): lines of code by language, and the COCOMO and LOCOMO estimates of what
+                            the code would cost a team or a model to write. They come from scc.
+                        </p>
+
+                        <h2 id="git">git panel</h2>
+                        <p>Changes, staged files, untracked files and stashes, then the commit graph, with a summary of the selected commit (or HEAD) at the bottom. Its file list scrolls on its own.</p>
+                        <table>
+                            <tr><td><kbd>Space</kbd></td><td>Stage or unstage a file or hunk; pop a stash</td></tr>
+                            <tr><td><kbd>l</kbd> <kbd>h</kbd></td><td>List a file's hunks; collapse them</td></tr>
+                            <tr><td><kbd>Enter</kbd> or <kbd>d</kbd></td><td>Open the diff as a tab; on a hunk, jump to it; on a commit or stash, show it</td></tr>
+                            <tr><td><kbd>v</kbd> <kbd>Ctrl+s</kbd></td><td>The diff in a split beside or below</td></tr>
+                            <tr><td><kbd>o</kbd></td><td>Open the file itself</td></tr>
+                            <tr><td><kbd>x</kbd> <kbd>a</kbd></td><td>Discard a file or hunk, or drop a stash, after asking; stage everything</td></tr>
+                            <tr><td><kbd>c</kbd> <kbd>A</kbd> <kbd>m</kbd></td><td>Commit; amend; write a commit message with a model</td></tr>
+                            <tr><td><kbd>b</kbd> <kbd>B</kbd></td><td>Switch branch; new branch</td></tr>
+                            <tr><td><kbd>z</kbd> <kbd>Z</kbd></td><td>Stash; pop the latest stash</td></tr>
+                            <tr><td><kbd>P</kbd> <kbd>p</kbd> <kbd>f</kbd></td><td>Push; pull; fetch</td></tr>
+                            <tr><td><kbd>R</kbd> <kbd>?</kbd> <kbd>q</kbd></td><td>Refresh; list these keys; hide</td></tr>
+                        </table>
+                        <p>
+                            With the mouse: a click on a file opens its diff, a double click lists its hunks, a right click opens the file. A
+                            diff tab shows the whole file with added lines tinted green and removed ones red, and stays current as the file changes.
+                        </p>
+
+                        <h2 id="tabs">tabs and splits</h2>
+                        <p>
+                            Each side-by-side split has its own row of file tabs on the border above it. A file joins a row when that split
+                            shows it, and stays until you close it there or drag it away. A file open in two splits has a tab in both.
+                        </p>
+                        <table>
+                            <tr><td>click</td><td>Show the file in its split</td></tr>
+                            <tr><td>drag along the row</td><td>Reorder; the other tabs slide aside</td></tr>
+                            <tr><td>drag to another split's row</td><td>Move the file there, at the end</td></tr>
+                            <tr><td>drag into a view</td><td>Open it there, or split it off by dropping near an edge</td></tr>
+                            <tr><td>drag onto an agent or terminal</td><td>Type the file's path there</td></tr>
+                            <tr><td>double click</td><td>Rename or move the file by editing its path; for a new file, save it there</td></tr>
+                            <tr><td><kbd>×</kbd></td><td>Close it in that row, or close the file if this was its last tab</td></tr>
+                            <tr><td>middle click</td><td>Close the file</td></tr>
+                            <tr><td><kbd>+</kbd></td><td>A new file in that split</td></tr>
+                        </table>
+                        <p>
+                            Rows of tabs are saved with the workspace. Layouts are whole arrangements of splits, like separate screens:
+                            <code>:tab-new</code> makes one, and when there is more than one they are numbered on the right of the border under
+                            LAYOUTS.
+                        </p>
+
+                        <h2 id="terminal">terminal</h2>
+                        <table>
+                            <tr><td><code>:terminal [command]</code></td><td>A new tab, running the command or a shell. Alias <code>:term</code>.</td></tr>
+                            <tr><td><code>:terminal-split [command]</code></td><td>A pane beside the focused one. Alias <code>:tsplit</code>.</td></tr>
+                            <tr><td>drag a tab into the panel</td><td>Join it to the shown tab as a pane</td></tr>
+                            <tr><td>double click a tab</td><td>Name it</td></tr>
+                        </table>
+                        <p>
+                            Tabs come back with the workspace, with their panes, names, folders and programs. A file path printed in the
+                            terminal can be clicked to open it.
+                        </p>
+
+                        <h2 id="agents">agents</h2>
+                        <table>
+                            <tr><td><code>:agent claude</code>, <code>:agent opencode</code></td><td>A new agent tab. The <kbd>+</kbd> on the AGENTS title offers whichever is installed.</td></tr>
+                            <tr><td><kbd>Space @</kbd></td><td>Mention the current file, and the selected lines, in the agent</td></tr>
+                            <tr><td><code>:accept</code> <code>:reject</code></td><td>Take or refuse an edit Claude proposed as a diff</td></tr>
+                        </table>
+                        <p>
+                            Agent tabs reopen on the conversation they were in, including after <code>/clear</code> or <code>/resume</code> in
+                            Claude and <code>/sessions</code> in OpenCode. A tab shows <span class="tone">●</span> while the agent works and
+                            <span class="tone">✓</span> when it finished while you were elsewhere, with a desktop notification for long runs.
+                            Claude Code connects to Helide the way it does to its VS Code extension, so it sees your selection and proposes
+                            edits as diffs in a tab.
+                        </p>
+
+                        <h2 id="history">time travel</h2>
+                        <p>
+                            Helide keeps a private copy of every file as you open it, each time you save it, and every half minute while it
+                            has unsaved edits. <code>:history</code> (or <code>:time-travel</code>) lists the versions with how they differ
+                            from now, and previews each one: a green bar marks lines that would come back, a red mark where lines of now would
+                            go. <kbd>Enter</kbd> puts the version back as one edit, so <kbd>u</kbd> undoes it.
+                        </p>
+                        <p>
+                            <code>:history git</code> does the same through the commits that changed the file. Copies older than a day are
+                            thinned to one an hour, older than a month to one a day; files over 1 MB are not kept.
+                        </p>
+
+                        <h2 id="preview">markdown preview</h2>
+                        <p>
+                            <kbd>Space m</kbd>, <code>:preview</code>, or PREVIEW on the border renders a Markdown file in the pane beside it,
+                            with headings, lists, tables, code blocks and quotes.
+                        </p>
+
+                        <h2 id="models">model commands</h2>
+                        <table>
+                            <tr><td><code>:rewrite instruction</code></td><td>Rewrite each selection as told</td></tr>
+                            <tr><td><code>:ask question</code></td><td>Answer a question about the selection in a popup. Alias <code>:explain</code>.</td></tr>
+                            <tr><td><kbd>m</kbd> in the git panel</td><td>Write a commit message for the staged changes</td></tr>
+                        </table>
+                        <p>
+                            These use the local model from your OpenCode config. <code>:ask</code> can search the web through SearXNG when
+                            <code>SEARXNG_URL</code> is set. The <code>helide-rs-mozilla</code> branch routes them through
+                            <a href="https://otari.ai">Otari</a> instead, with secrets masked before anything leaves the editor.
+                        </p>
+
+                        <h2 id="scripting">scripting</h2>
+                        <p>Each editor listens on a socket, and <code>hx msg</code> talks to it. Programs started inside Helide find their editor through <code>HELIDE_SOCKET</code>.</p>
+                        <table>
+                            <tr><td><code>hx msg open file:line:col</code></td><td>Open a file in the focused view</td></tr>
+                            <tr><td><code>hx msg command reload-all</code></td><td>Run a typable command</td></tr>
+                            <tr><td><code>hx msg keys '&lt;C-2&gt;j&lt;space&gt;'</code></td><td>Type keys as if pressed</td></tr>
+                            <tr><td><code>hx msg status</code></td><td>Mode, focused file, cursor, selection and open buffers</td></tr>
+                            <tr><td><code>hx msg lsp</code>, <code>hx msg diagnostics [file]</code></td><td>Language servers; diagnostics</td></tr>
+                        </table>
+
+                        <h2 id="files">where things live</h2>
+                        <table>
+                            <tr><td><code>~/.local/state/helide/workspaces/</code></td><td>Each project's saved workspace</td></tr>
+                            <tr><td><code>~/.local/state/helide/history/</code></td><td>Time travel's copies</td></tr>
+                            <tr><td><code>~/.config/helix/</code></td><td>Config, keys and themes, shared with Helix</td></tr>
+                        </table>
+                    </article>
+                </div>
+
+                <canvas id="rim-shader" aria-hidden="true"></canvas>
+
+                <div class="statusbar">
+                    <div class="status-left">
+                        <span class="mode">NOR</span>
+                        <span class="path">docs.html</span>
+                    </div>
+                    <div class="status-right">
+                        <span>markdown</span>
+                        <span>utf-8</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+        <script src="app.js"></script>
+    </body>
+</html>
