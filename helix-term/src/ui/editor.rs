@@ -2692,13 +2692,18 @@ impl EditorView {
                 .unwrap_or(0)
         };
         let focus = editor.tree.focus;
-        let owner = |doc: DocumentId| -> usize {
-            let showing = views
+        // A file shown in splits has a tab in each of their rows; one shown nowhere sits in the
+        // row of the split that showed it last, else the focused split's.
+        let owner = |doc: DocumentId| -> Vec<usize> {
+            let mut showing: Vec<usize> = views
                 .iter()
                 .filter(|view| view.doc == doc)
-                .min_by_key(|view| view.id != focus);
-            if let Some(view) = showing {
-                return column_of(view);
+                .map(|view| column_of(view))
+                .collect();
+            if !showing.is_empty() {
+                showing.sort_unstable();
+                showing.dedup();
+                return showing;
             }
             let seen = views
                 .iter()
@@ -2708,15 +2713,15 @@ impl EditorView {
                     Some((history.len() - at, *view))
                 })
                 .min_by_key(|&(distance, _)| distance);
-            match seen {
+            vec![match seen {
                 Some((_, view)) => column_of(view),
                 None => views
                     .iter()
                     .find(|view| view.id == focus)
                     .map_or(0, |view| column_of(view)),
-            }
+            }]
         };
-        let owners: Vec<usize> = ordered.iter().map(|&doc| owner(doc)).collect();
+        let owners: Vec<Vec<usize>> = ordered.iter().map(|&doc| owner(doc)).collect();
         self.buffer_strips
             .retain(|id, _| tops.iter().any(|view| view.id == *id));
         self.buffer_hits.clear();
@@ -2732,7 +2737,7 @@ impl EditorView {
             let ids: Vec<DocumentId> = ordered
                 .iter()
                 .zip(&owners)
-                .filter(|&(_, &owner)| owner == column)
+                .filter(|&(_, owner)| owner.contains(&column))
                 .map(|(&doc, _)| doc)
                 .collect();
             let labels: Vec<Label> = ids
@@ -3206,9 +3211,11 @@ impl EditorView {
         match press.grab {
             Grab::Edge(_) => {}
             Grab::Buffer(doc) if !press.moved => {
-                // Shown in the split whose row it is on.
-                if let Some(&(_, _, _, view)) =
-                    self.buffer_hits.iter().find(|&&(_, _, d, _)| d == doc)
+                // Shown in the split whose row it was clicked in.
+                if let Some(&(_, _, _, view)) = self
+                    .buffer_hits
+                    .iter()
+                    .find(|&&(start, end, d, _)| d == doc && (start..end).contains(&column))
                 {
                     if editor.tree.contains(view) {
                         editor.focus(view);
