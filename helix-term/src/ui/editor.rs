@@ -2703,6 +2703,7 @@ impl EditorView {
             .find(|view| view.id == focus)
             .map_or(0, |view| column_of(view));
         let mut owners: Vec<Vec<usize>> = Vec::with_capacity(ordered.len());
+        let mut arrived: Vec<DocumentId> = Vec::new();
         for &doc in &ordered {
             let mut showing: Vec<usize> = views
                 .iter()
@@ -2717,7 +2718,12 @@ impl EditorView {
                 .and_then(|id| tops.iter().position(|view| view.id == *id));
             let home = match home {
                 Some(home) if showing.is_empty() || showing.contains(&home) => home,
-                _ => showing.first().copied().unwrap_or(focused_column),
+                // A file new to a row joins it at the end, like a stack.
+                Some(_) => {
+                    arrived.push(doc);
+                    showing.first().copied().unwrap_or(focused_column)
+                }
+                None => showing.first().copied().unwrap_or(focused_column),
             };
             self.tab_home.insert(doc, tops[home].id);
             if !showing.contains(&home) {
@@ -2726,6 +2732,15 @@ impl EditorView {
             owners.push(showing);
         }
         self.tab_home.retain(|doc, _| ordered.contains(doc));
+        for doc in arrived {
+            if let Some(at) = ordered.iter().position(|&d| d == doc) {
+                let owner = owners.remove(at);
+                ordered.remove(at);
+                ordered.push(doc);
+                owners.push(owner);
+            }
+        }
+        self.buffer_order = ordered.clone();
         self.buffer_strips
             .retain(|id, _| tops.iter().any(|view| view.id == *id));
         self.buffer_hits.clear();
