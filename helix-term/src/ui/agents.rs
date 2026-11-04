@@ -100,12 +100,24 @@ impl AgentSession {
 
 impl AgentSession {
     /// Extra environment for the agent's process. Claude finds the editor through the IDE
-    /// server's variables, already exported. OpenCode gets nothing extra: in OpenCode 2.x,
-    /// pointing `OPENCODE_CONFIG` at a file replaced the user's config (their MCP servers
-    /// disappeared) instead of merging with it, so `hx mcp` is registered in the user's own
-    /// config instead (see crate::mcp).
+    /// server's variables, already exported.
+    ///
+    /// OpenCode 2 draws a tab strip of its own, a second row of tabs inside a panel that already
+    /// has Helide's, and its tabs open sessions Helide never hears of: closing the one a tab
+    /// started on still brought that one back next time. So it is switched off, the way the
+    /// Windows Helide does it: `OPENCODE_CLI_CONFIG_CONTENT` is merged over the user's own
+    /// cli config for this process only, and no file of theirs is touched. (Pointing
+    /// `OPENCODE_CONFIG` at a file instead replaced the user's config, MCP servers and all, so
+    /// `hx mcp` is registered in their own config; see crate::mcp.) Each Helide tab is then
+    /// one OpenCode session, and a new tab is a new session, like /new.
     pub fn env(&self) -> Vec<(String, String)> {
-        Vec::new()
+        match self.kind {
+            AgentKind::Claude => Vec::new(),
+            AgentKind::OpenCode => vec![(
+                "OPENCODE_CLI_CONFIG_CONTENT".into(),
+                r#"{"tabs":{"mode":"off"}}"#.into(),
+            )],
+        }
     }
 }
 
@@ -116,6 +128,57 @@ fn claude_config_dir() -> Option<PathBuf> {
             helix_stdx::path::home_dir()
                 .ok()
                 .map(|home| home.join(".claude"))
+        })
+}
+
+/// The conversation a running Claude is in now, or `None` when none of `pids` is a Claude that
+/// has said.
+///
+/// The id Helide launches Claude with is only where it starts: `/clear` and `/resume` move the
+/// same process onto another conversation, and without following it the saved id keeps naming
+/// the first one, so a restart reopened a chat that had long been left. Claude writes
+/// `sessions/<pid>.json` with its current `sessionId`, rewritten when the conversation changes;
+/// when several of the processes have one, the most recently started is the one in use.
+pub fn claude_live_session(pids: &[u32]) -> Option<String> {
+    let folder = claude_config_dir()?.join("sessions");
+    pids.iter()
+        .filter_map(|pid| {
+            let text = std::fs::read_to_string(folder.join(format!("{pid}.json"))).ok()?;
+            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let id = json["sessionId"].as_str()?;
+            is_uuid(id).then(|| (json["startedAt"].as_i64().unwrap_or(0), id.to_string()))
+        })
+        .max_by_key(|(started, _)| *started)
+        .map(|(_, id)| id)
+}
+
+/// A process and every process under it, read from /proc. Claude may run under a wrapper, so
+/// its own id is not always the one the pane started.
+pub fn self_and_descendants(pid: u32) -> Vec<u32> {
+    let mut all = vec![pid];
+    let mut next = 0;
+    while next < all.len() {
+        let parent = all[next];
+        next += 1;
+        let tasks = std::fs::read_dir(format!("/proc/{parent}/task"));
+        for task in tasks.into_iter().flatten().filter_map(Result::ok) {
+            let children =
+                std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+            all.extend(
+                children
+                    .split_whitespace()
+                    .filter_map(|c| c.parse::<u32>().ok()),
+            );
+        }
+    }
+    all
+}
+
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
         })
 }
 
@@ -375,12 +438,45 @@ mod tests {
     }
 
     #[test]
+    fn follows_the_conversation_claude_is_in() {
+        let dir = std::env::temp_dir().join(format!("helide-claude-{}", std::process::id()));
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let old = "11111111-1111-4111-8111-111111111111";
+        let new = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            sessions.join("100.json"),
+            format!(r#"{{"pid":100,"sessionId":"{old}","startedAt":1}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join("101.json"),
+            format!(r#"{{"pid":101,"sessionId":"{new}","startedAt":2}}"#),
+        )
+        .unwrap();
+        std::fs::write(sessions.join("102.json"), r#"{"sessionId":"../../etc"}"#).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+        assert_eq!(claude_live_session(&[100, 101, 102]).as_deref(), Some(new));
+        assert_eq!(claude_live_session(&[100]).as_deref(), Some(old));
+        assert_eq!(claude_live_session(&[102, 999]), None);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn launch_commands_and_mentions() {
         let opencode = AgentSession {
             kind: AgentKind::OpenCode,
             id: "ses_x".into(),
         };
         assert_eq!(opencode.command(), vec!["opencode", "--session", "ses_x"]);
+        assert_eq!(
+            opencode.env(),
+            vec![(
+                "OPENCODE_CLI_CONFIG_CONTENT".to_string(),
+                r#"{"tabs":{"mode":"off"}}"#.to_string()
+            )]
+        );
         assert_eq!(opencode.mention("src/a.rs", Some((3, 9))), "@src/a.rs ");
 
         let claude = AgentSession {

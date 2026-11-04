@@ -148,6 +148,8 @@ pub struct EditorView {
     buffer_hits: Vec<(u16, u16, DocumentId)>,
     /// The file tabs, scrolled when there are more than fit.
     buffer_strip: frame::TabStrip,
+    /// When the agent tabs were last checked for a conversation Claude moved to.
+    agents_followed: Option<std::time::Instant>,
     /// Sidebar width and terminal rows the user set by dragging or with Alt+Shift+arrows.
     sidebar_width: Option<u16>,
     terminal_height: Option<u16>,
@@ -204,6 +206,7 @@ impl EditorView {
             tab_hits: Vec::new(),
             buffer_hits: Vec::new(),
             buffer_strip: frame::TabStrip::default(),
+            agents_followed: None,
             sidebar_width: None,
             terminal_height: None,
             pressed: None,
@@ -3243,7 +3246,15 @@ impl Component for EditorView {
         // little. Integration tests leave the user's state alone.
         self.save_if_changed(cx.editor, false);
         let (finished, closed) = self.agents.update();
-        if closed {
+        // Every couple of seconds, catch a Claude tab moved by /clear or /resume, so a restart
+        // reopens the conversation it is in rather than the one it began with.
+        let follow = self
+            .agents_followed
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2));
+        if follow {
+            self.agents_followed = Some(std::time::Instant::now());
+        }
+        if closed || (follow && self.agents.follow_agents()) {
             self.save_agents();
         }
         for run in finished.iter().filter(|run| !run.seen) {
