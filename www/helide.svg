@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img">
   <title id="title">Helide</title>
-    <rect width="512" height="512" rx="32" fill="#091610" />
-    <rect x="12" y="12" width="488" height="488" rx="20" fill="none" stroke="#67e4b0" stroke-width="24" />
+    <rect width="512" height="512" fill="#091610" />
+    <rect x="12" y="12" width="488" height="488" fill="none" stroke="#67e4b0" stroke-width="24" />
     <g transform="translate(256, 256) rotate(-45) scale(16)">
         <path
             fill="#67e4b0"

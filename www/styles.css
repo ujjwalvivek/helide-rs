@@ -9,9 +9,11 @@
     --outline: #64746d;
     --primary: #67e4b0;
     --primary-soft: #93ecc7;
-    --secondary: #5cccd6;
-    --secondary-soft: #96e2e9;
-    --tertiary: #6691cc;
+    /* From the wallpaper itself: its cream and sage, for the second accent. */
+    --cream: #e7d6a9;
+    --sage: #a6ba8e;
+    /* Body text: brighter than the theme's muted grey, which washes out on the glass. */
+    --body: #d6ddd9;
     --error: #fd4663;
 
     /* Nothing is rounded, in the app or here. The only curves are the three
@@ -69,7 +71,9 @@ body {
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
+    /* Every page's window starts on the same line and has the same width, so switching tabs
+       changes only what is inside it. */
+    justify-content: flex-start;
     gap: 28px;
     padding: 48px 20px;
     background: transparent;
@@ -80,7 +84,7 @@ body {
 
 main {
     width: 100%;
-    max-width: 920px;
+    max-width: 1040px;
     display: flex;
     flex-direction: column;
     gap: 40px;
@@ -88,7 +92,11 @@ main {
 
 .window {
     position: relative;
-    background: rgba(17, 44, 33, 0.80);
+    min-height: calc(100vh - 96px);
+    min-height: calc(100dvh - 96px);
+    display: flex;
+    flex-direction: column;
+    background: rgba(5, 28, 25, 0.88);
     border-radius: var(--radius);
     /* Clip rather than hidden: it cuts the same, but is no scroll container, so the docs'
        contents can stay in view while the page scrolls. */
@@ -113,6 +121,46 @@ main {
     width: 18px;
     height: 18px;
     margin-right: 8px;
+}
+
+/* Tabs in the title bar, drawn like Helide's own: the page you are on is a filled chip, the
+   others muted, each with its close mark. */
+.tb-tabs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.tb-tab {
+    height: 20px;
+    padding: 0 10px;
+    font-size: 12px;
+    line-height: 20px;
+    white-space: nowrap;
+    color: var(--subtext);
+    text-decoration: none;
+}
+
+.tb-tab::after {
+    content: " ×";
+    opacity: 0.6;
+}
+
+.tb-tab:hover {
+    color: var(--text);
+    background: var(--surface0);
+}
+
+.tb-tab.here {
+    background: var(--primary);
+    color: var(--mantle);
+    font-weight: 700;
+}
+
+.tb-tab.here::after {
+    opacity: 0.8;
 }
 
 /* The project strip: name on the accent, then path, then branch. */
@@ -196,7 +244,7 @@ main {
 }
 
 .label { color: var(--primary); font-weight: 700; }
-.key { color: var(--secondary); font-weight: 600; }
+.key { color: var(--sage); font-weight: 600; }
 .val { color: var(--text); opacity: 0.9; }
 .tone-soft { color: var(--primary-soft); }
 .dim { color: var(--outline); font-size: 12px; }
@@ -221,7 +269,7 @@ main {
 }
 
 .result-text {
-    color: var(--subtext);
+    color: var(--body);
     font-weight: 400;
     line-height: 1.6;
 }
@@ -252,7 +300,7 @@ kbd {
 }
 
 .term-link {
-    color: var(--secondary);
+    color: var(--cream);
     text-decoration: none;
     font-weight: 600;
 }
@@ -262,6 +310,7 @@ kbd {
 }
 
 .layout {
+    flex: 1;
     display: flex;
     gap: 24px;
     align-items: stretch;
@@ -316,6 +365,8 @@ kbd {
 }
 
 .statusbar {
+    /* At the bottom of the window, however little the page holds. */
+    margin-top: auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -806,8 +857,8 @@ kbd {
 .first-shots {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-    margin-bottom: 8px;
+    gap: 10px;
+    margin: 4px 0 8px;
 }
 
 .first-shots button {
@@ -844,7 +895,7 @@ kbd {
 
 /* Docs: the same window, wider, with the contents as a file tree on the left. */
 .docs-main {
-    max-width: 1120px;
+    max-width: 1040px;
 }
 
 .tb-home {
@@ -900,7 +951,7 @@ kbd {
 
 .docs-nav .nav-back {
     margin-top: 14px;
-    color: var(--secondary);
+    color: var(--cream);
 }
 
 .docs-nav .nav-back::before {
@@ -913,7 +964,7 @@ kbd {
     padding: 26px 34px 40px;
     font-size: 14px;
     line-height: 1.65;
-    color: var(--subtext);
+    color: var(--body);
 }
 
 .docs-body h1 {
@@ -947,7 +998,7 @@ kbd {
 }
 
 .docs-body a {
-    color: var(--secondary);
+    color: var(--cream);
 }
 
 .docs-body code {
