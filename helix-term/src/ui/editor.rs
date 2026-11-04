@@ -555,6 +555,8 @@ impl EditorView {
             Self::render_diagnostics(doc, view, inner, surface, theme);
         }
 
+        Self::render_sticky_context(editor, doc, view, inner, surface, theme);
+
         let statusline_area = view
             .area
             .clip_top(view.area.height.saturating_sub(1))
@@ -564,6 +566,100 @@ impl EditorView {
             statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
 
         statusline::render(&mut context, statusline_area, surface);
+    }
+
+    /// Pins the lines that open the classes and functions the top of the view is inside, once
+    /// they have scrolled off, like an IDE's sticky scroll: at most three, innermost last. Which
+    /// nodes count comes from the language's text objects (`class.around`, `function.around`),
+    /// so every language with those queries gets it.
+    fn render_sticky_context(
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        inner: Rect,
+        surface: &mut Surface,
+        theme: &Theme,
+    ) {
+        const MAX: usize = 3;
+        if inner.height < 12 {
+            return;
+        }
+        let Some(syntax) = doc.syntax() else {
+            return;
+        };
+        let text = doc.text().slice(..);
+        let top_line = text.char_to_line(doc.view_offset(view.id).anchor.min(text.len_chars()));
+        if top_line == 0 {
+            return;
+        }
+        let byte = text.line_to_byte(top_line);
+        let loader = editor.syn_loader.load();
+        let layer = syntax.layer_for_byte_range(byte as u32, byte as u32);
+        let Some(query) = loader.textobject_query(syntax.layer(layer).language) else {
+            return;
+        };
+        let root = syntax
+            .tree_for_byte_range(byte as u32, byte as u32)
+            .root_node();
+        // Each block the top line is inside, as (first line, last line), from one pass of the
+        // query. A block that ends right under the pinned rows has nothing left to label.
+        let mut blocks: Vec<(usize, usize)> = ["class.around", "function.around"]
+            .iter()
+            .filter_map(|name| query.capture_nodes(name, &root, text))
+            .flatten()
+            .filter(|node| node.start_byte() < byte && node.end_byte() > byte)
+            .map(|node| {
+                (
+                    text.byte_to_line(node.start_byte()),
+                    text.byte_to_line(node.end_byte()),
+                )
+            })
+            .filter(|&(_, last)| last > top_line + 1)
+            .collect();
+        blocks.sort_unstable();
+        let mut lines: Vec<usize> = blocks.into_iter().map(|(first, _)| first).collect();
+        lines.dedup();
+        if lines.len() > MAX {
+            lines.drain(..lines.len() - MAX);
+        }
+        if lines.is_empty() {
+            return;
+        }
+
+        let base = theme.get("ui.background");
+        let row_style = base.patch(
+            theme
+                .try_get("ui.cursorline.primary")
+                .unwrap_or_else(|| theme.get("ui.popup")),
+        );
+        let text_style = row_style.patch(Style {
+            bg: None,
+            ..theme.get("ui.text")
+        });
+        let number_style = row_style.patch(Style {
+            bg: None,
+            ..theme.get("ui.linenr")
+        });
+        let gutter = inner.x.saturating_sub(view.area.x);
+        let tab = " ".repeat(doc.tab_width());
+        for (i, &line) in lines.iter().enumerate() {
+            let y = inner.y + i as u16;
+            let row = Rect::new(view.area.x, y, gutter + inner.width, 1);
+            surface.set_style(row, row_style);
+            let number = (line + 1).to_string();
+            if gutter as usize > number.len() {
+                let x = view.area.x + gutter - 1 - number.len() as u16;
+                surface.set_string(x, y, &number, number_style);
+            }
+            let content: String = text.line(line).to_string();
+            let content = content.trim_end_matches(['\n', '\r']).replace('\t', &tab);
+            let style = if i + 1 == lines.len() {
+                text_style.underline_style(helix_view::graphics::UnderlineStyle::Line)
+            } else {
+                text_style
+            };
+            surface.set_stringn(inner.x, y, &content, inner.width as usize, style);
+        }
     }
 
     pub fn render_rulers(
