@@ -275,6 +275,44 @@ fn prune(dir: &Path, now: u64) {
 }
 
 /// Lines added and removed going from `old` to `new`, counted by a line diff.
+/// How `version` differs from `now`, line by line in `version`: true for a line only the version
+/// has, false for a line under which the version lacks lines that `now` has.
+pub fn line_tints(now: &str, version: &str) -> Vec<(usize, bool)> {
+    let now = helix_core::Rope::from_str(now);
+    let version = helix_core::Rope::from_str(version);
+    let transaction = helix_core::diff::compare_ropes(&now, &version);
+    let mut tints: Vec<(usize, bool)> = Vec::new();
+    let mut at = 0; // a char position in `version`
+    for change in transaction.changes().changes() {
+        use helix_core::Operation;
+        match change {
+            Operation::Retain(n) => at += n,
+            Operation::Insert(text) => {
+                let len = text.chars().count();
+                let first = version.char_to_line(at);
+                let last = version.char_to_line((at + len).saturating_sub(1));
+                tints.extend((first..=last).map(|line| (line, true)));
+                at += len;
+            }
+            Operation::Delete(_) => {
+                let line = version.char_to_line(at.min(version.len_chars()));
+                // Removed whole lines sit between two lines: mark the one above.
+                let line = if version.line_to_char(line) == at {
+                    line.saturating_sub(1)
+                } else {
+                    line
+                };
+                if !tints.iter().any(|&(l, _)| l == line) {
+                    tints.push((line, false));
+                }
+            }
+        }
+    }
+    tints.sort_unstable();
+    tints.dedup_by_key(|&mut (line, _)| line);
+    tints
+}
+
 pub fn line_changes(old: &str, new: &str) -> (usize, usize) {
     let old = helix_core::Rope::from_str(old);
     let new = helix_core::Rope::from_str(new);
@@ -301,6 +339,15 @@ pub fn line_changes(old: &str, new: &str) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tints_lines_a_version_adds_or_lacks() {
+        let now = "a\nb\nc\nd\n";
+        // The version has an extra line after a, and lacks c.
+        let version = "a\nnew\nb\nd\n";
+        assert_eq!(line_tints(now, version), vec![(1, true), (2, false)]);
+        assert!(line_tints(now, now).is_empty());
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir =

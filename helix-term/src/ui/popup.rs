@@ -262,7 +262,19 @@ impl<T: Component> Component for Popup<T> {
     fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let key = match event {
             Event::Key(event) => *event,
-            Event::Mouse(event) => return self.handle_mouse_event(event),
+            Event::Mouse(mouse) => {
+                // A click inside goes to what the popup shows, so a menu can be clicked.
+                let inside = mouse.column >= self.area.left()
+                    && mouse.column < self.area.right()
+                    && mouse.row >= self.area.top()
+                    && mouse.row < self.area.bottom();
+                if inside && matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    if let EventResult::Consumed(callback) = self.contents.handle_event(event, cx) {
+                        return EventResult::Consumed(callback);
+                    }
+                }
+                return self.handle_mouse_event(mouse);
+            }
             Event::Resize(_, _) => {
                 // TODO: calculate inner area, call component's handle_event with that area
                 return EventResult::Ignored(None);

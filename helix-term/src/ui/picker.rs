@@ -269,7 +269,12 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+    /// Lines of the preview to tint for an item: true marks a line only the preview has, false
+    /// a line under which lines were removed.
+    tint_fn: Option<TintCallback<T>>,
 }
+
+type TintCallback<T> = Box<dyn Fn(&T) -> Vec<(usize, bool)>>;
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn stream(
@@ -394,6 +399,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             file_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            tint_fn: None,
         }
     }
 
@@ -421,6 +427,15 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         // assumption: if we have a preview we are matching paths... If this is ever
         // not true this could be a separate builder function
         self.matcher.update_config(Config::DEFAULT.match_paths());
+        self
+    }
+
+    /// Tints lines of the preview like a diff: see `tint_fn`.
+    pub fn with_preview_tints(
+        mut self,
+        tint_fn: impl Fn(&T) -> Vec<(usize, bool)> + 'static,
+    ) -> Self {
+        self.tint_fn = Some(Box::new(tint_fn));
         self
     }
 
@@ -896,6 +911,10 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let inner = inner.inner(margin);
         BLOCK.render(area, surface);
 
+        let tints = match (&self.tint_fn, self.selection()) {
+            (Some(tint_fn), Some(item)) => tint_fn(item),
+            _ => Vec::new(),
+        };
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
                 Some(doc)
@@ -987,7 +1006,32 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
             let mut decorations = DecorationManager::default();
 
-            if let Some((start, end)) = range {
+            if !tints.is_empty() {
+                let theme = &cx.editor.theme;
+                let plus = theme.get("diff.plus").fg;
+                let minus = theme.get("diff.minus").fg;
+                let base = theme
+                    .try_get("ui.cursorline.primary")
+                    .and_then(|style| style.bg)
+                    .or(theme.get("ui.background").bg);
+                let added = Style::default().bg(soften(plus, base));
+                let removed = Style::default()
+                    .underline_style(helix_view::graphics::UnderlineStyle::Line)
+                    .underline_color(minus.unwrap_or(helix_view::graphics::Color::Red));
+                let tints: HashMap<usize, bool> = tints.into_iter().collect();
+                let draw_tint = move |renderer: &mut TextRenderer, pos: LinePos| {
+                    if let Some(&only_here) = tints.get(&pos.doc_line) {
+                        let area = Rect::new(
+                            renderer.viewport.x,
+                            pos.visual_line,
+                            renderer.viewport.width,
+                            1,
+                        );
+                        renderer.set_style(area, if only_here { added } else { removed });
+                    }
+                };
+                decorations.add_decoration(draw_tint);
+            } else if let Some((start, end)) = range {
                 let style = cx
                     .editor
                     .theme
@@ -1211,3 +1255,24 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
+/// A diff colour toned down towards the background, for whole-line tints that leave the
+/// syntax colours readable. Without RGB colours to mix, the colour is used as it is.
+fn soften(
+    color: Option<helix_view::graphics::Color>,
+    base: Option<helix_view::graphics::Color>,
+) -> helix_view::graphics::Color {
+    use helix_view::graphics::Color;
+    let base = match base {
+        Some(Color::Rgb(r, g, b)) => (r, g, b),
+        _ => (16, 16, 20),
+    };
+    match color {
+        Some(Color::Rgb(r, g, b)) => {
+            let mix = |c: u8, b: u8| (c as u16 * 22 / 100 + b as u16 * 78 / 100) as u8;
+            Color::Rgb(mix(r, base.0), mix(g, base.1), mix(b, base.2))
+        }
+        Some(other) => other,
+        None => Color::Rgb(30, 60, 30),
+    }
+}

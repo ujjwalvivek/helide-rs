@@ -181,6 +181,11 @@ pub struct GitPanel {
     busy: Option<String>,
     refreshing: bool,
     last_refresh: Option<Instant>,
+    /// A refresh was asked for while one was running.
+    refresh_again: bool,
+    /// Where the commit summary was drawn, and how far its file list is scrolled.
+    summary_area: Rect,
+    summary_scroll: usize,
     rows_area: Rect,
     area: Rect,
     /// The commit summarised at the bottom of the panel, and the hash being read for it.
@@ -217,6 +222,8 @@ impl GitPanel {
     /// Re-reads the repository in the background.
     pub fn refresh(&mut self) {
         if self.refreshing {
+            // Read again once this one lands, so the last change is never missed.
+            self.refresh_again = true;
             return;
         }
         self.refreshing = true;
@@ -278,6 +285,9 @@ impl GitPanel {
         let selected = self.selected_key();
         self.snapshot = snapshot;
         self.refreshing = false;
+        if std::mem::take(&mut self.refresh_again) {
+            self.refresh();
+        }
         self.refresh_diffs();
         let present: HashSet<FileKey> = self
             .snapshot
@@ -526,11 +536,13 @@ impl GitPanel {
     /// Draws the panel: its rows, and under them, when there is room, a summary of the selected
     /// commit (HEAD's when no commit is selected).
     pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
+        // A third of the panel, at least SUMMARY_HEIGHT rows, when the panel is tall enough.
         let summary = if area.height >= SUMMARY_HEIGHT * 2 && self.snapshot.repo.is_some() {
-            SUMMARY_HEIGHT
+            SUMMARY_HEIGHT.max(area.height / 3)
         } else {
             0
         };
+        self.summary_area = Rect::default();
         let rows = Rect {
             height: area.height - summary,
             ..area
@@ -570,6 +582,7 @@ impl GitPanel {
                     if panel.detail_wanted.as_deref() == Some(hash.as_str()) {
                         panel.detail_wanted = None;
                         panel.detail = detail;
+                        panel.summary_scroll = 0;
                     }
                 }
             })
@@ -577,7 +590,8 @@ impl GitPanel {
         });
     }
 
-    fn render_summary(&self, area: Rect, surface: &mut Surface, roles: &Roles) {
+    fn render_summary(&mut self, area: Rect, surface: &mut Surface, roles: &Roles) {
+        self.summary_area = area;
         let width = area.width.saturating_sub(2) as usize;
         let x = area.x + 1;
         let mut y = area.y;
@@ -614,10 +628,14 @@ impl GitPanel {
             cx += text.width() as u16;
         }
         y += 1;
-        let shown = (area.bottom() - y) as usize;
-        for (i, (path, numbers)) in detail.files.iter().enumerate().take(shown) {
-            if i + 1 == shown && detail.files.len() > shown {
-                let more = format!("and {} more", detail.files.len() - i);
+        // The file list scrolls on its own under the wheel; the lines above it stay put.
+        let shown = (area.bottom().saturating_sub(y)) as usize;
+        let total = detail.files.len();
+        self.summary_scroll = self.summary_scroll.min(total.saturating_sub(shown));
+        let first = self.summary_scroll;
+        for (i, (path, numbers)) in detail.files.iter().enumerate().skip(first).take(shown) {
+            if i + 1 == first + shown && total > first + shown {
+                let more = format!("↓ {} more", total - i);
                 surface.set_stringn(x, y, &more, width, roles.faint);
                 break;
             }
@@ -892,7 +910,16 @@ impl GitPanel {
     }
 
     pub fn mouse(&mut self, event: &MouseEvent) -> GitAction {
+        let area = self.summary_area;
+        let on_summary = event.row >= area.y
+            && event.row < area.bottom()
+            && event.column >= area.x
+            && event.column < area.right();
         match event.kind {
+            MouseEventKind::ScrollDown if on_summary => self.summary_scroll += 3,
+            MouseEventKind::ScrollUp if on_summary => {
+                self.summary_scroll = self.summary_scroll.saturating_sub(3)
+            }
             MouseEventKind::ScrollDown => self.step(3),
             MouseEventKind::ScrollUp => self.step(-3),
             MouseEventKind::Down(MouseButton::Left)
