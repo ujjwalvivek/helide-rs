@@ -77,6 +77,7 @@ pub fn join_verticals(surface: &mut Surface, row: u16, left: u16, right: u16) {
 }
 
 /// One piece of text set into a border, padded by a space each side.
+#[derive(Clone)]
 pub struct Label {
     pub text: String,
     pub style: Style,
@@ -131,6 +132,139 @@ pub fn labels_right(
         return Vec::new();
     }
     labels_left(surface, y, end - total - 1, end, labels)
+}
+
+/// The width a ‹ or › marker takes, room for "‹ 99" with its padding.
+const MARKER_WIDTH: u16 = 6;
+
+/// A row of tabs that can be wider than the room for it. The tabs that fit are drawn, with
+/// "‹ N" and "N ›" for the ones hidden on either side; the active tab is brought into view
+/// whenever it changes, and the wheel or a click on a marker moves the row by a tab.
+#[derive(Default)]
+pub struct TabStrip {
+    /// The first tab drawn.
+    offset: usize,
+    /// The active tab the row last followed, so scrolling away from it sticks.
+    followed: Option<usize>,
+    /// Columns of the ‹ and › markers last frame.
+    left_marker: Option<(u16, u16)>,
+    right_marker: Option<(u16, u16)>,
+}
+
+/// How many tabs, from `offset`, fit in `room` columns, leaving room for the markers needed.
+fn fitting(widths: &[u16], offset: usize, room: u16) -> usize {
+    let count = |room: u16| {
+        let mut used = 0;
+        widths[offset..]
+            .iter()
+            .take_while(|&&w| {
+                used += w;
+                used <= room
+            })
+            .count()
+    };
+    let room = if offset > 0 {
+        room.saturating_sub(MARKER_WIDTH)
+    } else {
+        room
+    };
+    let n = count(room);
+    if offset + n < widths.len() {
+        count(room.saturating_sub(MARKER_WIDTH))
+    } else {
+        n
+    }
+}
+
+/// The first tab to draw and how many: `offset` moved to show `active` if it changed since
+/// `followed`, and held back so the last tab ends the row rather than empty space.
+fn window(
+    widths: &[u16],
+    room: u16,
+    offset: usize,
+    active: Option<usize>,
+    followed: Option<usize>,
+) -> (usize, usize) {
+    let n = widths.len();
+    if widths.iter().sum::<u16>() <= room {
+        return (0, n);
+    }
+    let mut offset = offset.min(n.saturating_sub(1));
+    if let Some(active) = active.filter(|&a| a < n && Some(a) != followed) {
+        if active < offset {
+            offset = active;
+        }
+        while offset < active && active >= offset + fitting(widths, offset, room).max(1) {
+            offset += 1;
+        }
+    }
+    let last = (0..n)
+        .find(|&o| o + fitting(widths, o, room) >= n)
+        .unwrap_or(n - 1);
+    let offset = offset.min(last);
+    (offset, fitting(widths, offset, room))
+}
+
+impl TabStrip {
+    /// Sets `lead` (fixed labels such as a title) and then `tabs` into a border row from `x` to
+    /// `end`. Returns the columns of each drawn tab, with its index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &mut self,
+        surface: &mut Surface,
+        y: u16,
+        x: u16,
+        end: u16,
+        lead: &[Label],
+        tabs: &[Label],
+        active: Option<usize>,
+        marker_style: Style,
+    ) -> Vec<(usize, u16, u16)> {
+        let lead_hits = labels_left(surface, y, x, end, lead);
+        let start = lead_hits.last().map_or(x + 1, |&(_, e)| e);
+        let room = end.saturating_sub(start);
+        let widths: Vec<u16> = tabs.iter().map(Label::width).collect();
+        let (offset, count) = window(&widths, room, self.offset, active, self.followed);
+        self.offset = offset;
+        self.followed = active;
+
+        let mut labels = Vec::new();
+        if offset > 0 {
+            labels.push(Label::new(format!("‹ {}", offset.min(99)), marker_style));
+        }
+        labels.extend(tabs[offset..offset + count].iter().cloned());
+        let hidden = tabs.len() - offset - count;
+        if hidden > 0 {
+            labels.push(Label::new(format!("{} ›", hidden.min(99)), marker_style));
+        }
+        let mut hits = labels_left(surface, y, start - 1, end, &labels).into_iter();
+        self.left_marker = if offset > 0 { hits.next() } else { None };
+        let tab_hits: Vec<(usize, u16, u16)> = hits
+            .by_ref()
+            .take(count)
+            .enumerate()
+            .map(|(i, (s, e))| (offset + i, s, e))
+            .collect();
+        self.right_marker = if hidden > 0 { hits.next() } else { None };
+        tab_hits
+    }
+
+    /// Moves the row by `by` tabs; the next draw keeps it within the tabs.
+    pub fn scroll(&mut self, by: isize) {
+        self.offset = self.offset.saturating_add_signed(by);
+    }
+
+    /// Which way a click at `column` on a marker moves the row, if it is on one.
+    pub fn marker_at(&self, column: u16) -> Option<isize> {
+        let on = |m: Option<(u16, u16)>| m.is_some_and(|(s, e)| (s..e).contains(&column));
+        if on(self.left_marker) {
+            Some(-1)
+        } else if on(self.right_marker) {
+            Some(1)
+        } else {
+            None
+        }
+    }
 }
 
 /// A scrollbar thumb drawn over a right border spanning `top..bottom`, for `total` rows of which
@@ -225,5 +359,37 @@ mod tests {
             .map(|y| surface[(0, y)].symbol.to_string())
             .collect();
         assert_eq!(column, "         ┃");
+    }
+}
+
+#[cfg(test)]
+mod tab_strip_tests {
+    use super::window;
+
+    #[test]
+    fn everything_fits() {
+        assert_eq!(window(&[10, 10, 10], 40, 2, Some(2), None), (0, 3));
+    }
+
+    #[test]
+    fn follows_the_active_tab() {
+        // Room 30: markers take 6 each, leaving 18 in the middle, so one 10-wide tab.
+        let widths = [10; 8];
+        let (offset, count) = window(&widths, 30, 0, Some(5), None);
+        assert!(offset <= 5 && 5 < offset + count);
+    }
+
+    #[test]
+    fn scrolling_away_sticks_until_the_active_tab_changes() {
+        let widths = [10; 8];
+        assert_eq!(window(&widths, 30, 0, Some(5), Some(5)).0, 0);
+    }
+
+    #[test]
+    fn never_leaves_empty_room_after_the_last_tab() {
+        let widths = [10; 8];
+        let (offset, count) = window(&widths, 30, 7, None, None);
+        assert_eq!(offset + count, 8);
+        assert!(count >= 2);
     }
 }
