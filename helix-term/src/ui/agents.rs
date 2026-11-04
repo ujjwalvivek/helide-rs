@@ -346,6 +346,28 @@ pub struct Panels {
     pub sidebar_width: Option<u16>,
     pub terminal_height: Option<u16>,
     pub agents_width: Option<u16>,
+    /// The terminal's tabs, so they reopen with their names, folders and programs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminals: Vec<TerminalTab>,
+}
+
+/// One terminal tab: its panes, side by side.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct TerminalTab {
+    pub panes: Vec<TerminalPane>,
+}
+
+/// One terminal pane: what it ran, where, and the name it was given.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct TerminalPane {
+    /// The program and its arguments; empty for the user's shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// The folder the pane's program was in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// The workspace saved for `project`, or an empty one.
