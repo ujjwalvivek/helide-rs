@@ -3536,6 +3536,33 @@ impl Component for EditorView {
         if closed || (follow && self.agents.follow_agents()) {
             self.save_agents();
         }
+        // OpenCode tabs follow the session they show, found from the title OpenCode sets.
+        let retitled = self.agents.retitled_opencode();
+        if !retitled.is_empty() {
+            let project = helix_stdx::env::current_working_dir();
+            tokio::task::spawn_blocking(move || {
+                let moves: Vec<(String, String)> = retitled
+                    .into_iter()
+                    .filter_map(|(from, title)| {
+                        agents::opencode_session_for_title(&project, &title).map(|to| (from, to))
+                    })
+                    .collect();
+                if moves.is_empty() {
+                    return;
+                }
+                crate::job::dispatch_blocking(move |_, compositor| {
+                    if let Some(view) = compositor.find::<EditorView>() {
+                        let mut moved = false;
+                        for (from, to) in &moves {
+                            moved |= view.agents.move_agent(from, to);
+                        }
+                        if moved {
+                            view.save_agents();
+                        }
+                    }
+                });
+            });
+        }
         for run in finished.iter().filter(|run| !run.seen) {
             let project = helix_stdx::env::current_working_dir();
             let project = project
