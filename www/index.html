@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <!-- viewport-fit=cover lets the page run under the status bar and the browser's
+             bottom bar instead of leaving the system to fill them with white, and
+             theme-color gives the bars themselves the page's dark. -->
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+        <meta name="theme-color" content="#091610" />
+        <meta name="color-scheme" content="dark" />
+        <title>Helide | Workspace</title>
+        <meta
+            name="description"
+            content="Helide is Helix with the workspace built in: a file tree, a git panel, terminals and Claude Code or OpenCode around the editor, in one terminal window."
+        />
+        <meta property="og:title" content="Helide" />
+        <meta property="og:description" content="Helix, with the workspace built in: a file tree, a git panel, terminals and AI agents in one terminal window." />
+        <meta property="og:image" content="https://helide.ujjwalvivek.com/images/webp/hero-1920x1080.webp" />
+        <link rel="icon" type="image/svg+xml" href="helide.svg" />
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body>
+        <canvas id="bg-shader"></canvas>
+        <main>
+            <section class="window" id="window">
+                <!-- The title bar: the mark, the project strip, and the three window
+                     buttons on the right. -->
+                <div class="titlebar">
+                    <img class="tb-logo" src="helide.svg" alt="" />
+                    <span class="tb-seg tb-name">helide</span
+                    ><span class="tb-seg tb-path">ujjwalvivek/helide-rs</span
+                    ><span class="tb-seg tb-branch">helide</span>
+                    <span class="lights" aria-hidden="true">
+                        <i class="light light-min"></i>
+                        <i class="light light-max"></i>
+                        <i class="light light-close"></i>
+                    </span>
+                </div>
+
+                <div class="layout">
+                    <div class="main">
+                        <div class="hero">
+                            <div class="fetch">
+                                <div class="logo-box">
+                                    <img class="logo" src="helide.svg" alt="Helide" />
+                                </div>
+                                <div class="fetch-info">
+                                    <pre class="fetch-text">
+<span class="label">helide</span>@<span class="js-version label tone-soft">v0.1.0</span><span class="cursor"></span><div class="palette"><div class="swatch" style="background:#67e4b0"></div><div class="swatch" style="background:#93ecc7"></div><div class="swatch" style="background:#5cccd6"></div><div class="swatch" style="background:#96e2e9"></div><div class="swatch" style="background:#6691cc"></div><div class="swatch" style="background:#1d4936"></div><div class="swatch" style="background:#173b2c"></div><div class="swatch" style="background:#091610"></div></div><span class="key">os</span>       <span class="val">linux x64</span>
+<span class="key">editor</span>   <span class="val">helix 25.07</span>
+<span class="key">panels</span>   <span class="val">tree·git·terminal·agents</span>
+<span class="key">agents</span>   <span class="val">claude·opencode</span>
+<span class="key">license</span>  <span class="val">mpl-2.0</span>
+</pre>
+                                </div>
+                            </div>
+                        </div>
+
+                        <section class="panes">
+                            <div class="prompt">
+                                <span class="chevron">$_</span><a href="https://helix-editor.com/" class="pill">helix</a>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text">Helix's editing, unchanged. Every key you know still works; Helide adds the rooms around it.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>file tree</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text"><kbd>Ctrl+1</kbd>. Create, rename and delete in place, with code stats for the folder you are in.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>git</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text"><kbd>Ctrl+2</kbd>. Stage hunks, commit, branch and stash. A click opens a file's diff as a tab, tinted green and red.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>terminal</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text"><kbd>Ctrl+4</kbd>. Tabs and side-by-side panes that come back with the project.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>agents</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text"><kbd>Ctrl+5</kbd>. <a href="https://claude.com/claude-code" class="pill">Claude Code</a> or <a href="https://opencode.ai" class="pill">OpenCode</a> in tabs that reopen on the same conversation. <kbd>Space @</kbd> mentions the file you are in.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>tabs per split</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text">Each split keeps its own row of tabs. Drag them between rows, or onto an agent to type the path.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>time travel</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text"><kbd>:history</kbd> scrubs through every version you opened or saved; <kbd>:history git</kbd> through the commits.</span>
+                            </div>
+
+                            <div class="prompt">
+                                <span class="chevron">$_</span><span>persisted workspace</span>
+                            </div>
+                            <div class="prompt result">
+                                <span class="result-text"><kbd>hx .</kbd> brings back tabs, splits, panels, terminals and agents. <kbd>hx file</kbd> is just a quick edit.</span>
+                            </div>
+                        </section>
+
+                        <section class="download">
+                            <div class="prompt">
+                                <span class="chevron">$_</span
+                                ><a id="download" href="https://github.com/ujjwalvivek/helide-rs/releases/latest" target="_blank" rel="noopener" class="term-link"
+                                    >Download <span class="js-version label tone-soft">v0.1.0</span> for Linux</a
+                                ><span class="js-size dim"></span>
+                            </div>
+                            <div class="prompt">
+                                <span class="chevron">$_</span><a href="docs.html" class="term-link">Read the docs</a>
+                            </div>
+                            <div class="prompt">
+                                <span class="chevron">$_</span
+                                ><a href="https://github.com/ujjwalvivek/helide-rs" target="_blank" rel="noopener" class="term-link">View source on github</a>
+                            </div>
+                        </section>
+                    </div>
+
+                    <aside class="sidebar">
+                        <div class="showcase">
+                            <div class="carousel-wrap">
+                                <div class="carousel" id="carousel" aria-label="Screenshots">
+                                    <div class="carousel-track" id="carousel-track"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+
+                <!-- The window's glass rim: drawn over its own border, and nowhere else. -->
+                <canvas id="rim-shader" aria-hidden="true"></canvas>
+
+                <div class="statusbar">
+                    <div class="status-left">
+                        <span class="mode">NOR</span>
+                        <span class="path">ujjwalvivek</span>
+                    </div>
+                    <div class="status-right">
+                        <span>linux x64</span>
+                        <span>helix 25.07</span>
+                        <span>utf-8</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- The first Helide, the Windows app: still here, with its own download. -->
+            <section class="window window-first" id="windows">
+                <div class="titlebar">
+                    <img class="tb-logo" src="helide.svg" alt="" />
+                    <span class="tb-seg tb-name">helide</span
+                    ><span class="tb-seg tb-path">ujjwalvivek\helide</span
+                    ><span class="tb-seg tb-branch">main</span>
+                    <span class="tb-note">the first helide</span>
+                </div>
+                <div class="first">
+                    <pre class="fetch-text first-fetch">
+<span class="label">helide</span>@<span class="js-first-version label tone-soft">v2.0.3</span>
+<span class="key">os</span>         <span class="val">win x64</span>
+<span class="key">shell</span>      <span class="val">pwsh</span>
+<span class="key">editor</span>     <span class="val">helix</span>
+<span class="key">explorer</span>   <span class="val">yazi</span>
+<span class="key">versioning</span> <span class="val">lazygit</span>
+<span class="key">agents</span>     <span class="val">opencode·codex·claude</span>
+</pre>
+                    <div class="first-body">
+                        <p class="result-text">
+                            Helide began as a Windows app: Helix, <a href="https://github.com/jesseduffield/lazygit" class="pill">lazygit</a>, <a href="https://yazi-rs.github.io/" class="pill">yazi</a> and PowerShell sessions in one keyboard-driven window, with a command palette on <kbd>Ctrl+P</kbd>. The Helix fork above grew out of it, moving the same workspace inside the editor itself.
+                        </p>
+                        <div class="first-shots" id="first-shots"></div>
+                        <div class="prompt">
+                            <span class="chevron">$_</span
+                            ><a id="first-download" href="https://github.com/ujjwalvivek/helide/releases/latest" target="_blank" rel="noopener" class="term-link"
+                                >Download <span class="js-first-version label tone-soft">v2.0.3</span> for Windows</a
+                            >
+                        </div>
+                        <div class="prompt">
+                            <span class="chevron">$_</span
+                            ><a href="https://github.com/ujjwalvivek/helide" target="_blank" rel="noopener" class="term-link">View source on github</a>
+                        </div>
+                    </div>
+                </div>
+                <div class="statusbar">
+                    <div class="status-left">
+                        <span class="mode">MIT</span>
+                        <span class="path">ujjwalvivek</span>
+                    </div>
+                    <div class="status-right">
+                        <span>win x64</span>
+                        <span>pwsh</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <div class="lightbox" id="lightbox" hidden>
+            <div class="lightbox-backdrop" data-lightbox-close></div>
+            <button class="lightbox-nav lightbox-prev" id="lightbox-prev" type="button" aria-label="Previous screenshot">&#8249;</button>
+            <figure class="lightbox-figure">
+                <img id="lightbox-img" src="" alt="" />
+                <figcaption class="lightbox-caption">
+                    <span id="lightbox-label"></span>
+                    <span class="lightbox-index" id="lightbox-index"></span>
+                </figcaption>
+            </figure>
+            <button class="lightbox-nav lightbox-next" id="lightbox-next" type="button" aria-label="Next screenshot">&#8250;</button>
+            <button class="lightbox-close" id="lightbox-close" type="button" aria-label="Close screenshot viewer">&times;</button>
+        </div>
+        <script src="app.js"></script>
+    </body>
+</html>

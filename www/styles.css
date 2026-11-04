@@ -1,0 +1,1021 @@
+:root {
+    /* Noctalia: the wallpaper-driven theme Helide's screenshots were taken in. */
+    --mantle: #091610;
+    --base: #0e251b;
+    --surface0: #173b2c;
+    --surface1: #1d4936;
+    --text: #f2f3f2;
+    --subtext: #afb6b3;
+    --outline: #64746d;
+    --primary: #67e4b0;
+    --primary-soft: #93ecc7;
+    --secondary: #5cccd6;
+    --secondary-soft: #96e2e9;
+    --tertiary: #6691cc;
+    --error: #fd4663;
+
+    /* Nothing is rounded, in the app or here. The only curves are the three
+       window buttons. */
+    --radius: 0;
+
+    /* How far in from the window's border its glass rim reaches. The rim is
+       painted over the window's own edge and fades to nothing at this depth;
+       see background-lite.glsl. */
+    --rim: 16px;
+}
+
+/* Over everything in the window, and never in the way of the pointer. */
+#rim-shader {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 5;
+    pointer-events: none;
+}
+
+/* Whatever the shader does not cover. The page is transparent over a canvas, so
+   without this anything outside the canvas -- the strips under a phone's status
+   bar and toolbar, the rubber-band overscroll, the frame before WebGL has drawn --
+   is the browser's default white. */
+html {
+    background: var(--mantle);
+}
+
+/* Taller than the screen on purpose. On a phone 100vh is the viewport with the
+   toolbars tucked away, so it is not what is on screen when they are showing, and
+   the bars float over the page; the extra runs the shader well past the top and
+   bottom so there is no edge to show. The script sizes the drawing to whatever
+   this ends up being. */
+#bg-shader {
+    position: fixed;
+    top: -120px;
+    left: 0;
+    width: 100%;
+    height: calc(100% + 240px);
+    z-index: -1;
+    display: block;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    padding: 48px 20px;
+    background: transparent;
+    color: var(--text);
+    font-family: "Cascadia Code", Consolas, "JetBrains Mono", Menlo, monospace;
+    -webkit-font-smoothing: antialiased;
+}
+
+main {
+    width: 100%;
+    max-width: 920px;
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+}
+
+.window {
+    position: relative;
+    background: rgba(17, 44, 33, 0.80);
+    border-radius: var(--radius);
+    /* Clip rather than hidden: it cuts the same, but is no scroll container, so the docs'
+       contents can stay in view while the page scrolls. */
+    overflow: hidden;
+    overflow: clip;
+    backdrop-filter: blur(32px) saturate(1.2);
+    -webkit-backdrop-filter: blur(32px) saturate(1.2);
+}
+
+.titlebar {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    height: 32px;
+    padding: 0 12px 0 8px;
+    border-bottom: 1px solid var(--surface0);
+    background: var(--mantle);
+}
+
+.tb-logo {
+    width: 18px;
+    height: 18px;
+    margin-right: 8px;
+}
+
+/* The project strip: name on the accent, then path, then branch. */
+.tb-seg {
+    height: 18px;
+    padding: 0 9px;
+    font-size: 10px;
+    line-height: 18px;
+    white-space: nowrap;
+}
+.tb-name {
+    background: var(--primary);
+    color: var(--mantle);
+    font-size: 11px;
+    font-weight: 700;
+}
+.tb-path {
+    background: var(--surface0);
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.tb-branch {
+    background: var(--surface1);
+    color: var(--primary-soft);
+    font-weight: 700;
+}
+
+.lights {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+    padding-left: 12px;
+}
+.light {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+}
+.light-min { background: #febc2e; border: 1px solid #FFD92E; }
+.light-max { background: #28c840; border: 1px solid #33FF52; }
+.light-close { background: #ff5f57; border: 1px solid #FF7557; }
+
+.hero {
+    padding: 28px 32px 0px;
+    text-align: left;
+}
+
+.fetch {
+    display: flex;
+    align-items: flex-start;
+    gap: 22px;
+    margin-bottom: 20px;
+}
+
+.logo-box {
+    flex-shrink: 0;
+}
+
+.logo {
+    width: 150px;
+    height: 150px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    filter: contrast(1.05);
+}
+
+.fetch-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.fetch-text {
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.3;
+    color: var(--text);
+    background: transparent;
+    border: none;
+    padding: 0;
+    overflow: visible;
+}
+
+.label { color: var(--primary); font-weight: 700; }
+.key { color: var(--secondary); font-weight: 600; }
+.val { color: var(--text); opacity: 0.9; }
+.tone-soft { color: var(--primary-soft); }
+.dim { color: var(--outline); font-size: 12px; }
+
+
+.prompt {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 14px;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+
+.chevron {
+    color: var(--primary);
+    font-weight: 600;
+}
+
+.prompt.result {
+    margin-bottom: 20px;
+}
+
+.result-text {
+    color: var(--subtext);
+    font-weight: 400;
+    line-height: 1.6;
+}
+
+/* A key cap, as the app draws its shortcuts. */
+kbd {
+    padding: 1px 5px 2px;
+    border: 1px solid var(--surface1);
+    background: var(--surface0);
+    color: var(--primary);
+    font-family: inherit;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.cursor {
+    width: 9px;
+    height: 16px;
+    background: var(--primary);
+    animation: blink 1.1s steps(2, start) infinite;
+    margin-left: 2px;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+@keyframes blink {
+    to { visibility: hidden; }
+}
+
+.term-link {
+    color: var(--secondary);
+    text-decoration: none;
+    font-weight: 600;
+}
+.term-link:hover {
+    cursor: pointer;
+    text-decoration: underline !important;
+}
+
+.layout {
+    display: flex;
+    gap: 24px;
+    align-items: stretch;
+    position: relative;
+    z-index: 1;
+}
+
+.main {
+    flex: 1;
+    min-width: 0;
+}
+
+.sidebar {
+    width: 180px;
+    flex-shrink: 0;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.pill {
+    display: inline;
+    padding: 2px 4px;
+    border: 1px solid var(--surface0);
+    color: var(--primary-soft);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+    background: rgba(255,255,255,0.02);
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.hero .palette {
+    display: flex;
+    gap: 2px;
+    width: auto;
+    margin: 9px 0 10px;
+    padding-top: 0;
+}
+
+.hero .palette .swatch {
+    width: 14px;
+    height: 14px;
+    aspect-ratio: auto;
+}
+
+.pill:hover {
+    border-color: var(--surface0);
+    background: rgba(255,255,255,0.06);
+}
+
+.statusbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 14px;
+    border-top: 1px solid var(--surface0);
+    background: var(--mantle);
+    font-size: 11px;
+    color: var(--subtext);
+    letter-spacing: 0.02em;
+}
+
+.statusbar .status-left,
+.statusbar .status-right {
+    display: flex;
+    gap: 12px;
+}
+
+.statusbar .mode {
+    color: var(--mantle);
+    background: var(--primary);
+    padding: 0 6px;
+    font-weight: 700;
+}
+
+.statusbar .path {
+    color: var(--text);
+    opacity: 0.7;
+}
+
+.download {
+    padding: 8px 32px 28px;
+}
+
+.showcase {
+    flex: 1 1 0%;
+    min-height: 150px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.carousel-wrap {
+    position: relative;
+    flex: 1 1 0%;
+    min-height: 0;
+}
+
+.carousel {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    border: 1px solid var(--surface0);
+    border-radius: var(--radius);
+    background: rgba(9, 22, 16, 0.80);
+    cursor: pointer;
+    -webkit-mask-image: linear-gradient(
+        to bottom,
+        transparent,
+        #000 34px,
+        #000 calc(100% - 34px),
+        transparent
+    );
+    mask-image: linear-gradient(
+        to bottom,
+        transparent,
+        #000 34px,
+        #000 calc(100% - 34px),
+        transparent
+    );
+}
+
+.carousel::before,
+.carousel::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    z-index: 1;
+    pointer-events: none;
+    background-image: linear-gradient(
+        to bottom,
+        rgba(242, 243, 242, 0.24) 0 6px,
+        transparent 6px
+    );
+    background-size: 6px 13px;
+    background-repeat: repeat-y;
+    background-position: 0 var(--film, 0px);
+}
+.carousel::before { left: 6px; }
+.carousel::after { right: 6px; }
+
+.carousel-track {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 18px;
+    will-change: transform;
+}
+
+.carousel-track.is-gliding {
+    transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.carousel-slide {
+    flex: 0 0 auto;
+    width: 100%;
+    padding: 0;
+    border-width: 1.5px 1.5px 3px 1.5px;
+    border-style: solid;
+    border-color: rgba(103, 228, 176, 0.45);
+    border-radius: var(--radius);
+    background: var(--mantle);
+    overflow: hidden;
+    cursor: zoom-in;
+    position: relative;
+    display: block;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.carousel-slide img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+}
+
+.carousel-slide:hover {
+    border-color: var(--primary);
+    transform: translateY(-2px);
+}
+
+.carousel-slide:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.slide-caption {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 18px 4px 4px;
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    font-weight: 700;
+    text-align: right;
+    color: var(--text);
+    background: linear-gradient(to top, rgba(9, 22, 16, 0.95), transparent);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.carousel-slide:hover .slide-caption,
+.carousel-slide:focus-visible .slide-caption {
+    opacity: 1;
+}
+
+.lightbox[hidden] {
+    display: none;
+}
+
+.lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 64px;
+}
+
+.lightbox-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(9, 22, 16, 0.86);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    cursor: zoom-out;
+    animation: fade-in 0.15s ease;
+}
+
+.lightbox-figure {
+    position: relative;
+    z-index: 1;
+    margin: 0;
+    max-width: 100%;
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.lightbox-figure img {
+    display: block;
+    max-width: 100%;
+    max-height: calc(100vh - 110px);
+    border: 1px solid var(--surface0);
+    border-radius: var(--radius);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+    animation: fade-in 0.15s ease;
+}
+
+.lightbox-caption {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text);
+}
+
+.lightbox-index {
+    color: var(--primary);
+}
+
+.lightbox-nav,
+.lightbox-close {
+    position: absolute;
+    z-index: 2;
+    padding: 0;
+    border: 1px solid var(--surface0);
+    background: rgba(17, 44, 33, 0.85);
+    color: var(--text);
+    font-family: inherit;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.lightbox-nav {
+    top: 50%;
+    transform: translateY(-50%);
+    width: 40px;
+    height: 56px;
+    font-size: 24px;
+    line-height: 1;
+}
+
+.lightbox-prev {
+    left: 8px;
+}
+
+.lightbox-next {
+    right: 8px;
+}
+
+.lightbox-close {
+    top: 16px;
+    right: 16px;
+    width: 34px;
+    height: 34px;
+    font-size: 20px;
+    line-height: 1;
+}
+
+.lightbox-nav:hover,
+.lightbox-close:hover {
+    color: var(--primary);
+    border-color: var(--primary);
+}
+
+@keyframes fade-in {
+    from {
+        opacity: 0;
+    }
+}
+
+
+
+.panes {
+    padding: 8px 32px 8px;
+}
+
+.panes .prompt {
+    margin-top: 4px;
+}
+
+.panes .prompt.result {
+    margin-bottom: 24px;
+}
+
+
+@media (max-width: 860px) {
+    main { max-width: 100%; }
+}
+
+@media (max-width: 720px) {
+    .layout {
+        flex-direction: column;
+        gap: 0;
+    }
+    .main {
+        min-width: 0;
+    }
+    .sidebar {
+        width: 100%;
+        border-left: none;
+        padding: 16px 14px;
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .logo {
+        width: 150px;
+        height: 150px;
+    }
+
+    .showcase {
+        flex: 0 0 100%;
+        height: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        position: relative;
+    }
+    .carousel-wrap {
+        order: 2;
+        flex: 0 0 auto;
+        height: 128px;
+        margin-top: 4px;
+    }
+    .carousel {
+        -webkit-mask-image: linear-gradient(
+            to right,
+            transparent,
+            #000 32px,
+            #000 calc(100% - 32px),
+            transparent
+        );
+        mask-image: linear-gradient(
+            to right,
+            transparent,
+            #000 32px,
+            #000 calc(100% - 32px),
+            transparent
+        );
+    }
+    .carousel::before,
+    .carousel::after {
+        top: auto;
+        bottom: auto;
+        left: 0;
+        right: 0;
+        width: auto;
+        height: 6px;
+        background-image: linear-gradient(
+            to right,
+            rgba(242, 243, 242, 0.24) 0 6px,
+            transparent 6px
+        );
+        background-size: 13px 6px;
+        background-repeat: repeat-x;
+        background-position: var(--film, 0px) 0;
+    }
+    .carousel::before { top: 6px; left: 0; }
+    .carousel::after { bottom: 6px; right: 0; }
+
+    .carousel-track {
+        flex-direction: row;
+        align-items: center;
+        width: max-content;
+        height: 100%;
+        padding: 18px 0;
+    }
+    .carousel-slide {
+        flex: 0 0 auto;
+        width: auto;
+        height: 100%;
+    }
+    .carousel-slide img {
+        height: 100%;
+        width: auto;
+        aspect-ratio: 16 / 9;
+    }
+}
+
+@media (max-width: 480px) {
+    body {
+        padding: 24px 12px;
+        gap: 16px;
+    }
+    .hero {
+        padding: 24px 16px 0;
+    }
+    .logo {
+        width: 100px;
+        height: 100px;
+    }
+    .fetch {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 16px;
+        text-align: left;
+    }
+    .fetch-info {
+        text-align: left;
+    }
+    .fetch-text {
+        text-align: left;
+    }
+    .panes {
+        padding: 8px 16px 8px;
+    }
+    .showcase {
+        flex: 0 0 100%;
+        height: auto;
+    }
+    .carousel-wrap {
+        flex: 0 0 148px;
+        height: 148px;
+    }
+    .lightbox {
+        padding: 20px 16px 68px;
+    }
+    /* Shrink the image so the nav row below it never overlaps the picture. */
+    .lightbox-figure img {
+        max-height: calc(100vh - 150px);
+    }
+    /* Nav buttons move out of the picture's side margins and dock underneath. */
+    .lightbox-nav {
+        top: auto;
+        bottom: 16px;
+        transform: none;
+        width: 44px;
+        height: 44px;
+        font-size: 22px;
+    }
+    .lightbox-prev {
+        left: calc(50% - 56px);
+    }
+    .lightbox-next {
+        right: calc(50% - 56px);
+    }
+    .download {
+        padding: 8px 16px 20px;
+    }
+    .statusbar {
+        min-width: 287px;
+        gap: 4px;
+        padding: 6px 10px;
+    }
+}
+
+
+/* The first Helide, the Windows app: a smaller window under the main one. */
+.window-first {
+    max-width: 760px;
+    width: 100%;
+    align-self: center;
+}
+
+.tb-note {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--subtext);
+    letter-spacing: 0.04em;
+}
+
+.first {
+    display: flex;
+    gap: 28px;
+    padding: 24px 28px 20px;
+    position: relative;
+    z-index: 1;
+}
+
+.first-fetch {
+    flex-shrink: 0;
+}
+
+.first-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.first-body .result-text {
+    font-size: 13px;
+    margin-bottom: 6px;
+}
+
+.first-shots {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.first-shots button {
+    padding: 0;
+    border: 1px solid var(--surface0);
+    background: var(--mantle);
+    cursor: zoom-in;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.first-shots button:hover {
+    border-color: var(--primary);
+    transform: translateY(-2px);
+}
+
+.first-shots img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+}
+
+@media (max-width: 720px) {
+    .first {
+        flex-direction: column;
+        gap: 16px;
+        padding: 20px 16px;
+    }
+    .tb-note {
+        display: none;
+    }
+}
+
+
+/* Docs: the same window, wider, with the contents as a file tree on the left. */
+.docs-main {
+    max-width: 1120px;
+}
+
+.tb-home {
+    display: flex;
+}
+
+.docs {
+    display: flex;
+    position: relative;
+    z-index: 1;
+    min-height: 70vh;
+}
+
+.docs-nav {
+    flex-shrink: 0;
+    width: 200px;
+    padding: 18px 0 18px;
+    border-right: 1px solid var(--surface0);
+    display: flex;
+    flex-direction: column;
+    position: sticky;
+    top: 16px;
+    align-self: flex-start;
+    font-size: 13px;
+}
+
+.nav-title {
+    padding: 0 18px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--subtext);
+}
+
+.docs-nav a {
+    padding: 3px 18px 3px 28px;
+    color: var(--text);
+    text-decoration: none;
+    border-left: 2px solid transparent;
+}
+
+.docs-nav a::before {
+    content: "▸ ";
+    color: var(--outline);
+}
+
+.docs-nav a:hover,
+.docs-nav a.here {
+    background: var(--surface0);
+    border-left-color: var(--primary);
+    color: var(--primary);
+}
+
+.docs-nav .nav-back {
+    margin-top: 14px;
+    color: var(--secondary);
+}
+
+.docs-nav .nav-back::before {
+    content: "";
+}
+
+.docs-body {
+    flex: 1;
+    min-width: 0;
+    padding: 26px 34px 40px;
+    font-size: 14px;
+    line-height: 1.65;
+    color: var(--subtext);
+}
+
+.docs-body h1 {
+    font-size: 22px;
+    color: var(--primary);
+    margin-bottom: 6px;
+}
+
+.docs-body h2 {
+    margin: 34px 0 10px;
+    font-size: 15px;
+    color: var(--primary);
+    scroll-margin-top: 16px;
+}
+
+.docs-body h2::before {
+    content: "## ";
+    color: var(--outline);
+}
+
+.docs-body p {
+    margin: 0 0 12px;
+}
+
+.docs-body .lede {
+    color: var(--text);
+}
+
+.docs-body strong {
+    color: var(--text);
+}
+
+.docs-body a {
+    color: var(--secondary);
+}
+
+.docs-body code {
+    color: var(--primary-soft);
+    font-family: inherit;
+    font-size: 13px;
+}
+
+.docs-body .tone {
+    color: var(--primary);
+}
+
+.docs-body .code {
+    margin: 0 0 14px;
+    padding: 12px 16px;
+    background: var(--mantle);
+    border-left: 2px solid var(--primary);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    overflow-x: auto;
+}
+
+.docs-body table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 14px;
+    font-size: 13px;
+}
+
+.docs-body td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--surface0);
+    vertical-align: top;
+}
+
+.docs-body td:first-child {
+    width: 34%;
+    color: var(--text);
+    white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+    .docs {
+        flex-direction: column;
+    }
+    .docs-nav {
+        position: static;
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--surface0);
+        flex-direction: row;
+        flex-wrap: wrap;
+        padding: 12px;
+        gap: 4px;
+    }
+    .nav-title {
+        display: none;
+    }
+    .docs-nav a {
+        padding: 2px 8px;
+        border-left: none;
+    }
+    .docs-body {
+        padding: 20px 16px 32px;
+    }
+    .docs-body td:first-child {
+        white-space: normal;
+        width: 40%;
+    }
+}
