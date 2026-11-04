@@ -391,7 +391,7 @@ where
 {
     let total_line_numbers = context.doc.text().len_lines();
 
-    write(context, format!(" {} ", total_line_numbers).into());
+    write(context, format!(" {total_line_numbers} lines ").into());
 }
 
 fn render_position_percentage<'a, F>(context: &mut RenderContext<'a>, write: F)
