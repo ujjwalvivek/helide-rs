@@ -53,14 +53,16 @@ impl FileWatcher {
         }
     }
 
-    /// Watches the folders of the open files, and stops watching folders with none left.
-    pub fn sync(&mut self, editor: &Editor) {
+    /// Watches the folders of the open files plus `extra` (the folders the file tree shows and
+    /// the repository's own), and stops watching folders no longer wanted.
+    pub fn sync(&mut self, editor: &Editor, extra: Vec<PathBuf>) {
         let Some(watcher) = self.watcher.as_mut() else {
             return;
         };
         let wanted: HashSet<PathBuf> = editor
             .documents()
             .filter_map(|doc| doc.path()?.parent().map(Path::to_path_buf))
+            .chain(extra.into_iter().filter(|dir| dir.is_dir()))
             .collect();
         for dir in self.watched.difference(&wanted) {
             let _ = watcher.unwatch(dir);

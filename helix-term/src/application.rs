@@ -286,7 +286,12 @@ impl Application {
 
     async fn render(&mut self) {
         self.ide.after_event(&mut self.editor);
-        self.watch.sync(&self.editor);
+        let extra = self
+            .compositor
+            .find::<ui::EditorView>()
+            .map(|view| view.watched_dirs())
+            .unwrap_or_default();
+        self.watch.sync(&self.editor, extra);
         let summary = self.lsp_summary();
         if let Some(editor_view) = self.compositor.find::<ui::EditorView>() {
             editor_view.lsp_summary = summary;
@@ -394,6 +399,9 @@ impl Application {
                     // Saves and checkouts come in bursts; take everything already queued.
                     while let Ok(more) = self.watch.rx.try_recv() {
                         paths.extend(more);
+                    }
+                    if let Some(view) = self.compositor.find::<ui::EditorView>() {
+                        view.disk_changed(&self.editor, &paths);
                     }
                     crate::watch::reload_changed(&mut self.editor, paths);
                     self.render().await;

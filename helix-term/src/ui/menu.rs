@@ -6,7 +6,12 @@ use tui::{buffer::Buffer as Surface, widgets::Table};
 
 pub use tui::widgets::{Cell, Row};
 
-use helix_view::{editor::SmartTabConfig, graphics::Rect, Editor};
+use helix_view::{
+    editor::SmartTabConfig,
+    graphics::Rect,
+    input::{MouseButton, MouseEventKind},
+    Editor,
+};
 use tui::layout::Constraint;
 
 pub trait Item: Sync + Send + 'static {
@@ -36,6 +41,8 @@ pub struct Menu<T: Item> {
     viewport: (u16, u16),
     recalculate: bool,
     auto_close: bool,
+    /// Where it was last drawn, to tell which row a click lands on.
+    area: Rect,
 }
 
 impl<T: Item> Menu<T> {
@@ -61,6 +68,7 @@ impl<T: Item> Menu<T> {
             viewport: (0, 0),
             recalculate: true,
             auto_close: false,
+            area: Rect::default(),
         }
     }
 
@@ -237,7 +245,27 @@ impl<T: Item + 'static> Component for Menu<T> {
             Event::Key(event) => *event,
             // Menu is a modal and should consume mouse events so clicks don't fall
             // through to the editor underneath
-            Event::Mouse(_) => return EventResult::Consumed(None),
+            Event::Mouse(mouse) => {
+                let area = self.area;
+                let inside = mouse.column >= area.left()
+                    && mouse.column < area.right()
+                    && mouse.row >= area.top()
+                    && mouse.row < area.bottom();
+                if inside && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    let index = self.scroll + (mouse.row - area.top()) as usize;
+                    if index < self.matches.len() {
+                        self.cursor = Some(index);
+                        let selection = self.selection();
+                        (self.callback_fn)(cx.editor, selection, MenuEvent::Validate);
+                        return EventResult::Consumed(Some(Box::new(
+                            |compositor: &mut Compositor, _| {
+                                compositor.pop();
+                            },
+                        )));
+                    }
+                }
+                return EventResult::Consumed(None);
+            }
             _ => return EventResult::Ignored(None),
         };
 
@@ -340,6 +368,7 @@ impl<T: Item + 'static> Component for Menu<T> {
         let selected = theme.get("ui.menu.selected");
 
         surface.clear_with(area, style);
+        self.area = area;
 
         let scroll = self.scroll;
 

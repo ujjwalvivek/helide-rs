@@ -2987,8 +2987,9 @@ fn rewrite(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
                 return;
             };
             if doc.version() != version || !editor.tree.contains(view_id) {
-                editor
-                    .set_error("The file changed while the model was answering; nothing was replaced");
+                editor.set_error(
+                    "The file changed while the model was answering; nothing was replaced",
+                );
                 return;
             }
             let view = editor.tree.get_mut(view_id);
@@ -3489,36 +3490,38 @@ fn history(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
         }
         bail!("No history for this file yet: it starts when the file is opened or saved.");
     }
-    let items: Vec<(crate::history::Version, String)> = versions
+    // Each version with how it differs from now, as a count and as lines to tint in the preview.
+    type Tints = Vec<(usize, bool)>;
+    let items: Vec<(crate::history::Version, String, Tints)> = versions
         .into_iter()
         .map(|version| {
-            let changes = std::fs::read_to_string(&version.copy)
-                .map(|old| {
-                    let (adds, dels) = crate::history::line_changes(&current, &old);
-                    if adds + dels == 0 {
-                        "same as now".to_string()
-                    } else {
-                        format!("+{adds} −{dels}")
-                    }
-                })
-                .unwrap_or_default();
-            (version, changes)
+            let Ok(old) = std::fs::read_to_string(&version.copy) else {
+                return (version, String::new(), Vec::new());
+            };
+            let (adds, dels) = crate::history::line_changes(&current, &old);
+            let changes = if adds + dels == 0 {
+                "same as now".to_string()
+            } else {
+                format!("+{adds} −{dels}")
+            };
+            let tints = crate::history::line_tints(&current, &old);
+            (version, changes, tints)
         })
         .collect();
     let callback = async move {
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |_editor: &mut Editor, compositor: &mut Compositor| {
-                type Item = (crate::history::Version, String);
+                type Item = (crate::history::Version, String, Vec<(usize, bool)>);
                 let columns = [
-                    ui::PickerColumn::new("age", |(version, _): &Item, _| version.age().into()),
-                    ui::PickerColumn::new("kind", |(version, _): &Item, _| {
+                    ui::PickerColumn::new("age", |(version, _, _): &Item, _| version.age().into()),
+                    ui::PickerColumn::new("kind", |(version, _, _): &Item, _| {
                         version
                             .subject
                             .clone()
                             .unwrap_or_else(|| version.kind.label().to_string())
                             .into()
                     }),
-                    ui::PickerColumn::new("against now", |(_, changes): &Item, _| {
+                    ui::PickerColumn::new("against now", |(_, changes, _): &Item, _| {
                         changes.as_str().into()
                     }),
                 ];
@@ -3527,11 +3530,12 @@ fn history(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
                     0,
                     items,
                     (),
-                    move |cx, (version, _): &Item, _action| {
+                    move |cx, (version, _, _): &Item, _action| {
                         let old = match std::fs::read_to_string(&version.copy) {
                             Ok(old) => Rope::from_str(&old),
                             Err(err) => {
-                                cx.editor.set_error(format!("cannot read that version: {err}"));
+                                cx.editor
+                                    .set_error(format!("cannot read that version: {err}"));
                                 return;
                             }
                         };
@@ -3545,13 +3549,21 @@ fn history(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
                         let age = version.age();
                         cx.editor.set_status(format!(
                             "Put back the version from {} (u undoes).",
-                            if age == "now" { "just now".to_string() } else { format!("{age} ago") }
+                            if age == "now" {
+                                "just now".to_string()
+                            } else {
+                                format!("{age} ago")
+                            }
                         ));
                     },
                 )
-                .with_preview(|_editor, (version, _): &Item| {
-                    Some((version.copy.as_path().into(), None))
-                });
+                // The preview opens on the first change, tinted: green for lines that would
+                // come back, a red underline where lines of now would go.
+                .with_preview(|_editor, (version, _, tints): &Item| {
+                    let first = tints.first().map(|&(line, _)| (line, line));
+                    Some((version.copy.as_path().into(), first))
+                })
+                .with_preview_tints(|(_, _, tints): &Item| tints.clone());
                 compositor.push(Box::new(overlaid(picker)))
             },
         ));

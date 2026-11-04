@@ -77,6 +77,13 @@ impl FileTree {
         }
     }
 
+    /// The folders the tree shows: the root and every expanded directory.
+    pub fn shown_dirs(&self) -> Vec<PathBuf> {
+        std::iter::once(self.root.clone())
+            .chain(self.expanded.iter().cloned())
+            .collect()
+    }
+
     /// Re-reads every expanded directory, keeping the selection on the same path.
     pub fn refresh(&mut self, editor: &Editor) {
         let root = helix_stdx::env::current_working_dir();
@@ -490,6 +497,18 @@ pub fn prompt(action: &TreeAction, editor: &Editor) -> Option<Box<dyn Component>
                     };
                     if let Err(err) = result {
                         cx.editor.set_error(format!("cannot delete: {err}"));
+                    } else {
+                        // Tabs of what was deleted close, unless they hold unsaved edits.
+                        let gone: Vec<_> = cx
+                            .editor
+                            .documents()
+                            .filter(|doc| !doc.is_modified())
+                            .filter(|doc| doc.path().is_some_and(|p| p.starts_with(&path)))
+                            .map(|doc| doc.id())
+                            .collect();
+                        for id in gone {
+                            let _ = cx.editor.close_document(id, true);
+                        }
                     }
                     refresh_later(cx, false);
                 },

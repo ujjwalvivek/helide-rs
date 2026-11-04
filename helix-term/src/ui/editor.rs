@@ -17,7 +17,7 @@ use helix_core::{
     diagnostic::NumberOrString,
     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
     movement::Direction,
-    syntax::{self, OverlayHighlights},
+    syntax::{self, HighlightEvent, OverlayHighlights},
     text_annotations::TextAnnotations,
     unicode::width::UnicodeWidthStr,
     visual_offset_from_block, Change, Position, Range, Selection, Transaction,
@@ -600,28 +600,46 @@ impl EditorView {
         }
         let byte = text.line_to_byte(top_line);
         let loader = editor.syn_loader.load();
+        let encloses = |start: usize, end: usize| start < byte && end > byte;
+        // Each block the top line is inside, as (first line, last line). Code blocks come from
+        // the text object query; Markdown has none, so its sections stand in.
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
         let layer = syntax.layer_for_byte_range(byte as u32, byte as u32);
-        let Some(query) = loader.textobject_query(syntax.layer(layer).language) else {
-            return;
-        };
-        let root = syntax
-            .tree_for_byte_range(byte as u32, byte as u32)
-            .root_node();
-        // Each block the top line is inside, as (first line, last line), from one pass of the
-        // query. A block that ends right under the pinned rows has nothing left to label.
-        let mut blocks: Vec<(usize, usize)> = ["class.around", "function.around"]
-            .iter()
-            .filter_map(|name| query.capture_nodes(name, &root, text))
-            .flatten()
-            .filter(|node| node.start_byte() < byte && node.end_byte() > byte)
-            .map(|node| {
-                (
-                    text.byte_to_line(node.start_byte()),
-                    text.byte_to_line(node.end_byte()),
-                )
-            })
-            .filter(|&(_, last)| last > top_line + 1)
-            .collect();
+        if let Some(query) = loader.textobject_query(syntax.layer(layer).language) {
+            let root = syntax
+                .tree_for_byte_range(byte as u32, byte as u32)
+                .root_node();
+            blocks.extend(
+                ["class.around", "function.around"]
+                    .iter()
+                    .filter_map(|name| query.capture_nodes(name, &root, text))
+                    .flatten()
+                    .filter(|node| encloses(node.start_byte(), node.end_byte()))
+                    .map(|node| {
+                        (
+                            text.byte_to_line(node.start_byte()),
+                            text.byte_to_line(node.end_byte()),
+                        )
+                    }),
+            );
+        }
+        if blocks.is_empty() {
+            let root = syntax.tree().root_node();
+            let mut node = root.descendant_for_byte_range(byte as u32, byte as u32);
+            while let Some(current) = node {
+                if current.kind() == "section"
+                    && encloses(current.start_byte() as usize, current.end_byte() as usize)
+                {
+                    blocks.push((
+                        text.byte_to_line(current.start_byte() as usize),
+                        text.byte_to_line(current.end_byte() as usize),
+                    ));
+                }
+                node = current.parent();
+            }
+        }
+        // A block that ends right under the pinned rows has nothing left to label.
+        blocks.retain(|&(_, last)| last > top_line + 1);
         blocks.sort_unstable();
         let mut lines: Vec<usize> = blocks.into_iter().map(|(first, _)| first).collect();
         lines.dedup();
@@ -632,12 +650,10 @@ impl EditorView {
             return;
         }
 
-        let base = theme.get("ui.background");
-        let row_style = base.patch(
-            theme
-                .try_get("ui.cursorline.primary")
-                .unwrap_or_else(|| theme.get("ui.popup")),
-        );
+        let row_style = theme
+            .try_get("ui.virtual.sticky")
+            .or_else(|| theme.try_get("ui.statusline.inactive"))
+            .unwrap_or_else(|| theme.get("ui.popup"));
         let text_style = row_style.patch(Style {
             bg: None,
             ..theme.get("ui.text")
@@ -647,25 +663,72 @@ impl EditorView {
             ..theme.get("ui.linenr")
         });
         let gutter = inner.x.saturating_sub(view.area.x);
-        let tab = " ".repeat(doc.tab_width());
+        let tab_width = doc.tab_width();
         for (i, &line) in lines.iter().enumerate() {
             let y = inner.y + i as u16;
             let row = Rect::new(view.area.x, y, gutter + inner.width, 1);
-            surface.set_style(row, row_style);
+            surface.clear_with(row, row_style);
             let number = (line + 1).to_string();
             if gutter as usize > number.len() {
                 let x = view.area.x + gutter - 1 - number.len() as u16;
                 surface.set_string(x, y, &number, number_style);
             }
-            let content: String = text.line(line).to_string();
-            let content = content.trim_end_matches(['\n', '\r']).replace('\t', &tab);
-            let style = if i + 1 == lines.len() {
-                text_style.underline_style(helix_view::graphics::UnderlineStyle::Line)
-            } else {
-                text_style
-            };
-            surface.set_stringn(inner.x, y, &content, inner.width as usize, style);
+            let last = i + 1 == lines.len();
+            let mut x = inner.x;
+            let end = inner.x + inner.width;
+            for (piece, style) in Self::highlighted_line(syntax, text, &loader, theme, line) {
+                let mut style = text_style.patch(Style { bg: None, ..style });
+                if last {
+                    style = style.underline_style(helix_view::graphics::UnderlineStyle::Line);
+                }
+                let piece = piece.replace('\t', &" ".repeat(tab_width));
+                if x >= end {
+                    break;
+                }
+                let (next, _) = surface.set_stringn(x, y, &piece, (end - x) as usize, style);
+                x = next;
+            }
+            if last && x < end {
+                let rest = Rect::new(x, y, end - x, 1);
+                surface.set_style(
+                    rest,
+                    Style::default().underline_style(helix_view::graphics::UnderlineStyle::Line),
+                );
+            }
         }
+    }
+
+    /// One line of a document cut into pieces by syntax highlight, without its line ending.
+    fn highlighted_line(
+        syntax: &syntax::Syntax,
+        text: helix_core::RopeSlice,
+        loader: &syntax::Loader,
+        theme: &Theme,
+        line: usize,
+    ) -> Vec<(String, Style)> {
+        let start = text.line_to_byte(line);
+        let content = text.line(line).to_string();
+        let end = start + content.trim_end_matches(['\n', '\r']).len();
+        let mut highlighter = syntax.highlighter(text, loader, start as u32..end as u32);
+        let mut stack = Vec::new();
+        let mut pieces = Vec::new();
+        let mut pos = start;
+        while pos < end {
+            while (highlighter.next_event_offset() as usize) <= pos {
+                let (event, new) = highlighter.advance();
+                if event == HighlightEvent::Refresh {
+                    stack.clear();
+                }
+                stack.extend(new);
+            }
+            let next = (highlighter.next_event_offset() as usize).min(end);
+            let style = stack
+                .iter()
+                .fold(Style::default(), |acc, h| acc.patch(theme.highlight(*h)));
+            pieces.push((text.byte_slice(pos..next).to_string(), style));
+            pos = next;
+        }
+        pieces
     }
 
     pub fn render_rulers(
@@ -2252,6 +2315,41 @@ impl EditorView {
                 );
                 Some(Box::new(agent_menu(position)))
             }
+        }
+    }
+
+    /// Folders to watch for the side panels: what the file tree shows, and the repository's
+    /// own files (index, HEAD, branches) for the git panel.
+    pub fn watched_dirs(&self) -> Vec<PathBuf> {
+        if !self.file_tree.visible && !self.git.visible {
+            return Vec::new();
+        }
+        let root = helix_stdx::env::current_working_dir();
+        let mut dirs = if self.file_tree.visible {
+            self.file_tree.shown_dirs()
+        } else {
+            vec![root.clone()]
+        };
+        dirs.push(root.join(".git"));
+        dirs.push(root.join(".git/refs/heads"));
+        dirs
+    }
+
+    /// Files changed on disk: the tree and git panel catch up at once.
+    pub fn disk_changed(&mut self, editor: &Editor, paths: &[PathBuf]) {
+        // Lock files come and go around every git command; the real change follows them.
+        if paths
+            .iter()
+            .all(|path| path.extension().is_some_and(|ext| ext == "lock"))
+        {
+            return;
+        }
+        if self.file_tree.visible {
+            self.tree_refreshed = Some(std::time::Instant::now());
+            self.file_tree.refresh(editor);
+        }
+        if self.git.visible {
+            self.git.refresh();
         }
     }
 
@@ -3978,9 +4076,11 @@ fn redraw_every_two_seconds() {
 /// never saved, the path is where it is saved.
 fn rename_file_prompt(editor: &Editor, doc: DocumentId) -> Prompt {
     let root = helix_stdx::env::current_working_dir();
+    // A file deleted under its tab counts as never saved: the path is where it is saved again.
     let old = editor
         .document(doc)
         .and_then(|d| d.path().map(PathBuf::from));
+    let on_disk = old.as_ref().is_some_and(|path| path.exists());
     let line = old
         .as_ref()
         .map(|path| {
@@ -3990,11 +4090,7 @@ fn rename_file_prompt(editor: &Editor, doc: DocumentId) -> Prompt {
                 .to_string()
         })
         .unwrap_or_default();
-    let label = if old.is_some() {
-        "move to: "
-    } else {
-        "save as: "
-    };
+    let label = if on_disk { "move to: " } else { "save as: " };
     Prompt::new(
         label.into(),
         None,
@@ -4010,7 +4106,7 @@ fn rename_file_prompt(editor: &Editor, doc: DocumentId) -> Prompt {
                     .unwrap_or_else(|_| root.join(input)),
                 None => root.join(input),
             };
-            if old.as_deref() == Some(new.as_path()) {
+            if on_disk && old.as_deref() == Some(new.as_path()) {
                 return;
             }
             if new.exists() {
@@ -4026,8 +4122,10 @@ fn rename_file_prompt(editor: &Editor, doc: DocumentId) -> Prompt {
                 }
             }
             let result = match &old {
-                Some(old) => cx.editor.move_path(old, &new).map_err(anyhow::Error::from),
-                None => cx.editor.save(doc, Some(new.clone()), false),
+                Some(old) if old.exists() => {
+                    cx.editor.move_path(old, &new).map_err(anyhow::Error::from)
+                }
+                _ => cx.editor.save(doc, Some(new.clone()), false),
             };
             match result {
                 Ok(()) => cx.editor.set_status(format!(
