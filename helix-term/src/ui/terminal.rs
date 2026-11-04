@@ -86,6 +86,9 @@ struct Session {
     group: u32,
     /// The agent session this tab runs, for agent tabs.
     agent: Option<AgentSession>,
+    /// For an agent: its turn as its own records last said, and which conversation that was.
+    /// While known, it decides busy and finished instead of the terminal's output.
+    turn: Option<(String, agents::Turn)>,
     /// The process the pane started, to ask Claude which conversation it is in.
     pid: Option<u32>,
     /// The command it was started with (empty for the shell), to start it again next time.
@@ -182,6 +185,7 @@ impl Session {
             group: 0,
             title: agent.as_ref().and_then(|a| a.name.clone()),
             agent,
+            turn: None,
             pid,
             command: command.to_vec(),
             program_title: None,
@@ -257,7 +261,10 @@ impl Session {
     }
 
     fn is_busy(&self) -> bool {
-        self.busy_since.is_some()
+        match &self.turn {
+            Some((_, turn)) => turn.busy,
+            None => self.busy_since.is_some(),
+        }
     }
 
     /// Ends a busy stretch after a quiet spell. Returns whether it was a long run.
@@ -698,6 +705,37 @@ impl TerminalPanel {
         true
     }
 
+    /// Takes in the agents' turns, read from their records, and reports the tabs whose turn
+    /// just ended. The first reading for a conversation only sets where it stands, so a tab
+    /// restored onto a chat that finished long ago is not reported.
+    pub fn apply_turns(&mut self, turns: &[(String, agents::Turn)]) -> Vec<Finished> {
+        let mut finished = Vec::new();
+        for (index, session) in self.sessions.iter_mut().enumerate() {
+            let Some(id) = session.agent.as_ref().map(|agent| agent.id.clone()) else {
+                continue;
+            };
+            let Some((_, turn)) = turns.iter().find(|(t, _)| *t == id) else {
+                continue;
+            };
+            let ended = match &session.turn {
+                Some((was, before)) if *was == id => {
+                    !turn.busy && turn.ended.is_some() && turn.ended != before.ended
+                }
+                _ => false,
+            };
+            session.turn = Some((id, *turn));
+            if ended {
+                let seen = self.visible && self.focused && index == self.active;
+                session.attention = !seen;
+                finished.push(Finished {
+                    name: session.name.clone(),
+                    seen,
+                });
+            }
+        }
+        finished
+    }
+
     /// Drains events from every session, drops the ones whose program exited, and reports the
     /// tabs that just finished a long run. Returns (finished, whether any tab closed).
     pub fn update(&mut self) -> (Vec<Finished>, bool) {
@@ -705,7 +743,9 @@ impl TerminalPanel {
         let mut finished = Vec::new();
         for (index, session) in self.sessions.iter_mut().enumerate() {
             session.drain_events();
-            if session.settle(now) {
+            // An agent whose records can be read is finished when they say so, not when it
+            // goes quiet.
+            if session.settle(now) && session.turn.is_none() {
                 let seen = self.visible && self.focused && index == self.active;
                 session.attention = !seen;
                 finished.push(Finished {
@@ -725,7 +765,9 @@ impl TerminalPanel {
             }
         }
         // A busy tab is settled by a redraw after the quiet spell, even if nothing else draws.
-        if self.sessions.iter().any(Session::is_busy) && !self.tick.swap(true, Ordering::Relaxed) {
+        if self.sessions.iter().any(|s| s.busy_since.is_some())
+            && !self.tick.swap(true, Ordering::Relaxed)
+        {
             let tick = self.tick.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(QUIET).await;

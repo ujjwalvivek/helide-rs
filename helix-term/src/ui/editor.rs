@@ -158,6 +158,9 @@ pub struct EditorView {
     tab_rows: HashMap<ViewId, Vec<DocumentId>>,
     /// When the agent tabs were last checked for a conversation Claude moved to.
     agents_followed: Option<std::time::Instant>,
+    /// When the agents' turns were last read from their records, and whether a read is out.
+    turns_read: Option<std::time::Instant>,
+    turns_reading: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Time travel: the version of each open file last kept, and when the edits were last
     /// looked at.
     history_seen: HashMap<DocumentId, i32>,
@@ -230,6 +233,8 @@ impl EditorView {
             tab_columns: Vec::new(),
             tab_rows: HashMap::new(),
             agents_followed: None,
+            turns_read: None,
+            turns_reading: Default::default(),
             history_seen: HashMap::new(),
             history_at: None,
             tree_refreshed: None,
@@ -3950,13 +3955,36 @@ impl Component for EditorView {
                 });
             });
         }
-        for run in finished.iter().filter(|run| !run.seen) {
-            let project = helix_stdx::env::current_working_dir();
-            let project = project
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            agents::notify(&format!("{} finished", run.name), &project);
+        notify_finished(&finished);
+        // About every second, each agent's own records say whether its turn is running or has
+        // ended; that, not a pause in its output, marks the tab and sends the notification.
+        let agent_tabs = self.agents.agent_sessions();
+        if !agent_tabs.is_empty() {
+            redraw_every_two_seconds();
+            let due = self
+                .turns_read
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+            if due
+                && !self
+                    .turns_reading
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.turns_read = Some(std::time::Instant::now());
+                let reading = self.turns_reading.clone();
+                tokio::task::spawn_blocking(move || {
+                    let turns: Vec<(String, agents::Turn)> = agent_tabs
+                        .iter()
+                        .filter_map(|agent| agents::turn_of(agent).map(|t| (agent.id.clone(), t)))
+                        .collect();
+                    reading.store(false, std::sync::atomic::Ordering::Relaxed);
+                    crate::job::dispatch_blocking(move |_, compositor| {
+                        if let Some(view) = compositor.find::<EditorView>() {
+                            let finished = view.agents.apply_turns(&turns);
+                            notify_finished(&finished);
+                        }
+                    });
+                });
+            }
         }
         self.layout_frame(frame);
         // A panel tab dragged along its own row: the row makes room for it.
@@ -4359,6 +4387,18 @@ fn copy_to_clipboard(editor: &mut Editor, text: String) {
             if lines == 1 { "" } else { "s" }
         )),
         Err(err) => editor.set_error(format!("Couldn't copy: {err}")),
+    }
+}
+
+/// A desktop notification for each agent tab that finished while you were elsewhere.
+fn notify_finished(finished: &[super::terminal::Finished]) {
+    for run in finished.iter().filter(|run| !run.seen) {
+        let project = helix_stdx::env::current_working_dir();
+        let project = project
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        agents::notify(&format!("{} finished", run.name), &project);
     }
 }
 

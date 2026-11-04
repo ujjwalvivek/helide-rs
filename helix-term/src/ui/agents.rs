@@ -159,6 +159,163 @@ pub fn claude_live_session(pids: &[u32]) -> Option<String> {
         .map(|(_, id)| id)
 }
 
+/// Where an agent is in its work, from its own records rather than from its terminal: a
+/// pause in output is not a turn ending (the model thinks, a tool runs, the TUI slows its
+/// redraw), so only the agent's word for it counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Turn {
+    /// A turn has started and not yet ended.
+    pub busy: bool,
+    /// Changes each time a turn ends: where the closing record sits in Claude's transcript,
+    /// or OpenCode's idle stamp. `None` before any turn has ended.
+    pub ended: Option<u64>,
+}
+
+/// The turn `agent` is in, or `None` when its records cannot be read (no conversation yet,
+/// or no file or database).
+pub fn turn_of(agent: &AgentSession) -> Option<Turn> {
+    match agent.kind {
+        AgentKind::Claude => claude_turn(&agent.id),
+        AgentKind::OpenCode => opencode_turn(&agent.id),
+    }
+}
+
+/// Claude's transcript, `projects/<folder>/<id>.jsonl`, says when a turn starts and ends. As
+/// the first Helide read it: a prompt you typed starts one; an assistant message that stops
+/// for any reason but a tool call ends it, as does the note Claude writes when Esc interrupts
+/// it. Subagents, slash commands and tool results say nothing. Only the end of the file is
+/// read, since it only grows.
+fn claude_turn(id: &str) -> Option<Turn> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !is_uuid(id) {
+        return None;
+    }
+    let projects = claude_config_dir()?.join("projects");
+    let path = std::fs::read_dir(projects)
+        .ok()?
+        .flatten()
+        .map(|folder| folder.path().join(format!("{id}.jsonl")))
+        .find(|path| path.is_file())?;
+    const TAIL: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(read_claude_turn(&bytes, start))
+}
+
+/// The turn the transcript lines in `bytes` describe; `start` is where they begin in the file,
+/// and a first line cut off by the start is skipped.
+fn read_claude_turn(bytes: &[u8], start: u64) -> Turn {
+    let mut turn = Turn {
+        busy: false,
+        ended: None,
+    };
+    let mut at = 0;
+    if start > 0 {
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(newline) => at = newline + 1,
+            None => return turn,
+        }
+    }
+    while at < bytes.len() {
+        let end = bytes[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| at + i);
+        // A line still being written has no newline yet; it is read on the next look.
+        if end == bytes.len() && !bytes.ends_with(b"\n") {
+            break;
+        }
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes[at..end]) {
+            match claude_mark(&record) {
+                Some(true) => turn.busy = true,
+                Some(false) => {
+                    turn.busy = false;
+                    turn.ended = Some(start + end as u64);
+                }
+                None => {}
+            }
+        }
+        at = end + 1;
+    }
+    turn
+}
+
+/// `Some(true)` for a record that starts a turn, `Some(false)` for one that ends it.
+fn claude_mark(record: &serde_json::Value) -> Option<bool> {
+    if record["isSidechain"].as_bool() == Some(true) {
+        return None;
+    }
+    let message = record.get("message")?.as_object()?;
+    let interrupted = |text: &str| text.starts_with("[Request interrupted");
+    match record["type"].as_str()? {
+        "assistant" => {
+            let stop = message.get("stop_reason")?.as_str()?;
+            (!matches!(stop, "tool_use" | "pause_turn")).then_some(false)
+        }
+        "user" => {
+            if record["isMeta"].as_bool() == Some(true) {
+                return None;
+            }
+            match message.get("content")? {
+                serde_json::Value::String(text) if interrupted(text) => Some(false),
+                // Slash commands and ! lines are run by Claude itself, with no reply.
+                serde_json::Value::String(text) => (!(text.starts_with("<command-")
+                    || text.starts_with("<local-command")
+                    || text.starts_with("<bash-")))
+                .then_some(true),
+                serde_json::Value::Array(blocks) => {
+                    let mut prompt = false;
+                    for block in blocks {
+                        match block["type"].as_str() {
+                            Some("tool_result") | None => {}
+                            Some("text") if block["text"].as_str().is_some_and(interrupted) => {
+                                return Some(false)
+                            }
+                            Some(_) => prompt = true,
+                        }
+                    }
+                    prompt.then_some(true)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// OpenCode stamps a session busy when a turn starts and idle when it ends, in its database.
+fn opencode_turn(id: &str) -> Option<Turn> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            helix_stdx::path::home_dir()
+                .ok()
+                .map(|home| home.join(".local/share"))
+        })?;
+    let db = data.join("opencode/opencode.db");
+    let connection = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = connection.busy_timeout(std::time::Duration::from_millis(200));
+    let (busy, idle): (Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT time_busy, time_idle FROM session_v2 WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    Some(Turn {
+        busy: busy.is_some_and(|busy| busy > idle.unwrap_or(0)),
+        ended: idle.map(|idle| idle as u64),
+    })
+}
+
 /// The OpenCode session a pane titled `title` is showing, among `project`'s sessions.
 ///
 /// OpenCode keeps no record of which session a running TUI shows, but it sets the terminal's
@@ -500,6 +657,44 @@ mod tests {
         assert!(id.starts_with("ses_"));
         assert_eq!(id.len(), 4 + 12 + 14);
         assert!(id[4..16].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn reads_turns_from_claude_transcripts() {
+        let line = |v: serde_json::Value| format!("{v}\n");
+        let prompt = line(serde_json::json!({"type": "user", "message": {"content": "fix it"}}));
+        let tool =
+            line(serde_json::json!({"type": "assistant", "message": {"stop_reason": "tool_use"}}));
+        let result = line(
+            serde_json::json!({"type": "user", "message": {"content": [{"type": "tool_result"}]}}),
+        );
+        let done =
+            line(serde_json::json!({"type": "assistant", "message": {"stop_reason": "end_turn"}}));
+        let side = line(
+            serde_json::json!({"type": "assistant", "isSidechain": true, "message": {"stop_reason": "end_turn"}}),
+        );
+
+        // Mid-turn: a tool call and its result keep it busy, and a subagent finishing does not end it.
+        let working = [prompt.clone(), tool, result, side].concat();
+        let turn = read_claude_turn(working.as_bytes(), 0);
+        assert!(turn.busy);
+        assert_eq!(turn.ended, None);
+
+        let finished = [working.clone(), done].concat();
+        let turn = read_claude_turn(finished.as_bytes(), 0);
+        assert!(!turn.busy);
+        assert_eq!(turn.ended, Some(finished.len() as u64 - 1));
+
+        // A slash command opens no turn; an interruption closes one.
+        let command = line(
+            serde_json::json!({"type": "user", "message": {"content": "<command-name>/clear</command-name>"}}),
+        );
+        assert!(!read_claude_turn(command.as_bytes(), 0).busy);
+        let stopped = line(
+            serde_json::json!({"type": "user", "message": {"content": [{"type": "text", "text": "[Request interrupted by user]"}]}}),
+        );
+        let turn = read_claude_turn([prompt, stopped].concat().as_bytes(), 0);
+        assert!(!turn.busy && turn.ended.is_some());
     }
 
     #[test]
