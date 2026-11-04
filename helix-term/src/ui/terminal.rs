@@ -804,8 +804,7 @@ impl TerminalPanel {
         let active = groups.iter().position(|g| Some(*g) == shown);
         let labels: Vec<Label> = groups
             .into_iter()
-            .enumerate()
-            .map(|(i, group)| {
+            .map(|group| {
                 let members: Vec<&Session> =
                     self.sessions.iter().filter(|s| s.group == group).collect();
                 let names: Vec<String> = match members.iter().find_map(|s| s.title.as_deref()) {
@@ -831,7 +830,7 @@ impl TerminalPanel {
                     ("", base)
                 };
                 // The trailing × closes the tab.
-                Label::new(format!("{} {}{mark} ×", i + 1, names.join(" · ")), style)
+                Label::new(format!("{}{mark} ×", names.join(" · ")), style)
             })
             .collect();
         let keys: Vec<u64> = self.groups().into_iter().map(u64::from).collect();
