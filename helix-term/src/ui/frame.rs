@@ -169,7 +169,7 @@ fn next_frame() {
         return;
     }
     tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(12)).await;
         PENDING.store(false, Ordering::Relaxed);
         helix_event::request_redraw();
     });
@@ -302,7 +302,7 @@ impl TabStrip {
             .animated_at
             .map_or(1.0, |at| now.duration_since(at).as_secs_f32());
         self.animated_at = Some(now);
-        let ease = 1.0 - (-elapsed / 0.045).exp();
+        let ease = 1.0 - (-elapsed / 0.075).exp();
         let mut moving = false;
         let mut hits = Vec::new();
         let mut columns = std::collections::HashMap::new();
