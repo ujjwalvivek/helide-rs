@@ -86,6 +86,10 @@ struct Session {
     pid: Option<u32>,
     /// The command it was started with (empty for the shell), to start it again next time.
     command: Vec<String>,
+    /// The title the program last set, and whether it changed since an OpenCode tab last
+    /// looked at it.
+    program_title: Option<String>,
+    title_changed: bool,
     /// When the current busy stretch started, and when the program last wrote.
     busy_since: Option<Instant>,
     last_output: Option<Instant>,
@@ -172,6 +176,8 @@ impl Session {
             agent,
             pid,
             command: command.to_vec(),
+            program_title: None,
+            title_changed: false,
             busy_since: None,
             last_output: None,
             attention: false,
@@ -209,6 +215,10 @@ impl Session {
                     self.busy_since.get_or_insert(now);
                 }
                 TermEvent::ChildExit(_) | TermEvent::Exit => self.exited = true,
+                TermEvent::Title(title) => {
+                    self.title_changed = self.program_title.as_deref() != Some(title.as_str());
+                    self.program_title = Some(title);
+                }
                 _ => {}
             }
         }
@@ -574,6 +584,46 @@ impl TerminalPanel {
             .iter()
             .filter_map(|session| session.agent.clone())
             .collect()
+    }
+
+    /// The OpenCode tabs whose title changed since last asked: (their session id now, the
+    /// title). Looking up which session a title names takes OpenCode's own command, so the
+    /// caller does it off the main thread and calls `move_agent` with what it found.
+    pub fn retitled_opencode(&mut self) -> Vec<(String, String)> {
+        self.sessions
+            .iter_mut()
+            .filter(|s| s.title_changed)
+            .filter_map(|s| {
+                s.title_changed = false;
+                let agent = s.agent.as_ref().filter(|a| a.kind == AgentKind::OpenCode)?;
+                Some((agent.id.clone(), s.program_title.clone()?))
+            })
+            .collect()
+    }
+
+    /// Moves the tab on session `from` onto session `to`, unless another tab already holds
+    /// `to`. Returns whether it moved.
+    pub fn move_agent(&mut self, from: &str, to: &str) -> bool {
+        if from == to
+            || self
+                .sessions
+                .iter()
+                .any(|s| s.agent.as_ref().is_some_and(|a| a.id == to))
+        {
+            return false;
+        }
+        let agent = self
+            .sessions
+            .iter_mut()
+            .filter_map(|s| s.agent.as_mut())
+            .find(|a| a.id == from);
+        match agent {
+            Some(agent) => {
+                agent.id = to.to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Moves each Claude tab's saved id onto the conversation its process is in now, so /clear

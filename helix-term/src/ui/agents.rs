@@ -122,7 +122,7 @@ impl AgentSession {
             AgentKind::Claude => Vec::new(),
             AgentKind::OpenCode => vec![(
                 "OPENCODE_CLI_CONFIG_CONTENT".into(),
-                r#"{"tabs":{"mode":"off"}}"#.into(),
+                r#"{"tabs":{"mode":"off"},"terminal":{"title":true}}"#.into(),
             )],
         }
     }
@@ -157,6 +157,39 @@ pub fn claude_live_session(pids: &[u32]) -> Option<String> {
         })
         .max_by_key(|(started, _)| *started)
         .map(|(_, id)| id)
+}
+
+/// The OpenCode session a pane titled `title` is showing, among `project`'s sessions.
+///
+/// OpenCode keeps no record of which session a running TUI shows, but it sets the terminal's
+/// title to `OC | <session title>` (cut to 37 characters and an ellipsis) whenever its view
+/// changes, and `opencode session list` gives every session's title. Of the sessions whose
+/// title fits, the most recently updated is taken. `None` for OpenCode's own home screen, a
+/// session with no title yet, or no match.
+pub fn opencode_session_for_title(project: &Path, title: &str) -> Option<String> {
+    let shown = title.strip_prefix("OC | ")?;
+    let output = Command::new(AgentKind::OpenCode.command())
+        .args(["session", "list", "--format", "json", "-n", "200"])
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+    match_title(&sessions, shown)
+}
+
+fn match_title(sessions: &[serde_json::Value], shown: &str) -> Option<String> {
+    let fits = |title: &str| match shown.strip_suffix('\u{2026}') {
+        Some(prefix) => title.starts_with(prefix),
+        None => title == shown,
+    };
+    sessions
+        .iter()
+        .filter(|s| s["title"].as_str().is_some_and(fits))
+        .max_by_key(|s| s["updated"].as_u64().unwrap_or(0))
+        .and_then(|s| s["id"].as_str())
+        .map(str::to_string)
 }
 
 /// A process and every process under it, read from /proc. Claude may run under a wrapper, so
@@ -493,6 +526,28 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_session_an_opencode_title_names() {
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"id": "ses_a", "title": "Token-tide development status", "updated": 5},
+                {"id": "ses_b", "title": "PROMPTS.md step 15 datacenter counters and more words", "updated": 9},
+                {"id": "ses_c", "title": "PROMPTS.md step 15 datacenter counters and other", "updated": 3}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            match_title(&sessions, "Token-tide development status").as_deref(),
+            Some("ses_a")
+        );
+        // Cut to 37 characters and an ellipsis: the most recently updated fit wins.
+        assert_eq!(
+            match_title(&sessions, "PROMPTS.md step 15 datacenter counte\u{2026}").as_deref(),
+            Some("ses_b")
+        );
+        assert_eq!(match_title(&sessions, "Something else"), None);
+    }
+
+    #[test]
     fn launch_commands_and_mentions() {
         let opencode = AgentSession {
             kind: AgentKind::OpenCode,
@@ -504,7 +559,7 @@ mod tests {
             opencode.env(),
             vec![(
                 "OPENCODE_CLI_CONFIG_CONTENT".to_string(),
-                r#"{"tabs":{"mode":"off"}}"#.to_string()
+                r#"{"tabs":{"mode":"off"},"terminal":{"title":true}}"#.to_string()
             )]
         );
         assert_eq!(opencode.mention("src/a.rs", Some((3, 9))), "@src/a.rs ");
