@@ -1,6 +1,6 @@
 //! Provides interface for controlling the terminal
 
-use std::io;
+use std::{borrow::Cow, io};
 
 use crate::{buffer::Cell, terminal::Config};
 
@@ -21,6 +21,64 @@ pub use self::crossterm::CrosstermBackend;
 
 mod test;
 pub use self::test::TestBackend;
+
+/// What a cell's symbol looks like on the terminal. Control characters would be obeyed by the
+/// terminal instead of drawn (ESC starts a sequence, CR and BS move the cursor), and a symbol
+/// with no width would not move the cursor even though it holds a column, so both would shift
+/// everything drawn after them. Control characters become their Control Pictures (␀, ␛, ␡) or
+/// � and a symbol of zero width becomes �, each one column wide like the cell they sit in.
+pub(crate) fn printable(symbol: &str) -> Cow<'_, str> {
+    use helix_core::unicode::width::UnicodeWidthStr;
+
+    if symbol.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return Cow::Borrowed(symbol);
+    }
+    if symbol.chars().any(char::is_control) {
+        return Cow::Owned(
+            symbol
+                .chars()
+                .map(|c| match c as u32 {
+                    0x00..=0x1f => char::from_u32(0x2400 + c as u32).unwrap_or('\u{FFFD}'),
+                    0x7f => '\u{2421}',
+                    _ if c.is_control() => '\u{FFFD}',
+                    _ => c,
+                })
+                .collect(),
+        );
+    }
+    if !symbol.is_empty() && symbol.width() == 0 {
+        return Cow::Borrowed("\u{FFFD}");
+    }
+    Cow::Borrowed(symbol)
+}
+
+#[cfg(test)]
+mod printable_tests {
+    use super::printable;
+
+    #[test]
+    fn plain_text_is_untouched() {
+        assert_eq!(printable("a"), "a");
+        assert_eq!(printable("é"), "é");
+        assert_eq!(printable("漢"), "漢");
+        assert_eq!(printable(""), "");
+    }
+
+    #[test]
+    fn control_characters_are_drawn_not_obeyed() {
+        assert_eq!(printable("\u{1b}"), "␛");
+        assert_eq!(printable("\0"), "␀");
+        assert_eq!(printable("\r"), "␍");
+        assert_eq!(printable("\u{7f}"), "␡");
+        assert_eq!(printable("\u{9b}"), "\u{FFFD}");
+    }
+
+    #[test]
+    fn zero_width_symbols_keep_their_column() {
+        assert_eq!(printable("\u{301}"), "\u{FFFD}");
+        assert_eq!(printable("\u{200b}"), "\u{FFFD}");
+    }
+}
 
 /// Representation of a terminal backend.
 pub trait Backend {

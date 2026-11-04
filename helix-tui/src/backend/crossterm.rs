@@ -278,7 +278,7 @@ where
                 underline_style = new_underline_style;
             }
 
-            queue!(self.buffer, Print(&cell.symbol))?;
+            queue!(self.buffer, Print(super::printable(&cell.symbol)))?;
         }
 
         queue!(

@@ -546,7 +546,7 @@ impl Backend for TerminaBackend {
                 )?;
             }
 
-            write!(self.terminal, "{}", &cell.symbol)?;
+            write!(self.terminal, "{}", super::printable(&cell.symbol))?;
         }
 
         write!(self.terminal, "{}", Csi::Sgr(csi::Sgr::Reset))?;
