@@ -153,8 +153,9 @@ pub struct EditorView {
     buffer_strips: HashMap<ViewId, frame::TabStrip>,
     /// Each split's tab row last frame: its top view, the columns it spans, and its files.
     tab_columns: Vec<TabColumn>,
-    /// The row each file's tab stays in while no split shows it, by the row's top view.
-    tab_home: HashMap<DocumentId, ViewId>,
+    /// Each split's tab row, by its top view: its files in order, like a stack. A file joins a
+    /// row when the split shows it, and leaves when its tab is closed there or dragged away.
+    tab_rows: HashMap<ViewId, Vec<DocumentId>>,
     /// When the agent tabs were last checked for a conversation Claude moved to.
     agents_followed: Option<std::time::Instant>,
     /// Time travel: the version of each open file last kept, and when the edits were last
@@ -166,8 +167,6 @@ pub struct EditorView {
     /// Opened as a project (`hx`, `hx .`, `hx dir/`): the workspace is restored and kept.
     /// Opened on files, it is a quick edit that leaves the saved workspace alone.
     pub persist: bool,
-    /// The order of the file tabs, as dragged; files not in it follow in the order opened.
-    buffer_order: Vec<DocumentId>,
     /// Columns of the + after FILES on the sidebar's title row, last frame.
     tree_plus: Option<(u16, u16)>,
     /// The last click on a tab and when, to tell a double click.
@@ -229,13 +228,12 @@ impl EditorView {
             buffer_hits: Vec::new(),
             buffer_strips: HashMap::new(),
             tab_columns: Vec::new(),
-            tab_home: HashMap::new(),
+            tab_rows: HashMap::new(),
             agents_followed: None,
             history_seen: HashMap::new(),
             history_at: None,
             tree_refreshed: None,
             persist: false,
-            buffer_order: Vec::new(),
             tree_plus: None,
             last_tab_click: None,
             sidebar_width: None,
@@ -2098,7 +2096,22 @@ impl EditorView {
                 tabs.push(pane);
             }
         }
-        let layout = (!tabs.is_empty()).then_some(agents::EditorLayout { tabs, active_tab });
+        let rows: Vec<Vec<PathBuf>> = top_views(editor)
+            .iter()
+            .map(|top| {
+                self.tab_rows
+                    .get(top)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&doc| editor.document(doc)?.path().map(PathBuf::from))
+                    .collect()
+            })
+            .collect();
+        let layout = (!tabs.is_empty()).then_some(agents::EditorLayout {
+            tabs,
+            active_tab,
+            rows,
+        });
         let [tree, git, terminal, agents_shown] = self.zen.unwrap_or([
             self.file_tree.visible,
             self.git.visible,
@@ -2156,6 +2169,16 @@ impl EditorView {
             }
             if opened > 0 {
                 editor.switch_tab(layout.active_tab.min(opened - 1));
+            }
+            // Each split's tab row, as it was: files not shown are opened in the background.
+            let tops = top_views(editor);
+            for (top, paths) in tops.iter().zip(&layout.rows) {
+                let row: Vec<DocumentId> = paths
+                    .iter()
+                    .filter(|path| path.exists())
+                    .filter_map(|path| editor.open(path, Action::Load).ok())
+                    .collect();
+                self.tab_rows.insert(*top, row);
             }
         }
         if let Some(panels) = &workspace.panels {
@@ -2672,75 +2695,55 @@ impl EditorView {
             self.tab_hits.push((row.y, start, end));
         }
 
-        // Files in the order they were dragged into; new ones at the end.
-        let mut ordered: Vec<DocumentId> = editor.documents().map(|doc| doc.id()).collect();
-        let rank = |id: &DocumentId| {
-            self.buffer_order
-                .iter()
-                .position(|o| o == id)
-                .unwrap_or(usize::MAX)
-        };
-        ordered.sort_by_key(rank);
-        self.buffer_order = ordered.clone();
-
-        // One tab row per side-by-side split, over the split's own columns. Each file sits in
-        // the split showing it, else the one it was last shown in, else the focused one.
+        // One tab row per side-by-side split, over the split's own columns.
         let views: Vec<&View> = editor.tree.views().map(|(view, _)| view).collect();
-        let top = views.iter().map(|view| view.area.y).min().unwrap_or(0);
-        let mut tops: Vec<&View> = views.iter().copied().filter(|v| v.area.y == top).collect();
-        tops.sort_by_key(|view| view.area.x);
+        let tops_ids = top_views(editor);
+        let tops: Vec<&View> = tops_ids.iter().map(|&id| editor.tree.get(id)).collect();
         let column_of = |view: &View| {
             tops.iter()
                 .position(|t| view.area.x >= t.area.x && view.area.x < t.area.right())
                 .unwrap_or(0)
         };
         let focus = editor.tree.focus;
-        // A file shown in splits has a tab in each of their rows. Each file also keeps a home
-        // row, where its tab stays while no split shows it: the row it was last shown in, or
-        // for a file never shown, the focused split's.
         let focused_column = views
             .iter()
             .find(|view| view.id == focus)
             .map_or(0, |view| column_of(view));
-        let mut owners: Vec<Vec<usize>> = Vec::with_capacity(ordered.len());
-        let mut arrived: Vec<DocumentId> = Vec::new();
-        for &doc in &ordered {
-            let mut showing: Vec<usize> = views
-                .iter()
-                .filter(|view| view.doc == doc)
-                .map(|view| column_of(view))
-                .collect();
-            showing.sort_unstable();
-            showing.dedup();
-            let home = self
-                .tab_home
-                .get(&doc)
-                .and_then(|id| tops.iter().position(|view| view.id == *id));
-            let home = match home {
-                Some(home) if showing.is_empty() || showing.contains(&home) => home,
-                // A file new to a row joins it at the end, like a stack.
-                Some(_) => {
-                    arrived.push(doc);
-                    showing.first().copied().unwrap_or(focused_column)
-                }
-                None => showing.first().copied().unwrap_or(focused_column),
-            };
-            self.tab_home.insert(doc, tops[home].id);
-            if !showing.contains(&home) {
-                showing.push(home);
-            }
-            owners.push(showing);
+        let existing: Vec<DocumentId> = editor.documents().map(|doc| doc.id()).collect();
+        // Rows of closed splits go; their files rejoin a row below.
+        let alive: std::collections::HashSet<ViewId> =
+            editor.tree.all_views().map(|(view, _)| view.id).collect();
+        self.tab_rows.retain(|id, _| alive.contains(id));
+        for row in self.tab_rows.values_mut() {
+            row.retain(|doc| existing.contains(doc));
         }
-        self.tab_home.retain(|doc, _| ordered.contains(doc));
-        for doc in arrived {
-            if let Some(at) = ordered.iter().position(|&d| d == doc) {
-                let owner = owners.remove(at);
-                ordered.remove(at);
-                ordered.push(doc);
-                owners.push(owner);
+        for top in &tops {
+            self.tab_rows.entry(top.id).or_default();
+        }
+        // What a split shows joins its row, at the end.
+        for view in &views {
+            let row = self.tab_rows.entry(tops[column_of(view)].id).or_default();
+            if !row.contains(&view.doc) {
+                row.push(view.doc);
             }
         }
-        self.buffer_order = ordered.clone();
+        // Files in no row (opened in the background, or from a closed split) join the focused
+        // split's.
+        let placed: std::collections::HashSet<DocumentId> = tops
+            .iter()
+            .filter_map(|top| self.tab_rows.get(&top.id))
+            .flatten()
+            .copied()
+            .collect();
+        let homeless: Vec<DocumentId> = existing
+            .iter()
+            .copied()
+            .filter(|doc| !placed.contains(doc))
+            .collect();
+        self.tab_rows
+            .entry(tops[focused_column].id)
+            .or_default()
+            .extend(homeless);
         self.buffer_strips
             .retain(|id, _| tops.iter().any(|view| view.id == *id));
         self.buffer_hits.clear();
@@ -2753,12 +2756,7 @@ impl EditorView {
                 .filter(|view| column_of(view) == column)
                 .collect();
             let shown: Vec<DocumentId> = members.iter().map(|view| view.doc).collect();
-            let ids: Vec<DocumentId> = ordered
-                .iter()
-                .zip(&owners)
-                .filter(|&(_, owner)| owner.contains(&column))
-                .map(|(&doc, _)| doc)
-                .collect();
+            let ids: Vec<DocumentId> = self.tab_rows.get(&top_view.id).cloned().unwrap_or_default();
             let labels: Vec<Label> = ids
                 .iter()
                 .filter_map(|&id| editor.document(id))
@@ -2993,6 +2991,39 @@ impl EditorView {
             .is_some_and(|strip| strip.marker_at(column).map(|by| strip.scroll(by)).is_some())
     }
 
+    /// Takes `doc`'s tab out of the row of the split under `top`. Views there showing it show
+    /// the row's last other file instead. Returns false when the row has nothing else to show.
+    fn leave_row(&mut self, editor: &mut Editor, top: ViewId, doc: DocumentId) -> bool {
+        let Some(row) = self.tab_rows.get_mut(&top) else {
+            return false;
+        };
+        let Some(next) = row.iter().rev().copied().find(|&d| d != doc) else {
+            return false;
+        };
+        row.retain(|&d| d != doc);
+        let Some(column) = self.tab_columns.iter().find(|c| c.view == top).cloned() else {
+            return true;
+        };
+        let showing: Vec<ViewId> = editor
+            .tree
+            .views()
+            .map(|(view, _)| view)
+            .filter(|view| {
+                view.doc == doc && view.area.x + 1 >= column.start && view.area.x < column.end
+            })
+            .map(|view| view.id)
+            .collect();
+        let focus = editor.tree.focus;
+        for view in showing {
+            editor.focus(view);
+            editor.switch(next, Action::Replace);
+        }
+        if editor.tree.contains(focus) {
+            editor.focus(focus);
+        }
+        true
+    }
+
     /// The split whose tab row covers `column`, from the last frame.
     fn tab_column_at(&self, column: u16) -> Option<&TabColumn> {
         self.tab_columns
@@ -3022,11 +3053,19 @@ impl EditorView {
     fn close_click(&mut self, mouse: &MouseEvent, editor: &mut Editor) -> bool {
         let (column, row) = (mouse.column, mouse.row);
         if self.zen.is_none() && row == self.editor_box.y {
-            if let Some(&(_, _, doc, _)) = self
+            if let Some(&(_, _, doc, row_view)) = self
                 .buffer_hits
                 .iter()
                 .find(|&&(_, end, _, _)| end >= 2 && column == end - 2)
             {
+                // A file with tabs in other splits' rows only leaves this row.
+                let elsewhere = self
+                    .tab_columns
+                    .iter()
+                    .any(|c| c.view != row_view && c.docs.contains(&doc));
+                if elsewhere && self.leave_row(editor, row_view, doc) {
+                    return true;
+                }
                 if editor.close_document(doc, false).is_err() {
                     editor
                         .set_error("This file has unsaved changes. Save it, or close it with :bc!");
@@ -3249,27 +3288,29 @@ impl EditorView {
                 let Some(target) = self.tab_column_at(column).cloned() else {
                     return;
                 };
-                if target.docs.contains(&doc) {
+                let source = self.tab_column_at(press.column).map(|c| c.view);
+                if source == Some(target.view) {
                     let slot = self
                         .buffer_strips
                         .get(&target.view)
                         .and_then(|strip| strip.drop_slot());
-                    if let Some(slot) = slot {
-                        let others: Vec<DocumentId> =
-                            target.docs.iter().copied().filter(|&d| d != doc).collect();
-                        self.buffer_order.retain(|&id| id != doc);
-                        let at = match others.get(slot) {
-                            Some(before) => self.buffer_order.iter().position(|d| d == before),
-                            None => others
-                                .last()
-                                .and_then(|after| self.buffer_order.iter().position(|d| d == after))
-                                .map(|i| i + 1),
-                        }
-                        .unwrap_or(self.buffer_order.len());
-                        self.buffer_order.insert(at, doc);
+                    if let (Some(slot), Some(row)) = (slot, self.tab_rows.get_mut(&target.view)) {
+                        row.retain(|&d| d != doc);
+                        row.insert(slot.min(row.len()), doc);
                     }
                 } else {
-                    move_to_split(editor, doc, target.view);
+                    // Onto another split's row: the tab moves there, at the end, and the split
+                    // it left shows the tab before it.
+                    if let Some(source) = source {
+                        self.leave_row(editor, source, doc);
+                    }
+                    let row = self.tab_rows.entry(target.view).or_default();
+                    row.retain(|&d| d != doc);
+                    row.push(doc);
+                    if editor.tree.contains(target.view) {
+                        editor.focus(target.view);
+                        editor.switch(doc, Action::Replace);
+                    }
                     self.focus_editor();
                 }
             }
@@ -4434,40 +4475,11 @@ struct TabColumn {
     docs: Vec<DocumentId>,
 }
 
-/// Moves a file to the split under `target`: splits elsewhere that show it go back to the file
-/// they showed before, and forget it, so its tab moves across.
-fn move_to_split(editor: &mut Editor, doc: DocumentId, target: ViewId) {
-    let others: Vec<ViewId> = editor
-        .tree
-        .views()
-        .map(|(view, _)| view.id)
-        .filter(|&id| id != target)
-        .collect();
-    for id in others {
-        let view = editor.tree.get_mut(id);
-        view.docs_access_history.retain(|&d| d != doc);
-        if view.doc != doc {
-            continue;
-        }
-        let previous = view
-            .docs_access_history
-            .iter()
-            .rev()
-            .copied()
-            .find(|&d| editor.documents.contains_key(&d));
-        if let Some(previous) = previous {
-            editor.focus(id);
-            editor.switch(previous, Action::Replace);
-            // Switching away put the file back in this split's history; forget it again.
-            editor
-                .tree
-                .get_mut(id)
-                .docs_access_history
-                .retain(|&d| d != doc);
-        }
-    }
-    if editor.tree.contains(target) {
-        editor.focus(target);
-        editor.switch(doc, Action::Replace);
-    }
+/// The views of the shown layout that touch its top edge, left to right: one tab row each.
+fn top_views(editor: &Editor) -> Vec<ViewId> {
+    let views: Vec<&View> = editor.tree.views().map(|(view, _)| view).collect();
+    let top = views.iter().map(|view| view.area.y).min().unwrap_or(0);
+    let mut tops: Vec<&View> = views.into_iter().filter(|v| v.area.y == top).collect();
+    tops.sort_by_key(|view| view.area.x);
+    tops.into_iter().map(|view| view.id).collect()
 }

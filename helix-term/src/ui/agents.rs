@@ -329,6 +329,9 @@ pub struct Workspace {
 pub struct EditorLayout {
     pub tabs: Vec<Pane>,
     pub active_tab: usize,
+    /// The shown layout's file tabs, one row per side-by-side split, left to right.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<PathBuf>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
