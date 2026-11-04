@@ -647,7 +647,11 @@ impl GitPanel {
                 Some((a, d)) => format!(" +{a} −{d}"),
                 None => " binary".to_string(),
             };
-            let room = width.saturating_sub(numbers.width());
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            let (glyph, color) = super::file_tree::icon(file_name, false, false);
+            surface.set_string(x, y, glyph, roles.text.fg(color));
+            let x = x + 2;
+            let room = width.saturating_sub(numbers.width() + 2);
             let name = shorten_path(path, room);
             surface.set_stringn(x, y, &name, room, roles.text);
             let nx = x + name.width() as u16;

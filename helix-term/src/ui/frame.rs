@@ -151,6 +151,41 @@ pub struct TabStrip {
     right_marker: Option<(u16, u16)>,
     /// Columns of the + button last frame, when the row has one.
     plus: Option<(u16, u16)>,
+    /// A tab being dragged along the row: its index and the mouse column. The others make room
+    /// for it where it would land.
+    drag: Option<(usize, u16)>,
+    /// Where the dragged tab would land, as an index among the tabs.
+    drop_slot: Option<usize>,
+    /// Each tab's column as drawn, by key, easing towards where it belongs so tabs slide.
+    columns: std::collections::HashMap<u64, f32>,
+    animated_at: Option<std::time::Instant>,
+}
+
+/// Asks for another frame soon, while tabs are still sliding.
+fn next_frame() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    if PENDING.swap(true, Ordering::Relaxed) || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        PENDING.store(false, Ordering::Relaxed);
+        helix_event::request_redraw();
+    });
+}
+
+/// Where the tab being dragged lands among the others: before the first whose middle is right of
+/// where the dragged tab's middle is. `widths` are the other tabs', in order, from `start`.
+fn slot_for(widths: &[u16], start: u16, middle: u16) -> usize {
+    let mut x = start;
+    for (i, &w) in widths.iter().enumerate() {
+        if middle < x + w / 2 {
+            return i;
+        }
+        x += w;
+    }
+    widths.len()
 }
 
 /// How many tabs, from `offset`, fit in `room` columns, leaving room for the markers needed.
@@ -220,6 +255,7 @@ impl TabStrip {
         end: u16,
         lead: &[Label],
         tabs: &[Label],
+        keys: &[u64],
         active: Option<usize>,
         marker_style: Style,
         plus: Option<Style>,
@@ -235,35 +271,90 @@ impl TabStrip {
         self.offset = offset;
         self.followed = active;
 
-        let mut labels = Vec::new();
+        let mut x = start;
+        self.left_marker = None;
         if offset > 0 {
-            labels.push(Label::new(format!("‹ {}", offset.min(99)), marker_style));
+            let label = Label::new(format!("‹ {}", offset.min(99)), marker_style);
+            self.left_marker = labels_left(surface, y, x - 1, end, &[label])
+                .first()
+                .copied();
+            x = self.left_marker.map_or(x, |(_, e)| e);
         }
-        labels.extend(tabs[offset..offset + count].iter().cloned());
+
+        // The order the visible tabs are drawn in: as given, or with the dragged one moved to
+        // where the mouse is, leaving a gap the others slide around.
+        let mut order: Vec<usize> = (offset..offset + count).collect();
+        self.drop_slot = None;
+        let dragged = self
+            .drag
+            .filter(|&(index, _)| (offset..offset + count).contains(&index));
+        if let Some((index, mouse)) = dragged {
+            order.retain(|&i| i != index);
+            let others: Vec<u16> = order.iter().map(|&i| widths[i]).collect();
+            let slot = slot_for(&others, x, mouse);
+            order.insert(slot, index);
+            self.drop_slot = Some(offset + slot);
+        }
+
+        // Each tab eases from where it was drawn to where it belongs.
+        let now = std::time::Instant::now();
+        let elapsed = self
+            .animated_at
+            .map_or(1.0, |at| now.duration_since(at).as_secs_f32());
+        self.animated_at = Some(now);
+        let ease = 1.0 - (-elapsed / 0.045).exp();
+        let mut moving = false;
+        let mut hits = Vec::new();
+        let mut columns = std::collections::HashMap::new();
+        for &i in &order {
+            let target = x as f32;
+            let key = keys.get(i).copied().unwrap_or(i as u64);
+            let shown = match self.columns.get(&key) {
+                Some(&was) if (was - target).abs() > 0.5 => {
+                    moving = true;
+                    was + (target - was) * ease
+                }
+                _ => target,
+            };
+            columns.insert(key, shown);
+            let at = shown.round() as u16;
+            if Some(i) != dragged.map(|(index, _)| index) && at + widths[i] <= end {
+                surface.set_string(at, y, &format!(" {} ", tabs[i].text), tabs[i].style);
+            }
+            hits.push((i, x, x + widths[i]));
+            x += widths[i];
+        }
+        self.columns = columns;
+        if moving {
+            next_frame();
+        }
+        hits.sort_unstable();
+
         let hidden = tabs.len() - offset - count;
+        self.right_marker = None;
         if hidden > 0 {
-            labels.push(Label::new(format!("{} ›", hidden.min(99)), marker_style));
+            let label = Label::new(format!("{} ›", hidden.min(99)), marker_style);
+            self.right_marker = labels_left(surface, y, x - 1, end, &[label])
+                .first()
+                .copied();
+            x = self.right_marker.map_or(x, |(_, e)| e);
         }
-        let mut hits = labels_left(surface, y, start - 1, end, &labels).into_iter();
-        self.left_marker = if offset > 0 { hits.next() } else { None };
-        let tab_hits: Vec<(usize, u16, u16)> = hits
-            .by_ref()
-            .take(count)
-            .enumerate()
-            .map(|(i, (s, e))| (offset + i, s, e))
-            .collect();
-        self.right_marker = if hidden > 0 { hits.next() } else { None };
-        let after = self
-            .right_marker
-            .or(tab_hits.last().map(|&(_, s, e)| (s, e)))
-            .or(self.left_marker)
-            .map_or(start, |(_, e)| e);
         self.plus = plus_label.and_then(|label| {
-            labels_left(surface, y, after - 1, end, &[label])
+            labels_left(surface, y, x - 1, end, &[label])
                 .first()
                 .copied()
         });
-        tab_hits
+        hits
+    }
+
+    /// Tells the row a tab is being dragged along it (its index and the mouse column), or not.
+    pub fn set_drag(&mut self, drag: Option<(usize, u16)>) {
+        self.drag = drag;
+    }
+
+    /// Where the tab being dragged would land, if it is over the row.
+    pub fn drop_slot(&self) -> Option<usize> {
+        self.drop_slot
     }
 
     /// Moves the row by `by` tabs; the next draw keeps it within the tabs.

@@ -8,6 +8,7 @@ use helix_core::unicode::width::UnicodeWidthStr;
 use helix_view::graphics::{Modifier, Rect};
 use tui::buffer::Buffer as Surface;
 
+use super::file_tree::icon;
 use super::panel_style::Roles;
 
 /// Folders that hold dependencies or build output, left out like sccc does.
@@ -135,6 +136,47 @@ fn parse(json: &[u8]) -> Option<CodeStats> {
     })
 }
 
+/// The tree's icon for a language scc names, through a file name typical of it.
+fn lang_icon(name: &str) -> (&'static str, helix_view::graphics::Color) {
+    let file = match name {
+        "Rust" => "a.rs",
+        "Markdown" => "a.md",
+        "TOML" => "a.toml",
+        "JSON" | "JSONC" | "JSON5" => "a.json",
+        "YAML" => "a.yaml",
+        "JavaScript" => "a.js",
+        "TypeScript" | "TypeScript Typings" => "a.ts",
+        "JSX" | "TSX" => "a.tsx",
+        "Python" => "a.py",
+        "Go" => "a.go",
+        "C" | "C Header" => "a.c",
+        "C++" | "C++ Header" => "a.cpp",
+        "C#" => "a.cs",
+        "Java" => "a.java",
+        "Kotlin" => "a.kt",
+        "Swift" => "a.swift",
+        "Zig" => "a.zig",
+        "Lua" => "a.lua",
+        "Scheme" | "Racket" => "a.scm",
+        "Nix" => "a.nix",
+        "Shell" | "BASH" | "Zsh" | "Fish" | "Nushell" | "PowerShell" => "a.sh",
+        "HTML" => "a.html",
+        "CSS" | "Sass" | "SCSS" => "a.css",
+        "SVG" => "a.svg",
+        "SQL" => "a.sql",
+        "XML" => "a.xml",
+        "Plain Text" => "a.txt",
+        "License" => "license",
+        "Makefile" | "Justfile" => "makefile",
+        "Dockerfile" => "dockerfile",
+        "gitignore" | "gitattributes" => ".gitignore",
+        "MSBuild" => "a.csproj",
+        "INI" | "KDL" => "a.ini",
+        other => return icon(&format!("a.{}", other.to_ascii_lowercase()), false, false),
+    };
+    icon(file, false, false)
+}
+
 /// 4641 → "4,641".
 fn grouped(n: u64) -> String {
     let digits = n.to_string();
@@ -245,7 +287,7 @@ pub fn render(
         .map(|lang| lang.name.width())
         .max()
         .unwrap_or(0)
-        .min(width / 2);
+        .min(width.saturating_sub(2) / 2);
     let shown = if stats.langs.len() > room {
         room.saturating_sub(1)
     } else {
@@ -253,9 +295,11 @@ pub fn render(
     };
     for lang in stats.langs.iter().take(shown) {
         let count = grouped(lang.code);
-        surface.set_stringn(x, y, &lang.name, name_width, roles.muted);
-        let bar_x = x + name_width as u16 + 1;
-        let bar_width = width.saturating_sub(name_width + 1 + count.width() + 1);
+        let (glyph, color) = lang_icon(&lang.name);
+        surface.set_string(x, y, glyph, roles.text.fg(color));
+        surface.set_stringn(x + 2, y, &lang.name, name_width, roles.muted);
+        let bar_x = x + 2 + name_width as u16 + 1;
+        let bar_width = width.saturating_sub(2 + name_width + 1 + count.width() + 1);
         let share = lang.code as f64 / stats.code as f64;
         let filled = bar(share, bar_width);
         surface.set_stringn(bar_x, y, &filled, bar_width, roles.accent);

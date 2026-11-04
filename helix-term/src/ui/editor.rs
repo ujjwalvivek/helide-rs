@@ -160,6 +160,8 @@ pub struct EditorView {
     /// Opened as a project (`hx`, `hx .`, `hx dir/`): the workspace is restored and kept.
     /// Opened on files, it is a quick edit that leaves the saved workspace alone.
     pub persist: bool,
+    /// The order of the file tabs, as dragged; files not in it follow in the order opened.
+    buffer_order: Vec<DocumentId>,
     /// Columns of the + after FILES on the sidebar's title row, last frame.
     tree_plus: Option<(u16, u16)>,
     /// The last click on a tab and when, to tell a double click.
@@ -225,6 +227,7 @@ impl EditorView {
             history_at: None,
             tree_refreshed: None,
             persist: false,
+            buffer_order: Vec::new(),
             tree_plus: None,
             last_tab_click: None,
             sidebar_width: None,
@@ -2662,8 +2665,18 @@ impl EditorView {
         }
 
         let current = view!(editor).doc;
-        let docs: Vec<(DocumentId, Label)> = editor
-            .documents()
+        // Files in the order they were dragged into; new ones at the end.
+        let mut ordered: Vec<&Document> = editor.documents().collect();
+        let rank = |id: DocumentId| {
+            self.buffer_order
+                .iter()
+                .position(|&o| o == id)
+                .unwrap_or(usize::MAX)
+        };
+        ordered.sort_by_key(|doc| rank(doc.id()));
+        self.buffer_order = ordered.iter().map(|doc| doc.id()).collect();
+        let docs: Vec<(DocumentId, Label)> = ordered
+            .into_iter()
             .map(|doc| {
                 let mut name = doc
                     .path()
@@ -2687,6 +2700,17 @@ impl EditorView {
         let end = right.saturating_sub(tabs_width + 1);
         let (ids, labels): (Vec<DocumentId>, Vec<Label>) = docs.into_iter().unzip();
         let active = ids.iter().position(|&id| id == current);
+        let keys: Vec<u64> = ids.iter().map(key_of).collect();
+        let drag = self
+            .pressed
+            .as_ref()
+            .filter(|press| press.moved && self.drag_at.1 == row.y)
+            .and_then(|press| match press.grab {
+                Grab::Buffer(doc) => ids.iter().position(|&id| id == doc),
+                _ => None,
+            })
+            .map(|index| (index, self.drag_at.0));
+        self.buffer_strip.set_drag(drag);
         let hits = self.buffer_strip.draw(
             surface,
             row.y,
@@ -2694,6 +2718,7 @@ impl EditorView {
             end,
             &[],
             &labels,
+            &keys,
             active,
             roles.label(),
             Some(roles.label()),
@@ -3081,6 +3106,40 @@ impl EditorView {
                 editor.switch(doc, Action::Replace);
                 self.focus_editor();
             }
+            // Along the tab row: the file tab moves to where it was let go.
+            Grab::Buffer(doc) if row == self.editor_box.y => {
+                if let Some(slot) = self.buffer_strip.drop_slot() {
+                    self.buffer_order.retain(|&id| id != doc);
+                    let slot = slot.min(self.buffer_order.len());
+                    self.buffer_order.insert(slot, doc);
+                }
+            }
+            // On the agents or a terminal: the file's path, typed in.
+            Grab::Buffer(doc)
+                if self.agents.contains(column, row) || self.terminal.contains(column, row) =>
+            {
+                let Some(path) = editor.document(doc).and_then(|d| d.path()) else {
+                    editor.set_error("This buffer has no file to give a path for.");
+                    return;
+                };
+                let cwd = helix_stdx::env::current_working_dir();
+                let relative = path
+                    .strip_prefix(&cwd)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                if self.agents.contains(column, row) {
+                    let Some(agent) = self.agents.active_agent().cloned() else {
+                        return;
+                    };
+                    self.agents.send_text(&agent.mention(&relative, None));
+                    self.focus_only(Panel::Agents);
+                } else {
+                    self.terminal
+                        .send_text(&format!("{} ", shell_quote(&relative)));
+                    self.focus_only(Panel::Terminal);
+                }
+            }
             Grab::Buffer(doc) => {
                 if let Some((view, action, _, swap)) = self.drop_target(column, row, editor) {
                     editor.focus(view);
@@ -3115,7 +3174,7 @@ impl EditorView {
                 if !press.moved {
                     panel.select(index);
                 } else if Some(row) == strip {
-                    if let Some(to) = panel.tab_at(column) {
+                    if let Some(to) = panel.tab_strip().drop_slot() {
                         panel.move_tab(index, to);
                     }
                 } else if panel.contains(column, row) {
@@ -3190,6 +3249,22 @@ impl EditorView {
             Grab::Buffer(_) => {
                 if let Some((_, _, area, _)) = self.drop_target(column, row, editor) {
                     frame::draw_box(surface, area, roles.accent, End::Corner, End::Corner);
+                }
+                // Over the agents or a terminal, it types the path: outline the panel.
+                let panel = [
+                    (self.agents.contains(column, row), self.agents_box),
+                    (self.terminal.contains(column, row), self.terminal_box),
+                ]
+                .into_iter()
+                .find_map(|(over, area)| over.then_some(area).flatten());
+                if let Some(area) = panel.filter(|area| row > area.y) {
+                    let inside = Rect::new(
+                        area.x + 1,
+                        area.y + 1,
+                        area.width.saturating_sub(2),
+                        area.height.saturating_sub(2),
+                    );
+                    frame::draw_box(surface, inside, roles.accent, End::Corner, End::Corner);
                 }
             }
             // A tab over its panel's contents joins it as a pane: outline the panel.
@@ -3684,6 +3759,23 @@ impl Component for EditorView {
             agents::notify(&format!("{} finished", run.name), &project);
         }
         self.layout_frame(frame);
+        // A panel tab dragged along its own row: the row makes room for it.
+        let dragging = self.pressed.as_ref().filter(|press| press.moved);
+        let (column, row) = self.drag_at;
+        let panel_drag = |agents: bool, strip_row: Option<u16>| {
+            dragging.and_then(|press| match press.grab {
+                Grab::PanelTab(a, index) if a == agents && strip_row == Some(row) => {
+                    Some((index, column))
+                }
+                _ => None,
+            })
+        };
+        let (agents_drag, terminal_drag) = (
+            panel_drag(true, self.agents_box.map(|b| b.y)),
+            panel_drag(false, self.terminal_box.map(|b| b.y)),
+        );
+        self.agents.tab_strip().set_drag(agents_drag);
+        self.terminal.tab_strip().set_drag(terminal_drag);
         let editor_box = self.editor_box;
         let zen = self.zen.is_some();
         let inner = |rect: Rect| {
@@ -4152,4 +4244,24 @@ fn rename_file_prompt(editor: &Editor, doc: DocumentId) -> Prompt {
         },
     )
     .with_line(line, editor)
+}
+
+/// A stable number for a document, so its tab keeps its place while tabs slide.
+fn key_of(id: &DocumentId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A path as a shell reads it: as it is when it is plain, else in single quotes.
+fn shell_quote(path: &str) -> String {
+    let plain = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+~,:@".contains(c));
+    if plain && !path.is_empty() {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
 }
