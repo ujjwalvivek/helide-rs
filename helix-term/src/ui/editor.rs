@@ -24,12 +24,12 @@ use helix_core::{
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
-    view::ViewPosition,
     document::{Mode, SCRATCH_BUFFER_NAME},
     editor::{Action, CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
+    view::ViewPosition,
     Document, DocumentId, Editor, Theme, View, ViewId,
 };
 use std::{collections::HashMap, mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
@@ -146,6 +146,8 @@ pub struct EditorView {
     tab_hits: Vec<(u16, u16, u16)>,
     /// Columns each buffer label covered on the editor box's top border last frame.
     buffer_hits: Vec<(u16, u16, DocumentId)>,
+    /// The file tabs, scrolled when there are more than fit.
+    buffer_strip: frame::TabStrip,
     /// Sidebar width and terminal rows the user set by dragging or with Alt+Shift+arrows.
     sidebar_width: Option<u16>,
     terminal_height: Option<u16>,
@@ -201,6 +203,7 @@ impl EditorView {
             git: GitPanel::default(),
             tab_hits: Vec::new(),
             buffer_hits: Vec::new(),
+            buffer_strip: frame::TabStrip::default(),
             sidebar_width: None,
             terminal_height: None,
             pressed: None,
@@ -348,8 +351,12 @@ impl EditorView {
             KeyCode::Char('u') if ctrl => self.scroll_preview(focus, -half, editor),
             KeyCode::PageDown => self.scroll_preview(focus, 2 * half, editor),
             KeyCode::PageUp => self.scroll_preview(focus, -2 * half, editor),
-            KeyCode::Char('g') | KeyCode::Home => self.scroll_preview(focus, -(u16::MAX as i32), editor),
-            KeyCode::Char('G') | KeyCode::End => self.scroll_preview(focus, u16::MAX as i32, editor),
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.scroll_preview(focus, -(u16::MAX as i32), editor)
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.scroll_preview(focus, u16::MAX as i32, editor)
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.toggle_preview(editor);
                 true
@@ -1147,12 +1154,17 @@ impl EditorView {
     /// a little into the surface colour. Without RGB colours in the theme there's no tint.
     pub fn diff_tint(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
         let text = doc.text().clone();
-        let base = ["ui.background", "ui.popup", "ui.cursorline.primary", "ui.menu"]
-            .iter()
-            .find_map(|key| match theme.get(key).bg {
-                Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
-                _ => None,
-            });
+        let base = [
+            "ui.background",
+            "ui.popup",
+            "ui.cursorline.primary",
+            "ui.menu",
+        ]
+        .iter()
+        .find_map(|key| match theme.get(key).bg {
+            Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+            _ => None,
+        });
         let tint = |key: &str| -> Option<Style> {
             let (Some(Color::Rgb(r, g, b)), Some((br, bg, bb))) = (theme.get(key).fg, base) else {
                 return None;
@@ -1164,13 +1176,19 @@ impl EditorView {
         let viewport = view.area;
 
         move |renderer: &mut TextRenderer, pos: LinePos| {
-            let style = match text.get_line(pos.doc_line).and_then(|line| line.get_char(0)) {
+            let style = match text
+                .get_line(pos.doc_line)
+                .and_then(|line| line.get_char(0))
+            {
                 Some('+') => plus,
                 Some('-') => minus,
                 _ => None,
             };
             if let Some(style) = style {
-                renderer.set_style(Rect::new(viewport.x, pos.visual_line, viewport.width, 1), style);
+                renderer.set_style(
+                    Rect::new(viewport.x, pos.visual_line, viewport.width, 1),
+                    style,
+                );
             }
         }
     }
@@ -2428,12 +2446,57 @@ impl EditorView {
             .collect();
         let end = right.saturating_sub(tabs_width + 1);
         let (ids, labels): (Vec<DocumentId>, Vec<Label>) = docs.into_iter().unzip();
-        let hits = frame::labels_left(surface, row.y, left, end, &labels);
+        let active = ids.iter().position(|&id| id == current);
+        let hits = self.buffer_strip.draw(
+            surface,
+            row.y,
+            left,
+            end,
+            &[],
+            &labels,
+            active,
+            roles.label(),
+        );
         self.buffer_hits = hits
             .into_iter()
-            .zip(ids)
-            .map(|((start, end), id)| (start, end, id))
+            .map(|(index, start, end)| (start, end, ids[index]))
             .collect();
+    }
+
+    /// The wheel over a row of tabs (files, terminals or agents) moves that row by a tab.
+    /// Returns whether it was over one.
+    fn scroll_tabs(&mut self, mouse: &MouseEvent) -> bool {
+        let by = if mouse.kind == MouseEventKind::ScrollUp {
+            -1
+        } else {
+            1
+        };
+        self.tab_row_at(mouse).is_some_and(|strip| {
+            strip.scroll(by);
+            true
+        })
+    }
+
+    /// A click on a row's ‹ or › marker moves it by a tab. Returns whether it was on one.
+    fn scroll_tabs_click(&mut self, mouse: &MouseEvent) -> bool {
+        let column = mouse.column;
+        self.tab_row_at(mouse)
+            .is_some_and(|strip| strip.marker_at(column).map(|by| strip.scroll(by)).is_some())
+    }
+
+    /// The row of tabs under the mouse, if any.
+    fn tab_row_at(&mut self, mouse: &MouseEvent) -> Option<&mut frame::TabStrip> {
+        let (column, row) = (mouse.column, mouse.row);
+        let on = |b: Rect| row == b.y && column >= b.x && column < b.right();
+        if self.zen.is_none() && on(self.editor_box) {
+            Some(&mut self.buffer_strip)
+        } else if self.terminal_box.is_some_and(on) {
+            Some(self.terminal.tab_strip())
+        } else if self.agents_box.is_some_and(on) {
+            Some(self.agents.tab_strip())
+        } else {
+            None
+        }
     }
 
     /// A click on a tab's ×: closes the file, terminal tab or agent tab. Returns whether it was
@@ -2540,6 +2603,10 @@ impl EditorView {
                     editor
                         .set_error("This file has unsaved changes. Save it, or close it with :bc!");
                 }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.scroll_tabs_click(mouse) => true,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.scroll_tabs(mouse) => {
                 true
             }
             MouseEventKind::Down(MouseButton::Left) if self.close_click(mouse, editor) => true,
@@ -3215,9 +3282,9 @@ impl Component for EditorView {
             if let Some(preview) = self.previews.get_mut(&view.id) {
                 // When the source has scrolled since the last sync, the preview follows it.
                 if let Some(source) = source_view(cx.editor, view.id, preview.doc) {
-                    let top = doc.text().char_to_line(
-                        doc.view_offset(source).anchor.min(doc.text().len_chars()),
-                    );
+                    let top = doc
+                        .text()
+                        .char_to_line(doc.view_offset(source).anchor.min(doc.text().len_chars()));
                     if preview.synced != Some(top) {
                         preview.synced = Some(top);
                         if !preview.sources.is_empty() {

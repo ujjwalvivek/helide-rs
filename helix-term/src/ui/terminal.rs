@@ -42,7 +42,7 @@ use tui::buffer::Buffer as Surface;
 
 use super::{
     agents::AgentSession,
-    frame::{labels_left, Label},
+    frame::{Label, TabStrip},
     panel_style::Roles,
 };
 
@@ -257,7 +257,9 @@ pub struct TerminalPanel {
     /// Where the whole panel was drawn last frame.
     area: Rect,
     /// Columns each tab label covered on the top edge last frame.
-    tab_hits: Vec<(u16, u16)>,
+    tab_hits: Vec<(usize, u16, u16)>,
+    /// The tab row, scrolled when there are more tabs than fit.
+    strip: TabStrip,
     /// A redraw is already scheduled to settle busy tabs.
     tick: Arc<AtomicBool>,
     next_group: u32,
@@ -401,7 +403,8 @@ impl TerminalPanel {
     pub fn close_at(&self, column: u16) -> Option<usize> {
         self.tab_hits
             .iter()
-            .position(|&(_, end)| end >= 2 && column == end - 2)
+            .find(|&&(_, _, end)| end >= 2 && column == end - 2)
+            .map(|&(index, _, _)| index)
     }
 
     /// Closes tab `index`: every pane in it ends.
@@ -587,36 +590,50 @@ impl TerminalPanel {
     /// Sets TERMINAL and one label per tab into the divider row the frame drew above the panel.
     fn render_tabs(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
         let roles = Roles::new(theme);
-        let mut labels = vec![Label::new(self.title, roles.label())];
+        let title = [Label::new(self.title, roles.label())];
         let shown = self.sessions.get(self.active).map(|s| s.group);
-        labels.extend(self.groups().into_iter().enumerate().map(|(i, group)| {
-            let members: Vec<&Session> =
-                self.sessions.iter().filter(|s| s.group == group).collect();
-            let names: Vec<String> = members.iter().map(|s| short_label(s.label())).collect();
-            // The shown tab is a filled chip, like the editor's. Status is a glyph, never colour
-            // alone: ● working, ✓ finished while away.
-            let chip = roles
-                .selected
-                .patch(roles.accent)
-                .add_modifier(Modifier::BOLD);
-            let base = if Some(group) == shown {
-                chip
-            } else {
-                roles.muted
-            };
-            let (mark, style) = if members.iter().any(|s| s.is_busy()) {
-                (" ●", base.patch(roles.warning))
-            } else if members.iter().any(|s| s.attention) {
-                (" ✓", base.patch(roles.accent).add_modifier(Modifier::BOLD))
-            } else {
-                ("", base)
-            };
-            // The trailing × closes the tab.
-            Label::new(format!("{} {}{mark} ×", i + 1, names.join(" · ")), style)
-        }));
-        let hits = labels_left(surface, area.y, area.x, area.right() - 1, &labels);
-        // The first label is the title; the rest are tabs.
-        self.tab_hits = hits.into_iter().skip(1).collect();
+        let groups = self.groups();
+        let active = groups.iter().position(|g| Some(*g) == shown);
+        let labels: Vec<Label> = groups
+            .into_iter()
+            .enumerate()
+            .map(|(i, group)| {
+                let members: Vec<&Session> =
+                    self.sessions.iter().filter(|s| s.group == group).collect();
+                let names: Vec<String> = members.iter().map(|s| short_label(s.label())).collect();
+                // The shown tab is a filled chip, like the editor's. Status is a glyph, never colour
+                // alone: ● working, ✓ finished while away.
+                let chip = roles
+                    .selected
+                    .patch(roles.accent)
+                    .add_modifier(Modifier::BOLD);
+                let base = if Some(group) == shown {
+                    chip
+                } else {
+                    roles.muted
+                };
+                let (mark, style) = if members.iter().any(|s| s.is_busy()) {
+                    (" ●", base.patch(roles.warning))
+                } else if members.iter().any(|s| s.attention) {
+                    (" ✓", base.patch(roles.accent).add_modifier(Modifier::BOLD))
+                } else {
+                    ("", base)
+                };
+                // The trailing × closes the tab.
+                Label::new(format!("{} {}{mark} ×", i + 1, names.join(" · ")), style)
+            })
+            .collect();
+        let hits = self.strip.draw(
+            surface,
+            area.y,
+            area.x,
+            area.right() - 1,
+            &title,
+            &labels,
+            active,
+            roles.label(),
+        );
+        self.tab_hits = hits;
     }
 
     pub fn cursor(&self) -> (Option<helix_core::Position>, CursorKind) {
@@ -644,11 +661,17 @@ impl TerminalPanel {
         (Some(pos), kind)
     }
 
+    /// The tab row, for scrolling it.
+    pub fn tab_strip(&mut self) -> &mut TabStrip {
+        &mut self.strip
+    }
+
     /// The tab whose label covers `column` on the top edge.
     pub fn tab_at(&self, column: u16) -> Option<usize> {
         self.tab_hits
             .iter()
-            .position(|&(start, end)| (start..end).contains(&column))
+            .find(|&&(_, start, end)| (start..end).contains(&column))
+            .map(|&(index, _, _)| index)
     }
 
     pub fn contains(&self, column: u16, row: u16) -> bool {
