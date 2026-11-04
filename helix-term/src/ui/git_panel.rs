@@ -183,6 +183,8 @@ pub struct GitPanel {
     last_refresh: Option<Instant>,
     /// A refresh was asked for while one was running.
     refresh_again: bool,
+    /// When the last wheel event came, to fold a notch's burst into one step.
+    last_wheel: Option<Instant>,
     /// Where the commit summary was drawn, and how far its file list is scrolled.
     summary_area: Rect,
     summary_scroll: usize,
@@ -915,6 +917,20 @@ impl GitPanel {
             && event.row < area.bottom()
             && event.column >= area.x
             && event.column < area.right();
+        // Terminals like Ghostty send several wheel events for one notch; a burst is one step.
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) {
+            let now = Instant::now();
+            let burst = self
+                .last_wheel
+                .is_some_and(|at| now.duration_since(at) < Duration::from_millis(25));
+            if burst {
+                return GitAction::None;
+            }
+            self.last_wheel = Some(now);
+        }
         match event.kind {
             MouseEventKind::ScrollDown if on_summary => self.summary_scroll += 3,
             MouseEventKind::ScrollUp if on_summary => {
@@ -929,12 +945,13 @@ impl GitPanel {
                 if self.rows.get(index).is_some_and(Self::selectable) {
                     let again = index == self.selected;
                     self.selected = index;
-                    if again {
-                        // A second click on a file expands it; on anything else, shows it.
-                        match self.selected_row() {
-                            Some(Row::File(_)) => self.expand(true),
-                            _ => self.show(Action::NewTab),
-                        }
+                    // A click on a file opens its diff; a second click lists its hunks. On
+                    // anything else, a second click shows it.
+                    match self.selected_row() {
+                        Some(Row::File(_)) if again => self.expand(true),
+                        Some(Row::File(_)) => self.show(Action::NewTab),
+                        _ if again => self.show(Action::NewTab),
+                        _ => {}
                     }
                 }
             }
@@ -1134,6 +1151,15 @@ impl GitPanel {
             let output = git(&repo, &args, None).await;
             crate::job::dispatch(move |editor, compositor| match output {
                 Ok(out) if !out.stdout.is_empty() => {
+                    // Showing the same thing again goes to its open tab, which stays current.
+                    let open = editor
+                        .documents()
+                        .find(|doc| doc.label.as_deref() == Some(label.as_str()))
+                        .map(|doc| doc.id());
+                    if let Some(doc) = open {
+                        editor.switch(doc, Action::Replace);
+                        return;
+                    }
                     let (text, labels) = if file {
                         marked_file(&out.stdout)
                     } else {
