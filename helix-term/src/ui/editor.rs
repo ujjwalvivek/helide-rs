@@ -2625,10 +2625,10 @@ impl EditorView {
             .selected
             .patch(roles.accent)
             .add_modifier(Modifier::BOLD);
-        // Layouts: whole arrangements of splits, numbered on the right after HELIDE when there are
+        // Layouts: whole arrangements of splits, numbered on the right after LAYOUTS when there are
         // several. Files are the tabs on the left.
         let mut tab_labels: Vec<Label> = if tab_count > 1 {
-            std::iter::once(Label::new("HELIDE", roles.label()))
+            std::iter::once(Label::new("LAYOUTS", roles.label()))
                 .chain((0..tab_count).map(|index| {
                     let style = if index == editor.tree.active_tab() {
                         chip
@@ -2657,7 +2657,7 @@ impl EditorView {
             .iter()
             .map(|label| label.text.width() as u16 + 2)
             .sum();
-        // PREVIEW comes first, then HELIDE; the rest are the layouts.
+        // PREVIEW comes first, then LAYOUTS; the rest are the layouts.
         let mut hits = frame::labels_right(surface, row.y, left, right, &tab_labels).into_iter();
         self.preview_hit = if has_button { hits.next() } else { None };
         for (start, end) in hits.skip(1) {
@@ -2944,7 +2944,7 @@ impl EditorView {
                 .iter()
                 .position(|&(y, start, end)| y == row && (start..end).contains(&column))
             {
-                return Some((Grab::EditorTab(index), format!("tab {}", index + 1)));
+                return Some((Grab::EditorTab(index), format!("layout {}", index + 1)));
             }
         }
         if let Some(terminal) = self.terminal_box {
@@ -2952,7 +2952,7 @@ impl EditorView {
                 return Some(match self.terminal.tab_at(column) {
                     Some(index) => (
                         Grab::PanelTab(false, index),
-                        format!("terminal {}", index + 1),
+                        self.terminal.tab_title(index).unwrap_or_default(),
                     ),
                     None => (Grab::Edge(Edge::Terminal), String::new()),
                 });
@@ -2961,7 +2961,8 @@ impl EditorView {
         if let Some(agents) = self.agents_box {
             if row == agents.y && within(agents) {
                 if let Some(index) = self.agents.tab_at(column) {
-                    return Some((Grab::PanelTab(true, index), format!("agent {}", index + 1)));
+                    let name = self.agents.tab_title(index).unwrap_or_default();
+                    return Some((Grab::PanelTab(true, index), name));
                 }
             }
             if (column == agents.x || column + 1 == agents.x)
