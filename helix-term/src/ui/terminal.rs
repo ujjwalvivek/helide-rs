@@ -41,7 +41,7 @@ use helix_view::{
 use tui::buffer::Buffer as Surface;
 
 use super::{
-    agents::AgentSession,
+    agents::{self, AgentKind, AgentSession},
     frame::{Label, TabStrip},
     panel_style::Roles,
 };
@@ -80,6 +80,8 @@ struct Session {
     group: u32,
     /// The agent session this tab runs, for agent tabs.
     agent: Option<AgentSession>,
+    /// The process the pane started, to ask Claude which conversation it is in.
+    pid: Option<u32>,
     /// When the current busy stretch started, and when the program last wrote.
     busy_since: Option<Instant>,
     last_output: Option<Instant>,
@@ -128,6 +130,10 @@ impl Session {
             escape_args: false,
         };
         let pty = tty::new(&options, window_size(size), 0)?;
+        #[cfg(unix)]
+        let pid = Some(pty.child().id());
+        #[cfg(not(unix))]
+        let pid = None;
 
         let (tx, events) = mpsc::channel();
         let listener = Listener {
@@ -155,6 +161,7 @@ impl Session {
             name,
             group: 0,
             agent,
+            pid,
             busy_since: None,
             last_output: None,
             attention: false,
@@ -474,6 +481,36 @@ impl TerminalPanel {
             .iter()
             .filter_map(|session| session.agent.clone())
             .collect()
+    }
+
+    /// Moves each Claude tab's saved id onto the conversation its process is in now, so /clear
+    /// and /resume are what the tab reopens. Returns whether any changed. A conversation another
+    /// tab already holds stays with that tab.
+    pub fn follow_agents(&mut self) -> bool {
+        let mut changed = false;
+        for index in 0..self.sessions.len() {
+            let session = &self.sessions[index];
+            let (Some(agent), Some(pid)) = (&session.agent, session.pid) else {
+                continue;
+            };
+            if agent.kind != AgentKind::Claude {
+                continue;
+            }
+            let Some(live) = agents::claude_live_session(&agents::self_and_descendants(pid)) else {
+                continue;
+            };
+            let taken = self
+                .sessions
+                .iter()
+                .any(|other| other.agent.as_ref().is_some_and(|a| a.id == live));
+            if !taken {
+                if let Some(agent) = self.sessions[index].agent.as_mut() {
+                    agent.id = live;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// The agent session of the tab being shown.
