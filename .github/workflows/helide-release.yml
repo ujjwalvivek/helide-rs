@@ -1,0 +1,73 @@
+# Builds Helide for a release and attaches the tarballs: the tag itself (the helide branch) and
+# its -otari twin (the helide-rs-mozilla branch), each with hx and a runtime folder holding
+# queries, themes and compiled grammars.
+#
+# Runs when a release is published, or by hand with a tag (for a release whose tag predates this
+# file). The release must exist; this only adds the files.
+name: Helide release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, like v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build helide
+        run: cargo build --release --locked && cp target/release/hx hx-helide
+
+      - name: Fetch and build grammars
+        run: |
+          export HELIX_RUNTIME=$PWD/runtime
+          ./hx-helide --grammar fetch
+          ./hx-helide --grammar build
+
+      - name: Build the Otari twin
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG-otari" >/dev/null; then
+            git worktree add ../otari "$TAG-otari"
+            (cd ../otari && cargo build --release --locked --target-dir "$GITHUB_WORKSPACE/target")
+            cp target/release/hx hx-otari
+          else
+            echo "No $TAG-otari tag; only the helide build is attached."
+          fi
+
+      - name: Package
+        run: |
+          pack() {
+            name=$1; dir=dist/$name
+            mkdir -p "$dir/runtime/grammars"
+            cp "$2" "$dir/hx" && strip "$dir/hx"
+            cp -r runtime/queries runtime/themes runtime/tutor "$dir/runtime/"
+            cp runtime/grammars/*.so "$dir/runtime/grammars/"
+            cp README.md LICENSE "$dir/"
+            tar -C dist -cJf "dist/$name.tar.xz" "$name"
+          }
+          pack "helide-$TAG-x86_64-linux" hx-helide
+          if [ -f hx-otari ]; then pack "helide-$TAG-otari-x86_64-linux" hx-otari; fi
+          ls -la dist/*.tar.xz
+
+      - name: Attach to the release
+        run: gh release upload "$TAG" dist/*.tar.xz --clobber
