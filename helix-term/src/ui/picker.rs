@@ -1015,19 +1015,27 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     .and_then(|style| style.bg)
                     .or(theme.get("ui.background").bg);
                 let added = Style::default().bg(soften(plus, base));
-                let removed = Style::default()
-                    .underline_style(helix_view::graphics::UnderlineStyle::Line)
-                    .underline_color(minus.unwrap_or(helix_view::graphics::Color::Red));
+                let bar = Style::default().fg(plus.unwrap_or(helix_view::graphics::Color::Green));
+                let gone = Style::default().fg(minus.unwrap_or(helix_view::graphics::Color::Red));
                 let tints: HashMap<usize, bool> = tints.into_iter().collect();
+                // In the margin left of the text: a bar beside lines only this version has, and
+                // a low mark under a line where lines of now are missing from it.
                 let draw_tint = move |renderer: &mut TextRenderer, pos: LinePos| {
-                    if let Some(&only_here) = tints.get(&pos.doc_line) {
+                    let Some(&only_here) = tints.get(&pos.doc_line) else {
+                        return;
+                    };
+                    let margin = renderer.viewport.x.saturating_sub(1);
+                    if only_here {
                         let area = Rect::new(
                             renderer.viewport.x,
                             pos.visual_line,
                             renderer.viewport.width,
                             1,
                         );
-                        renderer.set_style(area, if only_here { added } else { removed });
+                        renderer.set_style(area, added);
+                        renderer.set_string(margin, pos.visual_line, "▎", bar);
+                    } else {
+                        renderer.set_string(margin, pos.visual_line, "▁", gone);
                     }
                 };
                 decorations.add_decoration(draw_tint);

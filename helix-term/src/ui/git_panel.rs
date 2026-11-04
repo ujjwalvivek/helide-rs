@@ -204,7 +204,7 @@ struct CommitDetail {
 }
 
 /// Rows the commit summary takes at the bottom of the panel, when the panel is tall enough.
-const SUMMARY_HEIGHT: u16 = 9;
+const SUMMARY_HEIGHT: u16 = 8;
 
 impl GitPanel {
     /// Hidden: show and focus. Shown but unfocused: focus. Focused: hide.
@@ -536,9 +536,9 @@ impl GitPanel {
     /// Draws the panel: its rows, and under them, when there is room, a summary of the selected
     /// commit (HEAD's when no commit is selected).
     pub fn render(&mut self, area: Rect, surface: &mut Surface, theme: &Theme) {
-        // A third of the panel, at least SUMMARY_HEIGHT rows, when the panel is tall enough.
+        // 30% of the panel, at least SUMMARY_HEIGHT rows, when the panel is tall enough.
         let summary = if area.height >= SUMMARY_HEIGHT * 2 && self.snapshot.repo.is_some() {
-            SUMMARY_HEIGHT.max(area.height / 3)
+            SUMMARY_HEIGHT.max(area.height * 3 / 10)
         } else {
             0
         };
@@ -920,8 +920,8 @@ impl GitPanel {
             MouseEventKind::ScrollUp if on_summary => {
                 self.summary_scroll = self.summary_scroll.saturating_sub(3)
             }
-            MouseEventKind::ScrollDown => self.step(3),
-            MouseEventKind::ScrollUp => self.step(-3),
+            MouseEventKind::ScrollDown => self.step(1),
+            MouseEventKind::ScrollUp => self.step(-1),
             MouseEventKind::Down(MouseButton::Left)
                 if event.row >= self.rows_area.y && event.row < self.rows_area.bottom() =>
             {
