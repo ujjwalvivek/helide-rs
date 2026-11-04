@@ -3051,7 +3051,7 @@ impl EditorView {
                 .iter()
                 .position(|&(y, start, end)| y == row && (start..end).contains(&column))
             {
-                return Some((Grab::EditorTab(index), format!("layout {}", index + 1)));
+                return Some((Grab::EditorTab(index), (index + 1).to_string()));
             }
         }
         if let Some(terminal) = self.terminal_box {
