@@ -41,6 +41,7 @@ use super::{
     git_panel::{GitAction, GitPanel},
     panel_style::Roles,
     terminal::TerminalPanel,
+    Prompt, PromptEvent,
 };
 
 /// A panel edge that can be dragged to resize the panel.
@@ -150,6 +151,12 @@ pub struct EditorView {
     buffer_strip: frame::TabStrip,
     /// When the agent tabs were last checked for a conversation Claude moved to.
     agents_followed: Option<std::time::Instant>,
+    /// When the file tree last re-read the disk on its own.
+    tree_refreshed: Option<std::time::Instant>,
+    /// Columns of the + after FILES on the sidebar's title row, last frame.
+    tree_plus: Option<(u16, u16)>,
+    /// The last click on a tab and when, to tell a double click.
+    last_tab_click: Option<(Grab, std::time::Instant)>,
     /// Sidebar width and terminal rows the user set by dragging or with Alt+Shift+arrows.
     sidebar_width: Option<u16>,
     terminal_height: Option<u16>,
@@ -207,6 +214,9 @@ impl EditorView {
             buffer_hits: Vec::new(),
             buffer_strip: frame::TabStrip::default(),
             agents_followed: None,
+            tree_refreshed: None,
+            tree_plus: None,
+            last_tab_click: None,
             sidebar_width: None,
             terminal_height: None,
             pressed: None,
@@ -2251,14 +2261,14 @@ impl EditorView {
                 ("FILES", self.file_tree.root_name(), roles.muted)
             };
             let (left, right) = (sidebar.x, sidebar.right() - 1);
-            let title_hits = frame::labels_left(
-                surface,
-                sidebar.y,
-                left,
-                right,
-                &[Label::new(title, roles.label())],
-            );
-            let title_end = title_hits.first().map_or(left, |&(_, end)| end);
+            let mut titles = vec![Label::new(title, roles.label())];
+            if !self.git.visible {
+                // + makes a file or folder where the tree's selection is.
+                titles.push(Label::new("+", roles.label()));
+            }
+            let title_hits = frame::labels_left(surface, sidebar.y, left, right, &titles);
+            self.tree_plus = title_hits.get(1).copied();
+            let title_end = title_hits.last().map_or(left, |&(_, end)| end);
             if !meta.is_empty() {
                 let room = right.saturating_sub(title_end + 3) as usize;
                 let meta = shorten_end(&meta, room);
@@ -2459,11 +2469,96 @@ impl EditorView {
             &labels,
             active,
             roles.label(),
+            Some(roles.label()),
         );
         self.buffer_hits = hits
             .into_iter()
             .map(|(index, start, end)| (start, end, ids[index]))
             .collect();
+    }
+
+    /// Asks for a tab's new name. A file's name is its path from the project root, so editing
+    /// the path moves the file and naming an unsaved file saves it there. Terminal and agent tabs
+    /// just take a label.
+    fn rename_tab(&mut self, grab: Grab) {
+        match grab {
+            Grab::Buffer(doc) => crate::job::dispatch_blocking(move |editor, compositor| {
+                compositor.push(Box::new(rename_file_prompt(editor, doc)));
+            }),
+            Grab::PanelTab(agents, index) => {
+                let panel = if agents { &self.agents } else { &self.terminal };
+                let current = panel.tab_title(index).unwrap_or_default();
+                crate::job::dispatch_blocking(move |editor, compositor| {
+                    let prompt = Prompt::new(
+                        "rename tab: ".into(),
+                        None,
+                        super::completers::none,
+                        move |_cx, input, event| {
+                            if event != PromptEvent::Validate {
+                                return;
+                            }
+                            let name = input.to_string();
+                            crate::job::dispatch_blocking(move |_, compositor| {
+                                if let Some(view) = compositor.find::<EditorView>() {
+                                    if agents {
+                                        view.agents.rename_tab(index, &name);
+                                        view.save_agents();
+                                    } else {
+                                        view.terminal.rename_tab(index, &name);
+                                    }
+                                }
+                            });
+                        },
+                    )
+                    .with_line(current, editor);
+                    compositor.push(Box::new(prompt));
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// A click on a + button: a new file in the editor, a new shell in the terminal, the agent
+    /// menu in the agent panel, or a new file or folder from the tree. Returns whether it was one.
+    fn plus_click(&mut self, mouse: &MouseEvent, editor: &mut Editor) -> bool {
+        let (column, row) = (mouse.column, mouse.row);
+        if self.sidebar_box.is_some_and(|b| row == b.y)
+            && self
+                .tree_plus
+                .is_some_and(|(s, e)| (s..e).contains(&column))
+        {
+            let action = TreeAction::Create(self.file_tree.target_dir());
+            crate::job::dispatch_blocking(move |editor, compositor| {
+                if let Some(prompt) = file_tree::prompt(&action, editor) {
+                    compositor.push(prompt);
+                }
+            });
+            return true;
+        }
+        let on = |b: Rect| row == b.y && column >= b.x && column < b.right();
+        if self.zen.is_none() && on(self.editor_box) && self.buffer_strip.plus_at(column) {
+            editor.new_file(Action::Replace);
+            self.focus_editor();
+            return true;
+        }
+        if self.terminal_box.is_some_and(on) && self.terminal.tab_strip().plus_at(column) {
+            self.open_terminal(&[], None, editor);
+            return true;
+        }
+        if self.agents_box.is_some_and(on) && self.agents.tab_strip().plus_at(column) {
+            match AgentKind::installed().as_slice() {
+                [] => editor.set_error("Neither claude nor opencode is on PATH."),
+                [kind] => self.open_agent(*kind, editor),
+                _ => {
+                    let position = Position::new(row as usize + 1, column as usize);
+                    crate::job::dispatch_blocking(move |_, compositor| {
+                        compositor.push(Box::new(agent_menu(position)));
+                    });
+                }
+            }
+            return true;
+        }
+        false
     }
 
     /// The wheel over a row of tabs (files, terminals or agents) moves that row by a tab.
@@ -2609,6 +2704,7 @@ impl EditorView {
                 true
             }
             MouseEventKind::Down(MouseButton::Left) if self.scroll_tabs_click(mouse) => true,
+            MouseEventKind::Down(MouseButton::Left) if self.plus_click(mouse, editor) => true,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.scroll_tabs(mouse) => {
                 true
             }
@@ -2697,6 +2793,19 @@ impl EditorView {
     }
 
     fn release(&mut self, press: Press, column: u16, row: u16, editor: &mut Editor) {
+        // A second click on the same tab soon after the first renames it.
+        let tab = matches!(press.grab, Grab::Buffer(_) | Grab::PanelTab(..));
+        let now = std::time::Instant::now();
+        let double = tab
+            && !press.moved
+            && self.last_tab_click.is_some_and(|(grab, at)| {
+                grab == press.grab && now.duration_since(at) < std::time::Duration::from_millis(500)
+            });
+        self.last_tab_click = (tab && !press.moved && !double).then_some((press.grab, now));
+        if double {
+            self.rename_tab(press.grab);
+            return;
+        }
         match press.grab {
             Grab::Edge(_) => {}
             Grab::Buffer(doc) if !press.moved => {
@@ -3245,6 +3354,18 @@ impl Component for EditorView {
         // Keep the workspace saved while a project is open, so even a killed window loses
         // little. Integration tests leave the user's state alone.
         self.save_if_changed(cx.editor, false);
+        // The tree re-reads the disk every couple of seconds while it is shown, so files made
+        // or removed elsewhere (a terminal, an agent, git) appear without touching it.
+        if self.file_tree.visible {
+            let due = self
+                .tree_refreshed
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2));
+            if due {
+                self.tree_refreshed = Some(std::time::Instant::now());
+                self.file_tree.refresh(cx.editor);
+            }
+            redraw_every_two_seconds();
+        }
         let (finished, closed) = self.agents.update();
         // Every couple of seconds, catch a Claude tab moved by /clear or /resume, so a restart
         // reopens the conversation it is in rather than the one it began with.
@@ -3650,4 +3771,88 @@ fn copy_to_clipboard(editor: &mut Editor, text: String) {
         )),
         Err(err) => editor.set_error(format!("Couldn't copy: {err}")),
     }
+}
+
+/// Keeps the screen redrawing every two seconds while something polls the disk (the file
+/// tree), since nothing else wakes the editor when files change outside it.
+fn redraw_every_two_seconds() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TICKING: AtomicBool = AtomicBool::new(false);
+    if TICKING.swap(true, Ordering::Relaxed) || tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        TICKING.store(false, Ordering::Relaxed);
+        helix_event::request_redraw();
+    });
+}
+
+/// The prompt behind double-clicking a file tab: the file's path from the project root, to
+/// edit. A changed path renames or moves the file (making any missing folders); for a file
+/// never saved, the path is where it is saved.
+fn rename_file_prompt(editor: &Editor, doc: DocumentId) -> Prompt {
+    let root = helix_stdx::env::current_working_dir();
+    let old = editor
+        .document(doc)
+        .and_then(|d| d.path().map(PathBuf::from));
+    let line = old
+        .as_ref()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let label = if old.is_some() {
+        "move to: "
+    } else {
+        "save as: "
+    };
+    Prompt::new(
+        label.into(),
+        None,
+        super::completers::filename,
+        move |cx, input, event| {
+            if event != PromptEvent::Validate || input.trim().is_empty() {
+                return;
+            }
+            let input = input.trim();
+            let new = match input.strip_prefix("~/") {
+                Some(rest) => helix_stdx::path::home_dir()
+                    .map(|home| home.join(rest))
+                    .unwrap_or_else(|_| root.join(input)),
+                None => root.join(input),
+            };
+            if old.as_deref() == Some(new.as_path()) {
+                return;
+            }
+            if new.exists() {
+                cx.editor
+                    .set_error(format!("{} already exists", new.display()));
+                return;
+            }
+            if let Some(parent) = new.parent() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    cx.editor
+                        .set_error(format!("cannot make {}: {err}", parent.display()));
+                    return;
+                }
+            }
+            let result = match &old {
+                Some(old) => cx.editor.move_path(old, &new).map_err(anyhow::Error::from),
+                None => cx.editor.save(doc, Some(new.clone()), false),
+            };
+            match result {
+                Ok(()) => cx.editor.set_status(format!(
+                    "{}",
+                    new.strip_prefix(&root).unwrap_or(&new).display()
+                )),
+                Err(err) => cx.editor.set_error(format!("cannot save: {err}")),
+            }
+            file_tree::refresh_later(cx, false);
+        },
+    )
+    .with_line(line, editor)
 }

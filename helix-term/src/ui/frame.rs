@@ -149,6 +149,8 @@ pub struct TabStrip {
     /// Columns of the ‹ and › markers last frame.
     left_marker: Option<(u16, u16)>,
     right_marker: Option<(u16, u16)>,
+    /// Columns of the + button last frame, when the row has one.
+    plus: Option<(u16, u16)>,
 }
 
 /// How many tabs, from `offset`, fit in `room` columns, leaving room for the markers needed.
@@ -207,7 +209,8 @@ fn window(
 
 impl TabStrip {
     /// Sets `lead` (fixed labels such as a title) and then `tabs` into a border row from `x` to
-    /// `end`. Returns the columns of each drawn tab, with its index.
+    /// `end`, followed by a + button when `plus` is given. Returns the columns of each drawn tab,
+    /// with its index.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -219,10 +222,14 @@ impl TabStrip {
         tabs: &[Label],
         active: Option<usize>,
         marker_style: Style,
+        plus: Option<Style>,
     ) -> Vec<(usize, u16, u16)> {
         let lead_hits = labels_left(surface, y, x, end, lead);
         let start = lead_hits.last().map_or(x + 1, |&(_, e)| e);
-        let room = end.saturating_sub(start);
+        let plus_label = plus.map(|style| Label::new("+", style));
+        let room = end
+            .saturating_sub(start)
+            .saturating_sub(plus_label.as_ref().map_or(0, Label::width));
         let widths: Vec<u16> = tabs.iter().map(Label::width).collect();
         let (offset, count) = window(&widths, room, self.offset, active, self.followed);
         self.offset = offset;
@@ -246,12 +253,27 @@ impl TabStrip {
             .map(|(i, (s, e))| (offset + i, s, e))
             .collect();
         self.right_marker = if hidden > 0 { hits.next() } else { None };
+        let after = self
+            .right_marker
+            .or(tab_hits.last().map(|&(_, s, e)| (s, e)))
+            .or(self.left_marker)
+            .map_or(start, |(_, e)| e);
+        self.plus = plus_label.and_then(|label| {
+            labels_left(surface, y, after - 1, end, &[label])
+                .first()
+                .copied()
+        });
         tab_hits
     }
 
     /// Moves the row by `by` tabs; the next draw keeps it within the tabs.
     pub fn scroll(&mut self, by: isize) {
         self.offset = self.offset.saturating_add_signed(by);
+    }
+
+    /// Whether a click at `column` is on the + button.
+    pub fn plus_at(&self, column: u16) -> bool {
+        self.plus.is_some_and(|(s, e)| (s..e).contains(&column))
     }
 
     /// Which way a click at `column` on a marker moves the row, if it is on one.

@@ -154,7 +154,7 @@ impl FileTree {
     }
 
     /// The directory new files go into: the selected directory, or the selected file's parent.
-    fn target_dir(&self) -> PathBuf {
+    pub fn target_dir(&self) -> PathBuf {
         match self.rows.get(self.selected) {
             Some(row) if row.is_dir => row.path.clone(),
             Some(row) => row
@@ -501,7 +501,7 @@ pub fn prompt(action: &TreeAction, editor: &Editor) -> Option<Box<dyn Component>
 }
 
 /// Prompt callbacks have no access to the compositor, so the tree refresh runs as a job.
-fn refresh_later(cx: &mut compositor::Context, focus_editor: bool) {
+pub(crate) fn refresh_later(cx: &mut compositor::Context, focus_editor: bool) {
     cx.jobs.callback(async move {
         Ok(Callback::EditorCompositor(Box::new(
             move |editor, compositor| {
