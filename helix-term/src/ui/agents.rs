@@ -539,6 +539,9 @@ pub struct Panels {
     pub sidebar_width: Option<u16>,
     pub terminal_height: Option<u16>,
     pub agents_width: Option<u16>,
+    /// The sidebar on the right and the agents on the left, swapped by dragging a panel's title.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub swapped: bool,
     /// The terminal's tabs, so they reopen with their names, folders and programs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub terminals: Vec<TerminalTab>,

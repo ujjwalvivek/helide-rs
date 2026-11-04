@@ -1799,7 +1799,7 @@ fn parse_graph(output: &str) -> (Vec<Commit>, Vec<History>) {
 }
 
 /// Lays out the commit graph, one row per commit, the way graphical clients draw it: each lane
-/// is a straight `│` column keeping one colour; a commit is `●` in its lane; a branch or merge
+/// is a straight `│` column keeping one colour; a commit is a square `■` in its lane; a branch or merge
 /// leaves or joins it on the commit's own row with rounded corners (`╭╮╰╯`), `─` between, and
 /// `┼` where it crosses another lane. Lanes are two columns apart.
 fn layout_graph(commits: &mut [Commit]) {
@@ -1918,7 +1918,7 @@ fn layout_graph(commits: &mut [Commit]) {
             };
             connect(&mut row, *k, *c, corner);
         }
-        row[2 * lane] = ('●', color);
+        row[2 * lane] = ('■', color);
         while row.last().is_some_and(|(ch, _)| *ch == ' ') {
             row.pop();
         }
@@ -2393,7 +2393,7 @@ index 111..222 100644
             .iter()
             .map(|c| c.graph.iter().map(|(ch, _)| *ch).collect())
             .collect();
-        assert_eq!(rows, vec!["●─╮", "│ ●", "● │", "●─╯"]);
+        assert_eq!(rows, vec!["■─╮", "│ ■", "■ │", "■─╯"]);
         assert_eq!(history.len(), 4);
         assert!(commits[0].head);
         assert_eq!(commits[0].refs, vec!["main", "tag: v1"]);
