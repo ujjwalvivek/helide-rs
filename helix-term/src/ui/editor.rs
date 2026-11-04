@@ -64,6 +64,9 @@ enum Grab {
     /// A terminal or agent tab label: dragging along the strip reorders, dropping it in the
     /// panel puts it beside the shown tab as a pane.
     PanelTab(bool, usize),
+    /// A side panel's title (FILES or GIT, or AGENTS): dropping it on the other side of the
+    /// screen swaps the sidebar and the agents. True for the agents.
+    Header(bool),
 }
 
 /// A mouse press, until it is released: a press that moves is a drag, one that does not is a
@@ -170,6 +173,8 @@ pub struct EditorView {
     /// Opened as a project (`hx`, `hx .`, `hx dir/`): the workspace is restored and kept.
     /// Opened on files, it is a quick edit that leaves the saved workspace alone.
     pub persist: bool,
+    /// The sidebar on the right and the agents on the left.
+    swapped: bool,
     /// Columns of the + after FILES on the sidebar's title row, last frame.
     tree_plus: Option<(u16, u16)>,
     /// The last click on a tab and when, to tell a double click.
@@ -239,6 +244,7 @@ impl EditorView {
             history_at: None,
             tree_refreshed: None,
             persist: false,
+            swapped: false,
             tree_plus: None,
             last_tab_click: None,
             sidebar_width: None,
@@ -2131,6 +2137,7 @@ impl EditorView {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             agents_width: self.agents_width,
+            swapped: self.swapped,
             terminals: self.terminal.tabs(),
         };
         (layout, panels)
@@ -2190,6 +2197,7 @@ impl EditorView {
             self.sidebar_width = panels.sidebar_width;
             self.terminal_height = panels.terminal_height;
             self.agents_width = panels.agents_width;
+            self.swapped = panels.swapped;
             if panels.git {
                 self.git.visible = true;
                 self.git.refresh();
@@ -2472,8 +2480,18 @@ impl EditorView {
                 .min(frame.width.saturating_sub(EDITOR_MIN_WIDTH))
                 .max(SIDEBAR_MIN);
             if width + EDITOR_MIN_WIDTH <= frame.width {
-                self.sidebar_box = Some(frame.with_width(width));
-                main = frame.clip_left(width);
+                if self.swapped {
+                    self.sidebar_box = Some(Rect::new(
+                        frame.right() - width,
+                        frame.y,
+                        width,
+                        frame.height,
+                    ));
+                    main = frame.with_width(frame.width - width);
+                } else {
+                    self.sidebar_box = Some(frame.with_width(width));
+                    main = frame.clip_left(width);
+                }
             }
         }
         self.agents_box = None;
@@ -2484,8 +2502,14 @@ impl EditorView {
                 .min(main.width.saturating_sub(EDITOR_MIN_WIDTH))
                 .max(AGENTS_MIN);
             if width + EDITOR_MIN_WIDTH <= main.width {
-                self.agents_box = Some(Rect::new(main.right() - width, main.y, width, main.height));
-                main = main.with_width(main.width - width);
+                if self.swapped {
+                    self.agents_box = Some(main.with_width(width));
+                    main = main.clip_left(width);
+                } else {
+                    self.agents_box =
+                        Some(Rect::new(main.right() - width, main.y, width, main.height));
+                    main = main.with_width(main.width - width);
+                }
             }
         }
         self.main_box = main;
@@ -3029,6 +3053,15 @@ impl EditorView {
         true
     }
 
+    /// The whole frame the panels share, from the last layout.
+    fn frame_area(&self) -> Option<Rect> {
+        let mut area = self.main_box;
+        for panel in [self.sidebar_box, self.agents_box].into_iter().flatten() {
+            area = area.union(panel);
+        }
+        (area.width > 0).then_some(area)
+    }
+
     /// The split whose tab row covers `column`, from the last frame.
     fn tab_column_at(&self, column: u16) -> Option<&TabColumn> {
         self.tab_columns
@@ -3135,17 +3168,42 @@ impl EditorView {
                     return Some((Grab::PanelTab(true, index), name));
                 }
             }
-            if (column == agents.x || column + 1 == agents.x)
-                && row >= agents.y
-                && row < agents.bottom()
-            {
+            // The title, AGENTS, carries the whole panel to the other side.
+            if row == agents.y && column > agents.x && column < agents.x + 1 + 8 {
+                return Some((Grab::Header(true), "AGENTS".to_string()));
+            }
+            // The edge toward the editor resizes.
+            let inner = if self.swapped {
+                agents.right() - 1
+            } else {
+                agents.x
+            };
+            let outside = if self.swapped {
+                inner + 1
+            } else {
+                inner.saturating_sub(1)
+            };
+            if (column == inner || column == outside) && row >= agents.y && row < agents.bottom() {
                 return Some((Grab::Edge(Edge::Agents), String::new()));
             }
         }
         if let Some(sidebar) = self.sidebar_box {
-            if (column == sidebar.right() - 1 || column == sidebar.right())
-                && row >= sidebar.y
-                && row < sidebar.bottom()
+            let title = if self.git.visible { "GIT" } else { "FILES" };
+            if row == sidebar.y && column > sidebar.x && column < sidebar.x + 3 + title.len() as u16
+            {
+                return Some((Grab::Header(false), title.to_string()));
+            }
+            let inner = if self.swapped {
+                sidebar.x
+            } else {
+                sidebar.right() - 1
+            };
+            let outside = if self.swapped {
+                inner.saturating_sub(1)
+            } else {
+                inner + 1
+            };
+            if (column == inner || column == outside) && row >= sidebar.y && row < sidebar.bottom()
             {
                 return Some((Grab::Edge(Edge::Sidebar), String::new()));
             }
@@ -3229,13 +3287,24 @@ impl EditorView {
                 }
                 self.drag_at = (mouse.column, mouse.row);
                 match press.grab {
+                    // Each side panel's width runs from its outer edge to the mouse.
                     Grab::Edge(Edge::Sidebar) => {
-                        let left = self.sidebar_box.map_or(0, |sidebar| sidebar.x);
-                        self.sidebar_width = Some(mouse.column.saturating_sub(left) + 1);
+                        if let Some(sidebar) = self.sidebar_box {
+                            self.sidebar_width = Some(if self.swapped {
+                                sidebar.right().saturating_sub(mouse.column)
+                            } else {
+                                mouse.column.saturating_sub(sidebar.x) + 1
+                            });
+                        }
                     }
                     Grab::Edge(Edge::Agents) => {
-                        let right = self.agents_box.map_or(0, |agents| agents.right());
-                        self.agents_width = Some(right.saturating_sub(mouse.column));
+                        if let Some(agents) = self.agents_box {
+                            self.agents_width = Some(if self.swapped {
+                                mouse.column.saturating_sub(agents.x) + 1
+                            } else {
+                                agents.right().saturating_sub(mouse.column)
+                            });
+                        }
                     }
                     Grab::Edge(Edge::Terminal) => {
                         // The divider follows the mouse: the rows below it, less the border.
@@ -3273,6 +3342,15 @@ impl EditorView {
         }
         match press.grab {
             Grab::Edge(_) => {}
+            Grab::Header(_) if !press.moved => {}
+            // Let go on the far half of the screen: the panel goes to that side, and the other
+            // side panel to this one.
+            Grab::Header(agents) => {
+                let middle = self.frame_area().map_or(0, |area| area.x + area.width / 2);
+                let to_left = column < middle;
+                // The sidebar is on the left unless swapped; the agents the other way.
+                self.swapped = if agents { to_left } else { !to_left };
+            }
             Grab::Buffer(doc) if !press.moved => {
                 // Shown in the split whose row it was clicked in.
                 if let Some(&(_, _, _, view)) = self
@@ -3449,6 +3527,24 @@ impl EditorView {
             return;
         }
         let roles = Roles::new(&editor.theme);
+        // A side panel carried by its title: outline where it will go.
+        if let Grab::Header(agents) = press.grab {
+            let panel = if agents {
+                self.agents_box
+            } else {
+                self.sidebar_box
+            };
+            if let (Some(panel), Some(area)) = (panel, self.frame_area()) {
+                let to_left = self.drag_at.0 < area.x + area.width / 2;
+                let x = if to_left {
+                    area.x
+                } else {
+                    area.right() - panel.width
+                };
+                let target = Rect::new(x, panel.y, panel.width, panel.height);
+                frame::draw_box(surface, target, roles.accent, End::Corner, End::Corner);
+            }
+        }
         let (column, row) = self.drag_at;
         match press.grab {
             Grab::Buffer(_) => {
@@ -3615,6 +3711,13 @@ impl EditorView {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_only(Panel::Terminal);
                 }
+                // A right click pastes the clipboard, as in most terminals.
+                if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+                    if let Some(text) = clipboard_text(cx.editor) {
+                        self.terminal.paste(&text);
+                    }
+                    return Some(EventResult::Consumed(None));
+                }
                 if let Some(location) = self.terminal.mouse(mouse) {
                     self.open_location(&location, cx.editor);
                 }
@@ -3626,6 +3729,13 @@ impl EditorView {
             Event::Mouse(mouse) if self.agents.contains(mouse.column, mouse.row) => {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_only(Panel::Agents);
+                }
+                // A right click pastes the clipboard, as in most terminals.
+                if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+                    if let Some(text) = clipboard_text(cx.editor) {
+                        self.agents.paste(&text);
+                    }
+                    return Some(EventResult::Consumed(None));
                 }
                 if let Some(location) = self.agents.mouse(mouse) {
                     self.open_location(&location, cx.editor);
@@ -4343,6 +4453,7 @@ fn agent_menu(position: Position) -> super::Popup<super::Menu<AgentKind>> {
     super::Popup::new("agent-menu", menu)
         .with_scrollbar(false)
         .position(Some(position))
+        .anchored(true)
         .auto_close(true)
 }
 
@@ -4379,6 +4490,12 @@ fn source_view(editor: &Editor, preview: ViewId, doc: DocumentId) -> Option<View
 }
 
 /// Puts text selected in a terminal or agent pane on the system clipboard.
+/// What the system clipboard holds, if anything.
+fn clipboard_text(editor: &Editor) -> Option<String> {
+    let text: String = editor.registers.read('+', editor)?.next()?.into_owned();
+    (!text.is_empty()).then_some(text)
+}
+
 fn copy_to_clipboard(editor: &mut Editor, text: String) {
     let lines = text.lines().count().max(1);
     match editor.registers.write('+', vec![text]) {

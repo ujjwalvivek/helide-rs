@@ -30,6 +30,8 @@ struct RenderInfo {
 // a width/height hint. maybe Popup(Box<Component>)
 
 pub struct Popup<T: Component> {
+    /// Stays at `position` instead of following the cursor.
+    anchored: bool,
     contents: T,
     position: Option<Position>,
     area: Rect,
@@ -44,6 +46,7 @@ pub struct Popup<T: Component> {
 impl<T: Component> Popup<T> {
     pub fn new(id: &'static str, contents: T) -> Self {
         Self {
+            anchored: false,
             contents,
             position: None,
             position_bias: Open::Below,
@@ -60,6 +63,13 @@ impl<T: Component> Popup<T> {
     ///
     /// Note that this is not the position of the top-left corner of the rendered popup itself,
     /// but rather the screen-space position of the information to which the popup refers.
+    /// Keeps the popup at its `position` whatever the cursor does: for a menu opened from
+    /// a button, which belongs by the button.
+    pub fn anchored(mut self, anchored: bool) -> Self {
+        self.anchored = anchored;
+        self
+    }
+
     pub fn position(mut self, pos: Option<Position>) -> Self {
         self.position = pos;
         self
@@ -125,7 +135,10 @@ impl<T: Component> Popup<T> {
 
     fn render_info(&mut self, viewport: Rect, editor: &Editor) -> RenderInfo {
         let mut position = editor.cursor().0.unwrap_or_default();
-        if let Some(old_position) = self
+        if let Some(anchor) = self.position.filter(|_| self.anchored) {
+            // Pinned where it was opened (a menu under a button), wherever the cursor is.
+            position = anchor;
+        } else if let Some(old_position) = self
             .position
             .filter(|old_position| old_position.row == position.row)
         {
