@@ -19,6 +19,7 @@ use helix_view::{
 };
 use tui::buffer::Buffer as Surface;
 
+use super::code_stats::{self, CodeStats};
 use super::panel_style::Roles;
 
 use crate::{
@@ -61,6 +62,13 @@ pub struct FileTree {
     rows_area: Rect,
     /// Where the whole tree was drawn last frame.
     area: Rect,
+    /// Code stats of the folder in view, shown under the rows: the last result, the folder
+    /// being counted, and whether the result still matches the disk.
+    stats: Option<Result<CodeStats, String>>,
+    stats_for: Option<PathBuf>,
+    stats_loading: bool,
+    stats_fresh: bool,
+    stats_at: Option<std::time::Instant>,
 }
 
 impl FileTree {
@@ -95,6 +103,7 @@ impl FileTree {
         }
         let selected = self.selected_path().map(Path::to_path_buf);
         self.expanded.retain(|dir| dir.is_dir());
+        self.stats_fresh = false;
 
         let mut rows = Vec::new();
         self.list(editor, &self.root.clone(), 0, &mut rows);
@@ -201,8 +210,33 @@ impl FileTree {
             return;
         }
         let roles = Roles::new(&editor.theme);
-        let rows_area = area;
+        // Code stats of the folder in view take the bottom, when the tree is tall enough.
+        let stats = area.height >= code_stats::HEIGHT * 3;
+        let rows_area = if stats {
+            area.clip_bottom(code_stats::HEIGHT)
+        } else {
+            area
+        };
         self.rows_area = rows_area;
+        if stats {
+            self.want_stats();
+            let shown = self.stats_for.as_deref().unwrap_or(&self.root);
+            let folder = match shown.strip_prefix(&self.root) {
+                Ok(rest) if rest.as_os_str().is_empty() => shown
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string()),
+                Ok(rest) => rest.display().to_string(),
+                Err(_) => shown.display().to_string(),
+            };
+            let bottom = Rect::new(
+                area.x,
+                area.bottom() - code_stats::HEIGHT,
+                area.width,
+                code_stats::HEIGHT,
+            );
+            code_stats::render(self.stats.as_ref(), &folder, bottom, surface, &roles);
+        }
         let height = rows_area.height as usize;
         if self.selected < self.scroll {
             self.scroll = self.selected;
@@ -240,6 +274,50 @@ impl FileTree {
             let room = line.right().saturating_sub(x + 1) as usize;
             surface.set_string(x, y, &shorten(&row.name, room), name_style);
         }
+    }
+
+    /// The folder the stats are about: the selected folder, or the selected file's.
+    fn stats_dir(&self) -> PathBuf {
+        match self.rows.get(self.selected) {
+            Some(row) if row.is_dir => row.path.clone(),
+            Some(row) => row
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.root.clone()),
+            None => self.root.clone(),
+        }
+    }
+
+    /// Counts the folder in view in the background, when it changed or its files did (at most
+    /// every few seconds).
+    fn want_stats(&mut self) {
+        if self.stats_loading {
+            return;
+        }
+        let dir = self.stats_dir();
+        let same = self.stats_for.as_deref() == Some(dir.as_path());
+        let recent = self
+            .stats_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(5));
+        if same && (self.stats_fresh || recent) {
+            return;
+        }
+        self.stats_loading = true;
+        self.stats_at = Some(std::time::Instant::now());
+        tokio::spawn(async move {
+            let stats = code_stats::read(&dir).await;
+            crate::job::dispatch(move |_, compositor| {
+                if let Some(view) = compositor.find::<EditorView>() {
+                    let tree = &mut view.file_tree;
+                    tree.stats = Some(stats);
+                    tree.stats_for = Some(dir);
+                    tree.stats_loading = false;
+                    tree.stats_fresh = true;
+                }
+            })
+            .await;
+        });
     }
 
     pub fn key(&mut self, key: KeyEvent, editor: &mut Editor) -> TreeAction {
@@ -306,7 +384,9 @@ impl FileTree {
                 let bottom = self.scroll + self.rows_area.height as usize;
                 self.selected = self.selected.min(bottom.saturating_sub(1));
             }
-            MouseEventKind::Down(MouseButton::Left) if event.row >= self.rows_area.y => {
+            MouseEventKind::Down(MouseButton::Left)
+                if event.row >= self.rows_area.y && event.row < self.rows_area.bottom() =>
+            {
                 let index = self.scroll + (event.row - self.rows_area.y) as usize;
                 if index < self.rows.len() {
                     self.selected = index;

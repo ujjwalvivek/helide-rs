@@ -160,6 +160,8 @@ pub struct Document {
     /// The number the gutter shows for each line, in place of its own: helide's diffs show the
     /// file's line numbers, and none on removed lines.
     pub line_labels: Option<Vec<Option<usize>>>,
+    /// helide's diff tabs: each line's mark, `+`, `-` or ` `, kept here so the text can drop it.
+    pub line_marks: Option<Vec<u8>>,
     /// The secret values in the document, as sorted char ranges.
     secret_ranges: Vec<std::ops::Range<usize>>,
     /// One `•` per grapheme of `secret_ranges`, drawn over the text.
@@ -784,6 +786,7 @@ impl Document {
             secret_file: None,
             soft_wrap: None,
             line_labels: None,
+            line_marks: None,
             secret_ranges: Vec::new(),
             secret_masks: Vec::new(),
             document_highlights: HashMap::new(),

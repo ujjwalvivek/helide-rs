@@ -185,6 +185,8 @@ pub struct GitPanel {
     refresh_again: bool,
     /// When the last wheel event came, to fold a notch's burst into one step.
     last_wheel: Option<Instant>,
+    /// The row last clicked and when, to tell a double click.
+    last_click: Option<(usize, Instant)>,
     /// Where the commit summary was drawn, and how far its file list is scrolled.
     summary_area: Rect,
     summary_scroll: usize,
@@ -911,7 +913,7 @@ impl GitPanel {
         GitAction::None
     }
 
-    pub fn mouse(&mut self, event: &MouseEvent) -> GitAction {
+    pub fn mouse(&mut self, event: &MouseEvent, editor: &mut Editor) -> GitAction {
         let area = self.summary_area;
         let on_summary = event.row >= area.y
             && event.row < area.bottom()
@@ -938,21 +940,38 @@ impl GitPanel {
             }
             MouseEventKind::ScrollDown => self.step(1),
             MouseEventKind::ScrollUp => self.step(-1),
-            MouseEventKind::Down(MouseButton::Left)
+            MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right))
                 if event.row >= self.rows_area.y && event.row < self.rows_area.bottom() =>
             {
                 let index = self.scroll + (event.row - self.rows_area.y) as usize;
-                if self.rows.get(index).is_some_and(Self::selectable) {
-                    let again = index == self.selected;
-                    self.selected = index;
-                    // A click on a file opens its diff; a second click lists its hunks. On
-                    // anything else, a second click shows it.
-                    match self.selected_row() {
-                        Some(Row::File(_)) if again => self.expand(true),
-                        Some(Row::File(_)) => self.show(Action::NewTab),
-                        _ if again => self.show(Action::NewTab),
-                        _ => {}
+                if !self.rows.get(index).is_some_and(Self::selectable) {
+                    return GitAction::None;
+                }
+                let now = Instant::now();
+                let double = self.last_click.is_some_and(|(row, at)| {
+                    row == index && now.duration_since(at) < Duration::from_millis(400)
+                });
+                self.last_click = if double { None } else { Some((index, now)) };
+                self.selected = index;
+                let on_file = matches!(self.selected_row(), Some(Row::File(_)));
+                // A file: a click shows its diff, a double click lists its hunks, a right click
+                // opens the file itself. Anything else: a click selects, a double click shows.
+                match (button, on_file, double) {
+                    (MouseButton::Right, true, _) => return self.open_file(editor),
+                    (MouseButton::Right, false, _) => {}
+                    (_, true, false) => self.show(Action::NewTab),
+                    (_, true, true) => {
+                        if self
+                            .selected_entry()
+                            .is_some_and(|entry| entry.section == Section::Untracked)
+                        {
+                            editor.set_status("An untracked file has no hunks until it is staged.");
+                        } else {
+                            self.expand(true);
+                        }
                     }
+                    (_, false, true) => self.show(Action::NewTab),
+                    (_, false, false) => {}
                 }
             }
             _ => {}
@@ -2088,24 +2107,29 @@ const WHOLE_FILE: &str = "-U1000000";
 /// A file's diff as the file with its changes marked: git's headers and `@@` lines go, and each
 /// line gets the file's line number for the gutter (removed lines get none). A diff with no hunks
 /// (a binary file) stays as git wrote it.
-fn marked_file(diff: &str) -> (String, Option<Vec<Option<usize>>>) {
+fn marked_file(diff: &str) -> (String, Option<Marks>) {
     let mut out = String::new();
     let mut labels = Vec::new();
+    let mut marks = Vec::new();
     let mut line = None;
     for text in diff.lines() {
         if text.starts_with("@@") {
             if line.is_some() {
                 out.push('\n');
                 labels.push(None);
+                marks.push(b' ');
             }
             line = Some(hunk_new_start(text));
         } else if let Some(n) = &mut line {
             if text.starts_with('\\') {
                 continue;
             }
-            out.push_str(text);
+            // The tint says added or removed; the text is the file's own line.
+            let mark = text.bytes().next().unwrap_or(b' ');
+            out.push_str(text.get(1..).unwrap_or(""));
             out.push('\n');
-            if text.starts_with('-') {
+            marks.push(mark);
+            if mark == b'-' {
                 labels.push(None);
             } else {
                 labels.push(Some(*n));
@@ -2116,7 +2140,13 @@ fn marked_file(diff: &str) -> (String, Option<Vec<Option<usize>>>) {
     if line.is_none() {
         return (diff.to_string(), None);
     }
-    (out, Some(labels))
+    (out, Some(Marks { labels, marks }))
+}
+
+/// A diff tab's line numbers (none on removed lines) and each line's `+`, `-` or ` `.
+pub struct Marks {
+    labels: Vec<Option<usize>>,
+    marks: Vec<u8>,
 }
 
 /// Where a hunk starts in the new version: c in "@@ -a,b +c,d @@".
@@ -2137,7 +2167,7 @@ fn open_scratch(
     language: &str,
     action: Action,
     wrap: Option<bool>,
-    labels: Option<Vec<Option<usize>>>,
+    marks: Option<Marks>,
 ) -> DocumentId {
     let mut doc = Document::from(
         Rope::from(text),
@@ -2146,22 +2176,36 @@ fn open_scratch(
         editor.syn_loader.clone(),
     );
     let loader = editor.syn_loader.load();
-    let _ = doc.set_language_by_language_id(language, &loader);
+    // A file's diff without its marks reads as the file, so it gets the file's language.
+    let by_name = marks
+        .as_ref()
+        .and_then(|_| label.split_once(' '))
+        .and_then(|(_, path)| loader.language_for_filename(Path::new(path)));
+    match by_name {
+        Some(lang) => doc.set_language(Some(loader.language(lang).config().clone()), &loader),
+        None => {
+            let _ = doc.set_language_by_language_id(language, &loader);
+        }
+    }
     doc.readonly = true;
     doc.soft_wrap = wrap;
-    doc.line_labels = labels;
+    set_marks(&mut doc, marks);
     doc.label = Some(label.to_string());
     editor.new_file_from_document(action, doc)
 }
 
+fn set_marks(doc: &mut Document, marks: Option<Marks>) {
+    let (labels, marks) = match marks {
+        Some(Marks { labels, marks }) => (Some(labels), Some(marks)),
+        None => (None, None),
+    };
+    doc.line_labels = labels;
+    doc.line_marks = marks;
+}
+
 /// Swaps a diff tab's text for a fresh one, keeping the cursor on the same line and the tab
 /// unmodified.
-fn replace_text(
-    doc: &mut Document,
-    view: &mut View,
-    text: &str,
-    labels: Option<Vec<Option<usize>>>,
-) {
+fn replace_text(doc: &mut Document, view: &mut View, text: &str, marks: Option<Marks>) {
     if doc.text() == text {
         return;
     }
@@ -2179,7 +2223,7 @@ fn replace_text(
     // Into the history and marked saved, so the tab never asks to be saved.
     doc.append_changes_to_history(view_ref);
     doc.reset_modified();
-    doc.line_labels = labels;
+    set_marks(doc, marks);
     let new = doc.text().clone();
     let last = new.len_lines().saturating_sub(1);
     let at = new.line_to_char(line.min(last));
@@ -2370,9 +2414,11 @@ mod marked_file_tests {
     fn numbers_follow_the_new_file_and_skip_removed_lines() {
         let diff =
             "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
-        let (text, labels) = marked_file(diff);
-        assert_eq!(text, " one\n-two\n+TWO\n three\n");
-        assert_eq!(labels.unwrap(), vec![Some(1), None, Some(2), Some(3)]);
+        let (text, marks) = marked_file(diff);
+        let marks = marks.unwrap();
+        assert_eq!(text, "one\ntwo\nTWO\nthree\n");
+        assert_eq!(marks.labels, vec![Some(1), None, Some(2), Some(3)]);
+        assert_eq!(marks.marks, b" -+ ".to_vec());
     }
 }
 

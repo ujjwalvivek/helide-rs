@@ -69,6 +69,10 @@ impl EventListener for Listener {
 const QUIET: Duration = Duration::from_millis(1500);
 /// Only a busy stretch this long counts as a finished run worth a notification.
 const LONG_RUN: Duration = Duration::from_secs(5);
+/// How long after input or a resize the program's output counts as its answer to it.
+const ECHO: Duration = Duration::from_secs(1);
+/// During a redraw, a gap this long ends it.
+const REDRAW_GAP: Duration = Duration::from_millis(300);
 
 struct Session {
     term: Arc<FairMutex<Term<Listener>>>,
@@ -93,6 +97,10 @@ struct Session {
     /// When the current busy stretch started, and when the program last wrote.
     busy_since: Option<Instant>,
     last_output: Option<Instant>,
+    /// Output before this answers input, not work.
+    echo_until: std::cell::Cell<Option<Instant>>,
+    /// Output before this is a redraw after a resize; each burst of it moves this on.
+    redraw_until: Option<Instant>,
     /// Finished a long run while you were elsewhere; cleared once the tab is looked at.
     attention: bool,
     exited: bool,
@@ -180,13 +188,23 @@ impl Session {
             title_changed: false,
             busy_since: None,
             last_output: None,
+            echo_until: Default::default(),
+            redraw_until: None,
             attention: false,
             exited: false,
             size,
         })
     }
 
+    /// Sends what you typed, pasted or clicked. The program's answer to it (an echo, a redraw)
+    /// is not work, so output in the next second does not start a run.
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        self.echo_until.set(Some(Instant::now() + ECHO));
+        self.reply(bytes);
+    }
+
+    /// Answers the program's own questions (cursor position, size), which are not input.
+    fn reply(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let _ = self.pty.send(Msg::Input(bytes.into()));
     }
 
@@ -199,18 +217,28 @@ impl Session {
             .lock()
             .resize(TermSize::new(size.0 as usize, size.1 as usize));
         let _ = self.pty.send(Msg::Resize(window_size(size)));
+        // A resize makes a program redraw everything, which for a long chat takes a while; the
+        // redraw lasts while output keeps coming in quick succession.
+        self.redraw_until = Some(Instant::now() + ECHO);
     }
 
     /// Handles what the terminal asked for since the last frame.
     fn drain_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
-                TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
+                TermEvent::PtyWrite(text) => self.reply(text.into_bytes()),
                 TermEvent::TextAreaSizeRequest(format) => {
-                    self.write(format(window_size(self.size)).into_bytes())
+                    self.reply(format(window_size(self.size)).into_bytes())
                 }
                 TermEvent::Wakeup => {
                     let now = Instant::now();
+                    if self.redraw_until.is_some_and(|until| now < until) {
+                        self.redraw_until = Some(now + REDRAW_GAP);
+                        continue;
+                    }
+                    if self.echo_until.get().is_some_and(|until| now < until) {
+                        continue;
+                    }
                     self.last_output = Some(now);
                     self.busy_since.get_or_insert(now);
                 }
