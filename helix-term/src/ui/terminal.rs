@@ -41,7 +41,7 @@ use helix_view::{
 use tui::buffer::Buffer as Surface;
 
 use super::{
-    agents::{self, AgentKind, AgentSession},
+    agents::{self, AgentKind, AgentSession, TerminalPane, TerminalTab},
     frame::{Label, TabStrip},
     panel_style::Roles,
 };
@@ -84,6 +84,8 @@ struct Session {
     agent: Option<AgentSession>,
     /// The process the pane started, to ask Claude which conversation it is in.
     pid: Option<u32>,
+    /// The command it was started with (empty for the shell), to start it again next time.
+    command: Vec<String>,
     /// When the current busy stretch started, and when the program last wrote.
     busy_since: Option<Instant>,
     last_output: Option<Instant>,
@@ -99,6 +101,7 @@ impl Session {
         name: Option<String>,
         agent: Option<AgentSession>,
         size: (u16, u16),
+        cwd: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let (cols, rows) = size;
         let shell = command
@@ -125,7 +128,10 @@ impl Session {
         }
         let options = tty::Options {
             shell,
-            working_directory: Some(helix_stdx::env::current_working_dir()),
+            working_directory: Some(
+                cwd.filter(|dir| dir.is_dir())
+                    .unwrap_or_else(helix_stdx::env::current_working_dir),
+            ),
             drain_on_exit: true,
             env,
             #[cfg(windows)]
@@ -165,6 +171,7 @@ impl Session {
             title: agent.as_ref().and_then(|a| a.name.clone()),
             agent,
             pid,
+            command: command.to_vec(),
             busy_since: None,
             last_output: None,
             attention: false,
@@ -321,12 +328,23 @@ impl TerminalPanel {
         agent: Option<AgentSession>,
         split: bool,
     ) -> anyhow::Result<()> {
+        self.open_in(command, name, agent, split, None)
+    }
+
+    fn open_in(
+        &mut self,
+        command: &[String],
+        name: Option<String>,
+        agent: Option<AgentSession>,
+        split: bool,
+        cwd: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
         let size = if self.grid_area.width > 0 {
             (self.grid_area.width, self.grid_area.height)
         } else {
             (80, 24)
         };
-        let mut session = Session::spawn(command, name, agent, size)?;
+        let mut session = Session::spawn(command, name, agent, size, cwd)?;
         if split && !self.sessions.is_empty() {
             session.group = self.sessions[self.active].group;
             self.active += 1;
@@ -377,6 +395,45 @@ impl TerminalPanel {
             }
         }
         groups
+    }
+
+    /// The tabs as they are now, to save: each pane's command, current folder and name.
+    pub fn tabs(&self) -> Vec<TerminalTab> {
+        self.groups()
+            .into_iter()
+            .map(|group| TerminalTab {
+                panes: self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.group == group && !s.exited)
+                    .map(|s| TerminalPane {
+                        command: s.command.clone(),
+                        cwd: s
+                            .pid
+                            .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok()),
+                        title: s.title.clone(),
+                    })
+                    .collect(),
+            })
+            .filter(|tab| !tab.panes.is_empty())
+            .collect()
+    }
+
+    /// Opens saved tabs, each pane in its folder, under its name. The panel stays hidden; the
+    /// caller shows it if it was shown.
+    pub fn restore(&mut self, tabs: &[TerminalTab]) -> anyhow::Result<()> {
+        for tab in tabs {
+            for (n, pane) in tab.panes.iter().enumerate() {
+                self.open_in(&pane.command, None, None, n > 0, pane.cwd.clone())?;
+                if let Some(session) = self.sessions.get_mut(self.active) {
+                    session.title = pane.title.clone();
+                }
+            }
+        }
+        self.active = 0;
+        self.visible = false;
+        self.focused = false;
+        Ok(())
     }
 
     /// The name tab `index` shows: its given name, or its programs' names.

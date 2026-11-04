@@ -1926,6 +1926,7 @@ impl EditorView {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             agents_width: self.agents_width,
+            terminals: self.terminal.tabs(),
         };
         (layout, panels)
     }
@@ -1981,10 +1982,22 @@ impl EditorView {
                 self.file_tree.visible = true;
                 self.file_tree.refresh(editor);
             }
+            // Terminal tabs reopen in the folders they were in, hidden or shown as they were.
+            let restored = if panels.terminals.is_empty() {
+                Ok(())
+            } else {
+                self.terminal.restore(&panels.terminals)
+            };
+            if let Err(err) = restored {
+                editor.set_error(format!("cannot start terminal: {err}"));
+            }
             if panels.terminal {
-                if let Err(err) = self.terminal.open(&[], None) {
-                    editor.set_error(format!("cannot start terminal: {err}"));
+                if self.terminal.is_empty() {
+                    if let Err(err) = self.terminal.open(&[], None) {
+                        editor.set_error(format!("cannot start terminal: {err}"));
+                    }
                 }
+                self.terminal.visible = true;
             }
             if panels.agents {
                 for session in workspace.agents.clone() {
