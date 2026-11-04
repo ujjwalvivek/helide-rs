@@ -1,4 +1,5 @@
 pub mod agents;
+mod code_stats;
 mod completion;
 mod document;
 pub(crate) mod editor;

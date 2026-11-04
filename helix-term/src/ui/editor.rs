@@ -1332,6 +1332,7 @@ impl EditorView {
     /// a little into the surface colour. Without RGB colours in the theme there's no tint.
     pub fn diff_tint(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
         let text = doc.text().clone();
+        let marks = doc.line_marks.clone();
         let base = [
             "ui.background",
             "ui.popup",
@@ -1354,10 +1355,13 @@ impl EditorView {
         let viewport = view.area;
 
         move |renderer: &mut TextRenderer, pos: LinePos| {
-            let style = match text
-                .get_line(pos.doc_line)
-                .and_then(|line| line.get_char(0))
-            {
+            let mark = match &marks {
+                Some(marks) => marks.get(pos.doc_line).map(|&mark| mark as char),
+                None => text
+                    .get_line(pos.doc_line)
+                    .and_then(|line| line.get_char(0)),
+            };
+            let style = match mark {
                 Some('+') => plus,
                 Some('-') => minus,
                 _ => None,
@@ -3314,7 +3318,7 @@ impl EditorView {
                 if let MouseEventKind::Down(_) = mouse.kind {
                     self.focus_only(Panel::Git);
                 }
-                let action = self.git.mouse(mouse);
+                let action = self.git.mouse(mouse, cx.editor);
                 Some(self.git_action(action))
             }
             Event::Mouse(mouse) if self.terminal.contains(mouse.column, mouse.row) => {
