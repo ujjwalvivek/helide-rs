@@ -32,18 +32,19 @@ vec3 field(vec2 u)
     t.x += sin(t.y * freq + sp) / amp;
     t.y += sin(t.x * freq * 1.5 + sp) / (amp * 0.5);
 
-    // Noctalia, from the wallpaper Helide's screenshots were taken on: mint, teal, a pale
-    // mint and blue for the light, and the theme's two darkest greens for the shadow.
-    vec3 C1 = vec3(.404, .894, .690), C2 = vec3(.361, .800, .839), C3 = vec3(.576, .925, .780),
-    C4 = vec3(.400, .569, .800), c5 = vec3(.090, .231, .173), c6 = vec3(.035, .086, .063);
+    // The wallpaper Helide's screenshots were taken on: two greens and its cream and sage for
+    // the light, its two darkest teal-greens for the shadow. No blue; the wallpaper has none.
+    vec3 C1 = vec3(.341, .631, .455), C2 = vec3(.184, .561, .420), C3 = vec3(.906, .839, .663),
+    C4 = vec3(.651, .729, .557), c5 = vec3(.047, .275, .235), c6 = vec3(.020, .110, .098);
     float cyc = sin(iTime * 0.5), tt = (sign(cyc) * pow(abs(cyc), 0.6) + 1.0) / 2.0;
     vec3 c1 = mix(C1, C3, tt), c2 = mix(C2, C4, tt), c3 = mix(C3, c5, tt), c4 = mix(C4, c6, tt);
 
     vec3 l1 = mix(c3, c2, smoothstep(-0.03, 0.2, (t * R(radians(-5.0))).x));
     vec3 l2 = mix(c4, c1, smoothstep(-0.02, 0.2, (t * R(radians(-5.0))).x));
     vec3 col = mix(l1, l2, smoothstep(0.05, -0.3, t.y));
-    col *= 1.1;
-    col = pow(col, vec3(1.1));
+    // A shade darker than the original, so text on the glass above it stays readable.
+    col *= 0.9;
+    col = pow(col, vec3(1.15));
     return col;
 }
 
@@ -67,7 +68,7 @@ vec3 field(vec2 u)
 //
 //   Reflection. The steep outer part of the rim throws light back, and what it
 //   throws back is the light that reached it: the colour of the page at that
-//   spot, at full strength. Over mint it is a mint line, over blue a blue one.
+//   spot, at full strength. Over green it is a green line, over cream a cream one.
 //   It is never white, because nothing here lights the glass but the page.
 //
 // Both run the whole way round the border and take their colour from whatever
@@ -78,7 +79,7 @@ vec3 field(vec2 u)
 //
 // The seam, where the spilled light gives out on the inside, is not an offset
 // of the border. How deep the light reaches depends on its colour (blue is bent
-// further than mint), and dips where one colour gives way to another. It is
+// further than red), and dips where one colour gives way to another. It is
 // smooth and steady inside a single colour, so the seam is uneven only where
 // the colours are, the way a real one would be, rather than reading as a bevel.
 // ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ vec2 bend(vec3 n, float ior)
 
 // The colour of the light at a point on the page, as a tint that does not
 // depend on how bright it is, so the dark and light halves of the same hue
-// agree: low for a mint, rising for a blue.
+// agree: negative for the cream, rising toward the greens.
 float tintAt(vec2 page)
 {
     vec3 c = field(page / iResolution.xy);
@@ -146,7 +147,7 @@ void main()
     vec2 edgeY = vec2(p.x, sign(p.y) * half_.y);
     vec2 edge = mix(edgeY, edgeX, onX);
 
-    // Not every colour is bent the same, and blue is bent most: over mint the
+    // Not every colour is bent the same, and blue is bent most: over cream the
     // light stops short, over blue it carries further in. So the depth is a
     // function of the colour at that point on the border and of nothing else.
     // Within one colour the seam is smooth and keeps its line; it moves only

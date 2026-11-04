@@ -26,10 +26,8 @@
                 <!-- The title bar: the mark, the project strip, and the three window
                      buttons on the right. -->
                 <div class="titlebar">
-                    <img class="tb-logo" src="helide.svg" alt="" />
-                    <span class="tb-seg tb-name">helide</span
-                    ><span class="tb-seg tb-path">ujjwalvivek/helide-rs</span
-                    ><span class="tb-seg tb-branch">helide</span>
+                    <a href="./" class="tb-home"><img class="tb-logo" src="helide.svg" alt="Helide" /></a>
+                    <nav class="tb-tabs" aria-label="Pages"><a class="tb-tab here" href="./">helide</a><a class="tb-tab" href="docs.html">docs</a><a class="tb-tab" href="windows.html">helide for windows</a></nav>
                     <span class="lights" aria-hidden="true">
                         <i class="light light-min"></i>
                         <i class="light light-max"></i>
@@ -46,7 +44,7 @@
                                 </div>
                                 <div class="fetch-info">
                                     <pre class="fetch-text">
-<span class="label">helide</span>@<span class="js-version label tone-soft">v0.1.0</span><span class="cursor"></span><div class="palette"><div class="swatch" style="background:#67e4b0"></div><div class="swatch" style="background:#93ecc7"></div><div class="swatch" style="background:#5cccd6"></div><div class="swatch" style="background:#96e2e9"></div><div class="swatch" style="background:#6691cc"></div><div class="swatch" style="background:#1d4936"></div><div class="swatch" style="background:#173b2c"></div><div class="swatch" style="background:#091610"></div></div><span class="key">os</span>       <span class="val">linux x64</span>
+<span class="label">helide</span>@<span class="js-version label tone-soft">v0.1.0</span><span class="cursor"></span><div class="palette"><div class="swatch" style="background:#67e4b0"></div><div class="swatch" style="background:#57a174"></div><div class="swatch" style="background:#2f8f6b"></div><div class="swatch" style="background:#e7d6a9"></div><div class="swatch" style="background:#a6ba8e"></div><div class="swatch" style="background:#10594b"></div><div class="swatch" style="background:#0c463c"></div><div class="swatch" style="background:#051c19"></div></div><span class="key">os</span>       <span class="val">linux x64</span>
 <span class="key">editor</span>   <span class="val">helix 25.07</span>
 <span class="key">panels</span>   <span class="val">tree·git·terminal·agents</span>
 <span class="key">agents</span>   <span class="val">claude·opencode</span>
@@ -125,6 +123,9 @@
                                 <span class="chevron">$_</span><a href="docs.html" class="term-link">Read the docs</a>
                             </div>
                             <div class="prompt">
+                                <span class="chevron">$_</span><a href="windows.html" class="term-link">Helide for Windows</a><span class="dim">the first one, still available</span>
+                            </div>
+                            <div class="prompt">
                                 <span class="chevron">$_</span
                                 ><a href="https://github.com/ujjwalvivek/helide-rs" target="_blank" rel="noopener" class="term-link">View source on github</a>
                             </div>
@@ -158,53 +159,6 @@
                 </div>
             </section>
 
-            <!-- The first Helide, the Windows app: still here, with its own download. -->
-            <section class="window window-first" id="windows">
-                <div class="titlebar">
-                    <img class="tb-logo" src="helide.svg" alt="" />
-                    <span class="tb-seg tb-name">helide</span
-                    ><span class="tb-seg tb-path">ujjwalvivek\helide</span
-                    ><span class="tb-seg tb-branch">main</span>
-                    <span class="tb-note">the first helide</span>
-                </div>
-                <div class="first">
-                    <pre class="fetch-text first-fetch">
-<span class="label">helide</span>@<span class="js-first-version label tone-soft">v2.0.3</span>
-<span class="key">os</span>         <span class="val">win x64</span>
-<span class="key">shell</span>      <span class="val">pwsh</span>
-<span class="key">editor</span>     <span class="val">helix</span>
-<span class="key">explorer</span>   <span class="val">yazi</span>
-<span class="key">versioning</span> <span class="val">lazygit</span>
-<span class="key">agents</span>     <span class="val">opencode·codex·claude</span>
-</pre>
-                    <div class="first-body">
-                        <p class="result-text">
-                            Helide began as a Windows app: Helix, <a href="https://github.com/jesseduffield/lazygit" class="pill">lazygit</a>, <a href="https://yazi-rs.github.io/" class="pill">yazi</a> and PowerShell sessions in one keyboard-driven window, with a command palette on <kbd>Ctrl+P</kbd>. The Helix fork above grew out of it, moving the same workspace inside the editor itself.
-                        </p>
-                        <div class="first-shots" id="first-shots"></div>
-                        <div class="prompt">
-                            <span class="chevron">$_</span
-                            ><a id="first-download" href="https://github.com/ujjwalvivek/helide/releases/latest" target="_blank" rel="noopener" class="term-link"
-                                >Download <span class="js-first-version label tone-soft">v2.0.3</span> for Windows</a
-                            >
-                        </div>
-                        <div class="prompt">
-                            <span class="chevron">$_</span
-                            ><a href="https://github.com/ujjwalvivek/helide" target="_blank" rel="noopener" class="term-link">View source on github</a>
-                        </div>
-                    </div>
-                </div>
-                <div class="statusbar">
-                    <div class="status-left">
-                        <span class="mode">MIT</span>
-                        <span class="path">ujjwalvivek</span>
-                    </div>
-                    <div class="status-right">
-                        <span>win x64</span>
-                        <span>pwsh</span>
-                    </div>
-                </div>
-            </section>
         </main>
 
         <div class="lightbox" id="lightbox" hidden>
