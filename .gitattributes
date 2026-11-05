@@ -12,3 +12,6 @@ runtime/queries/**/*.scm linguist-detectable=false
 tests/indent/** linguist-documentation
 tests/query/** linguist-documentation
 Cargo.lock text
+book/theme/*.hbs linguist-detectable=false
+contrib/completion/** linguist-detectable=false
+*.nix linguist-detectable=false
