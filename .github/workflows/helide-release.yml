@@ -1,6 +1,6 @@
 # Builds Helide for a release and attaches the tarballs: the tag itself (the helide branch) and
 # its -otari twin (the helide-rs-mozilla branch), each with hx and a runtime folder holding
-# queries, themes and compiled grammars.
+# queries, themes and compiled grammars, plus the Ghostty glow shader.
 #
 # Runs when a release is published, or by hand with a tag (for a release whose tag predates this
 # file). The release must exist; this only adds the files.
@@ -62,7 +62,7 @@ jobs:
             cp "$2" "$dir/hx" && strip "$dir/hx"
             cp -r runtime/queries runtime/themes runtime/tutor "$dir/runtime/"
             cp runtime/grammars/*.so "$dir/runtime/grammars/"
-            cp README.md LICENSE "$dir/"
+            cp README.md LICENSE contrib/ghostty/glow.glsl "$dir/"
             tar -C dist -cJf "dist/$name.tar.xz" "$name"
           }
           pack "helide-$TAG-x86_64-linux" hx-helide
