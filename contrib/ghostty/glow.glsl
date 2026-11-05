@@ -5,7 +5,8 @@
 //
 //   custom-shader = /path/to/helide-rs/contrib/ghostty/glow.glsl
 //
-// Made for dark themes: a pixel glows when it is brighter than the pixel it lands on.
+// Made for dark themes: a pixel glows when it is coloured and brighter than the pixel it lands on,
+// so syntax colours glow and plain white or grey text doesn't.
 
 // How strong the halo is, 0 to 1 (Nib's default is 0.6; fainter reads crisper in a terminal).
 const float STRENGTH = 0.55;
@@ -18,6 +19,11 @@ const vec3 RINGS[3] = vec3[3](vec3(0.30, 8.0, 0.20), vec3(0.65, 12.0, 0.11), vec
 
 float luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// How colourful a pixel is: 0 for white, grey and black, higher for syntax colours.
+float chroma(vec3 c) {
+    return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
@@ -34,8 +40,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             float angle = (float(k) + 0.5 * float(r)) * 6.283185307 / ring.y;
             vec2 at = fragCoord - vec2(cos(angle), sin(angle)) * RADIUS * ring.x;
             vec3 s = texture(iChannel0, at * px).rgb;
-            // Only text glows, and brighter text more: dim comments barely do.
-            float text = smoothstep(0.08, 0.5, luma(s) - here);
+            // Only coloured text glows, the way Nib glows keywords, types and names but not plain
+            // text: white and grey (plain text, comments, the UI) stay as they are.
+            float text = smoothstep(0.08, 0.5, luma(s) - here) * smoothstep(0.15, 0.4, chroma(s));
             glow += s * ring.z * text;
         }
     }
