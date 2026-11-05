@@ -9,9 +9,9 @@
 
 // How strong the halo is, 0 to 1 (Nib's default strength, 60).
 const float STRENGTH = 0.6;
-// How far the halo reaches, in pixels: Nib's default spread is 30% of a line, and a line is
-// about 20 px at font-size 11 on a 1x screen. Raise it on a HiDPI screen or with a larger font.
-const float RADIUS = 6.0;
+// How far the halo reaches, in pixels: Nib's default spread is 30% of a line (about 6 px here), but
+// a terminal font is thinner, so half that keeps it crisp. Raise it on HiDPI or with a larger font.
+const float RADIUS = 3.0;
 
 // Nib's three rings: how far out (of RADIUS), how many stamps, and each stamp's weight.
 const vec3 RINGS[3] = vec3[3](vec3(0.30, 8.0, 0.20), vec3(0.65, 12.0, 0.11), vec3(1.00, 16.0, 0.06));

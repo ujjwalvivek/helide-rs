@@ -93,8 +93,8 @@ Helide reads your Helix config in `~/.config/helix`. A Nerd Font makes the file 
 The agent panel needs `claude` or `opencode` on your PATH. The code stats need
 [scc](https://github.com/boyter/scc).
 
-In Ghostty, [contrib/ghostty/glow.glsl](contrib/ghostty/glow.glsl) gives text a soft glow, as in
-[Nib](https://github.com/ujjwalvivek/nib): set it as `custom-shader` in Ghostty's config.
+In Ghostty, [contrib/ghostty/glow.glsl](contrib/ghostty/glow.glsl) gives text a soft glow, as in my editor Nib:
+set it as `custom-shader` in Ghostty's config.
 
 ## Branches and versions
 
