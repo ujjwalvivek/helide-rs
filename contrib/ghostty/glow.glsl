@@ -7,11 +7,11 @@
 //
 // Made for dark themes: a pixel glows when it is brighter than the pixel it lands on.
 
-// How strong the halo is, 0 to 1 (Nib's default strength, 60).
-const float STRENGTH = 0.6;
+// How strong the halo is, 0 to 1 (Nib's default is 0.6; fainter reads crisper in a terminal).
+const float STRENGTH = 0.45;
 // How far the halo reaches, in pixels: Nib's default spread is 30% of a line (about 6 px here), but
-// a terminal font is thinner, so half that keeps it crisp. Raise it on HiDPI or with a larger font.
-const float RADIUS = 3.0;
+// a terminal font is thinner, so a third of that keeps it crisp. Raise it on HiDPI or with a larger font.
+const float RADIUS = 2.0;
 
 // Nib's three rings: how far out (of RADIUS), how many stamps, and each stamp's weight.
 const vec3 RINGS[3] = vec3[3](vec3(0.30, 8.0, 0.20), vec3(0.65, 12.0, 0.11), vec3(1.00, 16.0, 0.06));
