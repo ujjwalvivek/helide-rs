@@ -108,31 +108,43 @@ pub struct Endpoint {
     pub label: String,
 }
 
-/// OpenCode's config file: `$OPENCODE_CONFIG`, or `opencode.jsonc` / `opencode.json` in
-/// `~/.config/opencode`.
-fn opencode_config() -> Option<PathBuf> {
+/// OpenCode's config files: `$OPENCODE_CONFIG`, else both `opencode.jsonc` and `opencode.json`
+/// in `~/.config/opencode`, since OpenCode merges the two and a provider may sit in either.
+fn opencode_configs() -> Vec<PathBuf> {
     if let Some(path) = std::env::var_os("OPENCODE_CONFIG") {
-        return Some(path.into());
+        return vec![path.into()];
     }
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
+    let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?
-        .join("opencode");
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    else {
+        return Vec::new();
+    };
     ["opencode.jsonc", "opencode.json"]
         .into_iter()
-        .map(|name| dir.join(name))
-        .find(|path| path.is_file())
+        .map(|name| dir.join("opencode").join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
-/// The endpoint to use, read from OpenCode's config each time, so edits there apply at once.
+/// The endpoint to use, read from OpenCode's config each time, so edits there apply at once:
+/// the first config file with a usable provider wins.
 pub fn endpoint() -> anyhow::Result<Endpoint> {
-    let path = opencode_config().context("no OpenCode config found (~/.config/opencode)")?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("could not read {}", path.display()))?;
-    let config: Value = serde_json::from_str(&strip_jsonc(&text))
-        .with_context(|| format!("could not parse {}", path.display()))?;
+    let paths = opencode_configs();
+    anyhow::ensure!(!paths.is_empty(), "no OpenCode config found (~/.config/opencode)");
     let wanted = std::env::var("HELIDE_MODEL").ok().filter(|m| !m.is_empty());
-    find_endpoint(&config, wanted.as_deref())
+    let mut last = None;
+    for path in paths {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        let config: Value = serde_json::from_str(&strip_jsonc(&text))
+            .with_context(|| format!("could not parse {}", path.display()))?;
+        match find_endpoint(&config, wanted.as_deref()) {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.expect("at least one config was read"))
 }
 
 fn find_endpoint(config: &Value, wanted: Option<&str>) -> anyhow::Result<Endpoint> {
